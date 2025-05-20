@@ -1,6 +1,6 @@
 # YugabyteDB MCP Server
 
-An [MCP](https://modelcontextprotocol.io/) server implementation for YugabyteDB/PostgreSQL that allows LLMs to directly interact with your database.
+An [MCP](https://modelcontextprotocol.io/) server implementation for YugabyteDB that allows LLMs to directly interact with your database.
 
 ## Features
 
@@ -29,7 +29,7 @@ uv sync
 
 The server is configured using the following environment variable:
 
-- `YUGABYTEDB_URL`: The connection string for your YugabyteDB/PostgreSQL database (e.g., `postgresql://user:password@host:port/dbname`)
+- `YUGABYTEDB_URL`: The connection string for your YugabyteDB database (e.g., `dbname=database_name host=hostname port=5433 user=username password=password`)
 
 Example `.env` file:
 
