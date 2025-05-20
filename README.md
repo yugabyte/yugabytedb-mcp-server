@@ -12,7 +12,7 @@ An [MCP](https://modelcontextprotocol.io/) server implementation for YugabyteDB/
 
 - Python 3.10 or higher
 - [uv](https://docs.astral.sh/uv/) installed to manage and run the server
-- A running YugabyteDB (or PostgreSQL-compatible) database
+- A running YugabyteDB database
 - An [MCP client](https://modelcontextprotocol.io/clients) such as [Claude Desktop](https://claude.ai/download) or [Cursor](https://cursor.sh/)
 
 ## Installation
