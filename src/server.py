@@ -90,10 +90,14 @@ def run_read_only_query(ctx:Context, query: str) -> str:
             rows = cur.fetchall()
             column_names = [desc[0] for desc in cur.description]
             result = [dict(zip(column_names, row)) for row in rows]
-            cur.execute("ROLLBACK")
             return json.dumps(result, indent=2)
         except Exception as e:
             return f"Error executing query: {e}"
+        finally:
+            try:
+                cur.execute("ROLLBACK")
+            except Exception as e:
+                return f"Couldn't ROLLBACK transaction: {e}"
 
 
 if __name__ == "__main__":
