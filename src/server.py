@@ -35,7 +35,7 @@ mcp = FastMCP("yugabytedb-mcp", lifespan=app_lifespan)
 
 # Add an addition tool
 @mcp.tool()
-def summarize_database(ctx:Context) -> List[Dict[str, Any]]:
+def summarize_database(ctx:Context, schema: str = "public") -> List[Dict[str, Any]]:
     """
     Summarize the database: list tables with schema and row counts.
     """
@@ -47,9 +47,9 @@ def summarize_database(ctx:Context) -> List[Dict[str, Any]]:
             cur.execute("""
                 SELECT table_name
                 FROM information_schema.tables
-                WHERE table_schema = 'public'
+                WHERE table_schema = %s
                 ORDER BY table_name
-            """)
+            """, (schema,))
             tables = [row[0] for row in cur.fetchall()]
 
             for table in tables:
@@ -57,19 +57,19 @@ def summarize_database(ctx:Context) -> List[Dict[str, Any]]:
                 cur.execute("""
                     SELECT column_name, data_type
                     FROM information_schema.columns
-                    WHERE table_schema = 'public' AND table_name = %s
+                    WHERE table_schema = %s AND table_name = %s
                     ORDER BY ordinal_position
-                """, (table,))
-                schema = [{"column_name": col, "data_type": dtype} for col, dtype in cur.fetchall()]
+                """, (schema, table,))
+                schema_info = [{"column_name": col, "data_type": dtype} for col, dtype in cur.fetchall()]
 
                 # Get row count
-                cur.execute(f"SELECT COUNT(*) FROM public.\"{table}\"")
+                cur.execute(f"SELECT COUNT(*) FROM {schema}.\"{table}\"")
                 row_count = cur.fetchone()[0]
 
                 summary.append({
                     "table": table,
                     "row_count": row_count,
-                    "schema": schema
+                    "schema": schema_info
                 })
 
         except Exception as e:
