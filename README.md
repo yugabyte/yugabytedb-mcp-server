@@ -54,7 +54,7 @@ To use this server with an MCP client (e.g., Claude Desktop, Cursor), add it to 
 ```json
 {
   "mcpServers": {
-    "yugabytedb": {
+    "yugabytedb-mcp": {
       "command": "uv",
       "args": [
         "--directory",
