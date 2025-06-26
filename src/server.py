@@ -6,13 +6,12 @@ import argparse
 import psycopg2
 from typing import List, Dict, Any, AsyncIterator
 from dataclasses import dataclass
-from contextlib import asynccontextmanager
-
+from contextlib import asynccontextmanager, AsyncExitStack
 from mcp.server.fastmcp import FastMCP, Context
 import uvicorn
 from fastapi import FastAPI
 from starlette.responses import JSONResponse
-import contextlib
+
 @dataclass
 class AppContext:
     conn: psycopg2.extensions.connection
@@ -101,25 +100,14 @@ def run_read_only_query(ctx: Context, query: str) -> str:
                 return f"Couldn't ROLLBACK transaction: {e}"
 
 
-# Simple health check endpoint
-async def ping_endpoint(request):
-    return JSONResponse({"status": "ok"})
-
-
 def run_stdio():
     mcp.run(transport="stdio")
 
 
 def run_http():
-    # Build a minimal Starlette app with /ping and MCP handler at /invocations
-    # routes = [
-    #     Route("/ping", endpoint=ping_endpoint, methods=["GET"]),
-    #     Mount("/invocations/", app=mcp.streamable_http_app()),
-    # ]
-    # app = Starlette(routes=routes)
-    @contextlib.asynccontextmanager
+    @asynccontextmanager
     async def lifespan(app: FastAPI):
-        async with contextlib.AsyncExitStack() as stack:
+        async with AsyncExitStack() as stack:
             await stack.enter_async_context(mcp.session_manager.run())
             yield
     app = FastAPI(lifespan=lifespan)
@@ -128,9 +116,6 @@ def run_http():
         return JSONResponse({"status": "ok"})
     
     app.mount("/invocations", mcp.streamable_http_app())
-
-    mcp_host = os.getenv("MCP_HOST")
-    mcp_port = os.getenv("MCP_PORT")
     
     uvicorn.run(app, host="0.0.0.0", port=8080) 
 
@@ -144,6 +129,5 @@ if __name__ == "__main__":
 
     if args.transport == "http":
         run_http()
-        # mcp.run(transport="streamable-http")
     else:
         run_stdio()
