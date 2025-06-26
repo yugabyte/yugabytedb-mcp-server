@@ -2,13 +2,17 @@
 import json
 import os
 import sys
+import argparse
 import psycopg2
-from typing import List, Dict, Any
+from typing import List, Dict, Any, AsyncIterator
 from dataclasses import dataclass
-from mcp.server.fastmcp import FastMCP, Context
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 
+from mcp.server.fastmcp import FastMCP, Context
+import uvicorn
+from fastapi import FastAPI
+from starlette.responses import JSONResponse
+import contextlib
 @dataclass
 class AppContext:
     conn: psycopg2.extensions.connection
@@ -17,25 +21,24 @@ class AppContext:
 async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     database_url = os.getenv("YUGABYTEDB_URL")
     if not database_url:
-        print("YUGABYTEDB_URL is not set")
+        print("YUGABYTEDB_URL is not set", file=sys.stderr)
         sys.exit(1)
 
-    print("Connecting to database...")
+    print("Connecting to database...", file=sys.stderr)
     conn = psycopg2.connect(database_url)
     try:
         yield AppContext(conn=conn)
     finally:
-        print("Closing database connection...")
+        print("Closing database connection...", file=sys.stderr)
         conn.close()
 
 
-# Create an MCP server
-mcp = FastMCP("yugabytedb-mcp", lifespan=app_lifespan)
+# Initialize MCP server
+mcp = FastMCP("yugabytedb-mcp", lifespan=app_lifespan, json_response=True)
 
 
-# Add an addition tool
 @mcp.tool()
-def summarize_database(ctx:Context, schema: str = "public") -> List[Dict[str, Any]]:
+def summarize_database(ctx: Context, schema: str = "public") -> List[Dict[str, Any]]:
     """
     Summarize the database: list tables with schema and row counts.
     """
@@ -43,7 +46,6 @@ def summarize_database(ctx:Context, schema: str = "public") -> List[Dict[str, An
     conn = ctx.request_context.lifespan_context.conn
     with conn.cursor() as cur:
         try:
-            # Get list of tables
             cur.execute("""
                 SELECT table_name
                 FROM information_schema.tables
@@ -53,7 +55,6 @@ def summarize_database(ctx:Context, schema: str = "public") -> List[Dict[str, An
             tables = [row[0] for row in cur.fetchall()]
 
             for table in tables:
-                # Get schema for each table
                 cur.execute("""
                     SELECT column_name, data_type
                     FROM information_schema.columns
@@ -62,7 +63,6 @@ def summarize_database(ctx:Context, schema: str = "public") -> List[Dict[str, An
                 """, (schema, table,))
                 schema_info = [{"column_name": col, "data_type": dtype} for col, dtype in cur.fetchall()]
 
-                # Get row count
                 cur.execute(f"SELECT COUNT(*) FROM {schema}.\"{table}\"")
                 row_count = cur.fetchone()[0]
 
@@ -77,11 +77,12 @@ def summarize_database(ctx:Context, schema: str = "public") -> List[Dict[str, An
 
     return summary
 
+
 @mcp.tool()
-def run_read_only_query(ctx:Context, query: str) -> str:
+def run_read_only_query(ctx: Context, query: str) -> str:
     """
-        Run a read-only SQL query and return the results as JSON.
-        """
+    Run a read-only SQL query and return the results as JSON.
+    """
     conn = ctx.request_context.lifespan_context.conn
     with conn.cursor() as cur:
         try:
@@ -100,5 +101,49 @@ def run_read_only_query(ctx:Context, query: str) -> str:
                 return f"Couldn't ROLLBACK transaction: {e}"
 
 
+# Simple health check endpoint
+async def ping_endpoint(request):
+    return JSONResponse({"status": "ok"})
+
+
+def run_stdio():
+    mcp.run(transport="stdio")
+
+
+def run_http():
+    # Build a minimal Starlette app with /ping and MCP handler at /invocations
+    # routes = [
+    #     Route("/ping", endpoint=ping_endpoint, methods=["GET"]),
+    #     Mount("/invocations/", app=mcp.streamable_http_app()),
+    # ]
+    # app = Starlette(routes=routes)
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI):
+        async with contextlib.AsyncExitStack() as stack:
+            await stack.enter_async_context(mcp.session_manager.run())
+            yield
+    app = FastAPI(lifespan=lifespan)
+    @app.get("/ping")
+    async def ping():
+        return JSONResponse({"status": "ok"})
+    
+    app.mount("/invocations", mcp.streamable_http_app())
+
+    mcp_host = os.getenv("MCP_HOST")
+    mcp_port = os.getenv("MCP_PORT")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8080) 
+
+
 if __name__ == "__main__":
-    mcp.run()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--transport", default="stdio", help="stdio | http")
+    args = parser.parse_args()
+
+    print(f"Starting server with transport: {args.transport}", file=sys.stderr)
+
+    if args.transport == "http":
+        run_http()
+        # mcp.run(transport="streamable-http")
+    else:
+        run_stdio()

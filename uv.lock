@@ -69,6 +69,20 @@ wheels = [
 ]
 
 [[package]]
+name = "fastapi"
+version = "0.115.13"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "starlette" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/20/64/ec0788201b5554e2a87c49af26b77a4d132f807a0fa9675257ac92c6aa0e/fastapi-0.115.13.tar.gz", hash = "sha256:55d1d25c2e1e0a0a50aceb1c8705cd932def273c102bff0b1c1da88b3c6eb307", size = 295680, upload-time = "2025-06-17T11:49:45.575Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/59/4a/e17764385382062b0edbb35a26b7cf76d71e27e456546277a42ba6545c6e/fastapi-0.115.13-py3-none-any.whl", hash = "sha256:0a0cab59afa7bab22f5eb347f8c9864b681558c278395e94035a741fc10cd865", size = 95315, upload-time = "2025-06-17T11:49:44.106Z" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -137,7 +151,7 @@ wheels = [
 
 [[package]]
 name = "mcp"
-version = "1.9.0"
+version = "1.9.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -150,9 +164,9 @@ dependencies = [
     { name = "starlette" },
     { name = "uvicorn", marker = "sys_platform != 'emscripten'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bc/8d/0f4468582e9e97b0a24604b585c651dfd2144300ecffd1c06a680f5c8861/mcp-1.9.0.tar.gz", hash = "sha256:905d8d208baf7e3e71d70c82803b89112e321581bcd2530f9de0fe4103d28749", size = 281432, upload-time = "2025-05-15T18:51:06.615Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/06/f2/dc2450e566eeccf92d89a00c3e813234ad58e2ba1e31d11467a09ac4f3b9/mcp-1.9.4.tar.gz", hash = "sha256:cfb0bcd1a9535b42edaef89947b9e18a8feb49362e1cc059d6e7fc636f2cb09f", size = 333294, upload-time = "2025-06-12T08:20:30.158Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a5/d5/22e36c95c83c80eb47c83f231095419cf57cf5cca5416f1c960032074c78/mcp-1.9.0-py3-none-any.whl", hash = "sha256:9dfb89c8c56f742da10a5910a1f64b0d2ac2c3ed2bd572ddb1cfab7f35957178", size = 125082, upload-time = "2025-05-15T18:51:04.916Z" },
+    { url = "https://files.pythonhosted.org/packages/97/fc/80e655c955137393c443842ffcc4feccab5b12fa7cb8de9ced90f90e6998/mcp-1.9.4-py3-none-any.whl", hash = "sha256:7fcf36b62936adb8e63f89346bccca1268eeca9bf6dfb562ee10b1dfbda9dac0", size = 130232, upload-time = "2025-06-12T08:20:28.551Z" },
 ]
 
 [package.optional-dependencies]
@@ -178,6 +192,17 @@ sdist = { url = "https://files.pythonhosted.org/packages/78/26/c5cc4810c5100e7bd
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d6/f2/7d8d5c3f792c45c37bf2d67e410d43e34f4794a69b284fdf720c2de1be9a/psycopg2_yugabytedb-2.9.3.5-cp311-cp311-macosx_13_0_arm64.whl", hash = "sha256:dcfb49c2d94608b365bcd917f8b072f8ee3ca1407e90dc2fee440920ffa672e2", size = 152677, upload-time = "2025-01-31T11:12:22.882Z" },
     { url = "https://files.pythonhosted.org/packages/d8/65/3d68a705bdd2b3b25f4f5b8ca015d8635e5b4e0d8539b55d57d24e355910/psycopg2_yugabytedb-2.9.3.5-cp312-cp312-macosx_13_0_arm64.whl", hash = "sha256:f2a590fb536e68af8aee9f5f79f2b342dbe0ed4f8155982b0b666b824db48282", size = 155224, upload-time = "2025-01-31T11:12:25.15Z" },
+]
+
+[[package]]
+name = "psycopg2-yugabytedb-binary"
+version = "2.9.3.5"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/60/f7/f21478badfd15ee66a4d463d9c9c333d139243f4b9b34315492648b3e6a1/psycopg2_yugabytedb_binary-2.9.3.5-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:8ca4e48fd7661e61828ab1e9a45d2bd10a07eec06ace07f6fca7a199d74fe764", size = 2998390, upload-time = "2025-02-03T12:33:06.053Z" },
+    { url = "https://files.pythonhosted.org/packages/db/33/e263ece61819b8b65d06bbb9aa744e6105ef039dc1e48badefc33851ddd8/psycopg2_yugabytedb_binary-2.9.3.5-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6356f7556135a72890f81857cfd2cb6ccb4733551914ba40d6f07bf587fe78cf", size = 2998388, upload-time = "2025-02-03T12:33:30.048Z" },
+    { url = "https://files.pythonhosted.org/packages/30/ed/7347689e3ddd9e878af3aa66b8805f6ad56020f43bd04f7f5769466ff361/psycopg2_yugabytedb_binary-2.9.3.5-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:1f4a293fab721a46dc9ffbf95afddd4cd77367df1cfc511ad3b5c39f0d6dff9a", size = 2999640, upload-time = "2025-02-03T12:33:53.365Z" },
+    { url = "https://files.pythonhosted.org/packages/55/2a/417c7f661943ae93640c783075c59e7e405f912824d6d5a1c82dd3492198/psycopg2_yugabytedb_binary-2.9.3.5-cp312-cp312-win_amd64.whl", hash = "sha256:9e63c5521e7d7226f0b582ff7afbd6760490239174327ea36df29705b5b338b7", size = 1721101, upload-time = "2025-01-31T11:59:12.538Z" },
 ]
 
 [[package]]
@@ -435,12 +460,18 @@ name = "yugabytedb-mcp-server"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "fastapi" },
+    { name = "httpx" },
     { name = "mcp", extra = ["cli"] },
-    { name = "psycopg2-yugabytedb" },
+    { name = "psycopg2-yugabytedb", marker = "sys_platform == 'darwin'" },
+    { name = "psycopg2-yugabytedb-binary", marker = "sys_platform != 'darwin'" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "mcp", extras = ["cli"], specifier = ">=1.9.0" },
-    { name = "psycopg2-yugabytedb", specifier = ">=2.9.3.5" },
+    { name = "fastapi", specifier = ">=0.115.12" },
+    { name = "httpx", specifier = "~=0.28.0" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.9.4" },
+    { name = "psycopg2-yugabytedb", marker = "sys_platform == 'darwin'", specifier = ">=2.9.3.5" },
+    { name = "psycopg2-yugabytedb-binary", marker = "sys_platform != 'darwin'", specifier = ">=2.9.3.5" },
 ]
