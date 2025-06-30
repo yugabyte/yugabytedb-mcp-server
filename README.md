@@ -41,15 +41,46 @@ YUGABYTEDB_URL=postgresql://user:password@localhost:5433/yugabyte
 
 ### Running the Server
 
-You can run the server using uv:
+You can run the server with `STDIO` transport using uv:
 
 ```bash
 uv run server.py
 ```
 
+
+or with `Streamable-HTTP` transport:
+
+```bash
+uv run src/server.py --transport http
+```
+
+### Running the Server with Docker
+
+Build the Docker image:
+
+```bash
+docker build -t mcp/yugabytedb .
+```
+
+Run the container with `STDIO` transport:
+
+```bash
+docker run -p 8080:8080 -e YUGABYTEDB_URL="your-db-url" mcp/yugabytedb
+```
+
+or with `Streamable-HTTP` transport:
+
+```bash
+docker run -p 8080:8080 -e YUGABYTEDB_URL="your-db-url" mcp/yugabytedb --transport=http
+```
+
 ### MCP Client Configuration
 
-To use this server with an MCP client (e.g., Claude Desktop, Cursor), add it to your MCP client configuration. Example for Cursor:
+To use this server with an MCP client (e.g., Claude Desktop, Cursor), add it to your MCP client configuration. 
+
+#### Running via `uv`
+
+Example configuration for Cursor:
 
 ```json
 {
@@ -72,6 +103,28 @@ To use this server with an MCP client (e.g., Claude Desktop, Cursor), add it to 
 
 - Replace `/path/to/cloned/yugabytedb-mcp-server/` with the path to your cloned repository.
 - Set the correct database URL in the `env` section.
+
+#### Running via Docker (e.g., in Claude)
+
+After building the docker container, add the following to `claude_config.json` entry or equivalent json files for other editors:
+
+```json
+{
+  "mcpServers": {
+    "yugabytedb-mcp-docker": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "-e",
+        "YUGABYTEDB_URL=dbname=yugabyte host=host.docker.internal port=5433 user=yugabyte password=yugabyte load_balance=false",
+        "mcp/yugabytedb"
+      ]
+    }
+  }
+}
+```
 
 ### Claude Desktop
 
@@ -106,6 +159,33 @@ In the bottom panel of Cursor, click on "Output" and select "Cursor MCP" from th
 2. Go to Windsurf > Settings > Windsurf Settings > Cascade > Model Context Protocol (MCP) Servers > Add server > Add custom server.
 3. Add the configuration as above.
 4. Save and refresh.
+
+### Streamable-HTTP with MCP Inspector
+
+1. Start the server using Streamable-HTTP:
+   ```bash
+   uv run src/server.py --transport http
+   ```
+
+   Or with Docker:
+
+   ```bash
+   docker run -p 8080:8080 -e YUGABYTEDB_URL="..." mcp/yugabytedb --transport=http
+   ```
+
+2. Launch the inspector:
+   ```bash
+   npx @modelcontextprotocol/inspector
+   ```
+
+3. In the GUI, use the URL:
+
+   ```
+   http://localhost:8080/invocations/mcp
+   ```
+
+   - Change transport type to `Streamable-HTTP`
+   - Add the proxy token from the terminal output
 
 ### Tools Provided
 
