@@ -44,7 +44,7 @@ YUGABYTEDB_URL=postgresql://user:password@localhost:5433/yugabyte
 You can run the server with `STDIO` transport using uv:
 
 ```bash
-uv run server.py
+uv run src/server.py
 ```
 
 
