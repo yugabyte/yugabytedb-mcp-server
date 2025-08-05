@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/yugabyte-yugabytedb-mcp-server-badge.png)](https://mseep.ai/app/yugabyte-yugabytedb-mcp-server)
+
 # YugabyteDB MCP Server
 
 An [MCP](https://modelcontextprotocol.io/) server implementation for YugabyteDB that allows LLMs to directly interact with your database.
