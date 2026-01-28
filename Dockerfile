@@ -22,7 +22,7 @@ RUN uv pip install --system -e .
 ENV YUGABYTEDB_URL="dbname=yugabyte host=host.docker.internal port=5433 user=yugabyte password=yugabyte load_balance=false"
 
 # Expose HTTP/SSE port
-EXPOSE 8080
+EXPOSE 8000
 
 # Run the server using uv
 ENTRYPOINT ["uv","--verbose", "run", "src/server.py"]

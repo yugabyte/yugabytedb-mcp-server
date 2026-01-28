@@ -32,11 +32,6 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         conn.close()
 
 
-# Initialize MCP server
-mcp = FastMCP("yugabytedb-mcp", lifespan=app_lifespan, json_response=True)
-
-
-@mcp.tool()
 def summarize_database(ctx: Context, schema: str = "public") -> List[Dict[str, Any]]:
     """
     Summarize the database: list tables with schema and row counts.
@@ -77,7 +72,6 @@ def summarize_database(ctx: Context, schema: str = "public") -> List[Dict[str, A
     return summary
 
 
-@mcp.tool()
 def run_read_only_query(ctx: Context, query: str) -> str:
     """
     Run a read-only SQL query and return the results as JSON.
@@ -100,34 +94,75 @@ def run_read_only_query(ctx: Context, query: str) -> str:
                 return f"Couldn't ROLLBACK transaction: {e}"
 
 
-def run_stdio():
-    mcp.run(transport="stdio")
+def parse_config() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--transport",
+        default=os.environ.get("YB_MCP_TRANSPORT", "stdio"),
+        help="stdio | http (env: YB_MCP_TRANSPORT)",
+    )
+    parser.add_argument(
+        "--stateless-http",
+        action="store_true",
+        default=os.environ.get("YB_MCP_STATELESS_HTTP", "").lower() == "true",
+        help="Enable stateless HTTP mode (env: YB_MCP_STATELESS_HTTP=true)",
+    )
+    parser.add_argument(
+        "--yugabytedb-url",
+        default=os.environ.get("YUGABYTEDB_URL"),
+        help="YugabyteDB connection string (env: YUGABYTEDB_URL)",
+    )
+    return parser.parse_args()
 
 
-def run_http():
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        async with AsyncExitStack() as stack:
-            await stack.enter_async_context(mcp.session_manager.run())
-            yield
-    app = FastAPI(lifespan=lifespan)
-    @app.get("/ping")
-    async def ping():
-        return JSONResponse({"status": "ok"})
-    
-    app.mount("/invocations", mcp.streamable_http_app())
-    
-    uvicorn.run(app, host="0.0.0.0", port=8080) 
+class YugabyteDBMCPServer:
+    def __init__(self, transport: str, stateless_http: bool):
+        self.transport = transport
+        self.stateless_http = stateless_http
+
+        self.mcp = FastMCP(
+            "yugabytedb-mcp",
+            lifespan=app_lifespan,
+            json_response=True,
+            stateless_http=stateless_http,
+        )
+
+        self._register_tools()
+
+    def _register_tools(self):
+        self.mcp.add_tool(summarize_database)
+        self.mcp.add_tool(run_read_only_query)
+
+    def run(self, host="0.0.0.0", port=8000):
+        if self.transport == "http":
+            self._run_http(host, port)
+        else:
+            self.mcp.run(transport="stdio")
+
+    def _run_http(self, host, port):
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            async with AsyncExitStack() as stack:
+                await stack.enter_async_context(self.mcp.session_manager.run())
+                yield
+
+        app = FastAPI(lifespan=lifespan)
+
+        @app.get("/ping")
+        async def ping():
+            return JSONResponse({"status": "ok"})
+
+        app.mount("/", self.mcp.streamable_http_app())
+
+        uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--transport", default="stdio", help="stdio | http")
-    args = parser.parse_args()
+    cfg = parse_config()
 
-    print(f"Starting server with transport: {args.transport}", file=sys.stderr)
+    server = YugabyteDBMCPServer(
+        transport=cfg.transport,
+        stateless_http=cfg.stateless_http,
+    )
 
-    if args.transport == "http":
-        run_http()
-    else:
-        run_stdio()
+    server.run()
