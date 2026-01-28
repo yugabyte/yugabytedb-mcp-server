@@ -491,7 +491,7 @@ wheels = [
 
 [[package]]
 name = "yugabytedb-mcp-server"
-version = "1.0.1"
+version = "1.0.3"
 source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },
