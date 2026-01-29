@@ -27,15 +27,14 @@ uv sync
 
 ## Configuration
 
-The server is configured using the following environment variable:
+The server is configured using the following:
 
-- `YUGABYTEDB_URL`: The connection string for your YugabyteDB database (e.g., `dbname=database_name host=hostname port=5433 user=username password=password`)
+| Environment Variable | Argument | Optional | Description |
+|----------------------|----------|----------|-------------|
+| `YUGABYTEDB_URL`     | `--yugabytedb-url` | No | Connection string for your YugabyteDB database (e.g., `dbname=database_name host=hostname port=5433 user=username password=password`) |
+| `YB_MCP_TRANSPORT`   | `--transport`     | Yes | Transport protocol to use: `stdio` or `http` (default: `stdio`) |
+| `YB_MCP_STATELESS_HTTP` | `--stateless-http`| Yes | Enable stateless Streamable-HTTP mode: `true` or `false` (default: `false`) |
 
-Example `.env` file:
-
-```
-YUGABYTEDB_URL=postgresql://user:password@localhost:5433/yugabyte
-```
 
 ## Usage
 
@@ -48,10 +47,16 @@ uv run src/server.py
 ```
 
 
-or with `Streamable-HTTP` transport:
+or with stateful `Streamable-HTTP` transport:
 
 ```bash
 uv run src/server.py --transport http
+```
+
+or with stateless `Streamable-HTTP` transport:
+
+```bash
+uv run src/server.py --transport http --stateless-http
 ```
 
 ### Running the Server with Docker
@@ -65,13 +70,36 @@ docker build -t mcp/yugabytedb .
 Run the container with `STDIO` transport:
 
 ```bash
-docker run -p 8080:8080 -e YUGABYTEDB_URL="your-db-url" mcp/yugabytedb
+docker run -p 8000:8000 -e YUGABYTEDB_URL="your-db-url" mcp/yugabytedb
 ```
 
 or with `Streamable-HTTP` transport:
 
+Stateful Server:
 ```bash
-docker run -p 8080:8080 -e YUGABYTEDB_URL="your-db-url" mcp/yugabytedb --transport=http
+docker run -p 8000:8000 \
+  -e YUGABYTEDB_URL="your-db-url" \
+  mcp/yugabytedb --transport=http
+
+```
+Stateless Server:
+```bash
+docker run -p 8000:8000 \
+  -e YUGABYTEDB_URL="your-db-url" \
+  -e YB_MCP_TRANSPORT=http \
+  -e YB_MCP_STATELESS_HTTP=true \
+  mcp/yugabytedb
+
+```
+Stateless Server with SSL enabled cluster:
+```bash
+docker run -p 8000:8000 \
+  -v /path/to/root.crt:/certs/root.crt:ro \
+  -e YUGABYTEDB_URL="your-db-url" \
+  mcp/yugabytedb \
+  --transport=http \
+  --stateless-http
+
 ```
 
 ### MCP Client Configuration
@@ -170,7 +198,7 @@ In the bottom panel of Cursor, click on "Output" and select "Cursor MCP" from th
    Or with Docker:
 
    ```bash
-   docker run -p 8080:8080 -e YUGABYTEDB_URL="..." mcp/yugabytedb --transport=http
+   docker run -p 8000:8000 -e YUGABYTEDB_URL="..." mcp/yugabytedb --transport=http
    ```
 
 2. Launch the inspector:
@@ -181,7 +209,7 @@ In the bottom panel of Cursor, click on "Output" and select "Cursor MCP" from th
 3. In the GUI, use the URL:
 
    ```
-   http://localhost:8080/invocations/mcp
+   http://localhost:8000/mcp
    ```
 
    - Change transport type to `Streamable-HTTP`
