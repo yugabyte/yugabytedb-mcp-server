@@ -34,10 +34,10 @@ The server is configured using the following:
 | `YUGABYTEDB_URL`     | `--yugabytedb-url` | No | Connection string for your YugabyteDB database (e.g., `dbname=database_name host=hostname port=5433 user=username password=password`) |
 | `YB_MCP_TRANSPORT`   | `--transport`     | Yes | Transport protocol to use: `stdio` or `http` (default: `stdio`) |
 | `YB_MCP_STATELESS_HTTP` | `--stateless-http`| Yes | Enable stateless Streamable-HTTP mode: `true` or `false` (default: `false`) |
-| `YB_SSL_ROOT_CERT_SECRET_ARN` | `--yb-ssl-root-cert-secret-arn` | Yes | ARN of the AWS Secrets Manager secret containing the TLS root certificate |
-| `YB_SSL_ROOT_CERT_KEY` | `--yb-ssl-root-cert-key` | Yes | Key inside the secret JSON that selects which certificate to use |
+| `YB_AWS_SSL_ROOT_CERT_SECRET_ARN` | `--yb-aws-ssl-root-cert-secret-arn` | Yes | ARN of the AWS Secrets Manager secret containing the TLS root certificate |
+| `YB_AWS_SSL_ROOT_CERT_KEY` | `--yb-aws-ssl-root-cert-key` | Yes | Key inside the secret JSON that selects which certificate to use |
 | `YB_SSL_ROOT_CERT_PATH` | `--yb-ssl-root-cert-path` | Yes | Filesystem path where the root certificate will be written (default: `/tmp/yb-root.crt`) |
-| `YB_SSL_ROOT_CERT_SECRET_REGION` | `--yb-ssl-root-cert-secret-region` | Yes | Region of the AWS Secrets Manager secret containing the TLS root certificate |
+| `YB_AWS_SSL_ROOT_CERT_SECRET_REGION` | `--yb-aws-ssl-root-cert-secret-region` | Yes | Region of the AWS Secrets Manager secret containing the TLS root certificate |
 
 
 ## Usage
@@ -119,8 +119,8 @@ docker run -p 8000:8000 \
   -e YUGABYTEDB_URL="host=... port=5433 dbname=... user=... password=... sslmode=verify-full" \
   -e YB_MCP_TRANSPORT=http \
   -e YB_MCP_STATELESS_HTTP=true \
-  -e YB_SSL_ROOT_CERT_SECRET_ARN=arn:ofthe:secret:manager \
-  -e YB_SSL_ROOT_CERT_SECRET_REGION=region-of-the-secret-manager \
+  -e YB_AWS_SSL_ROOT_CERT_SECRET_ARN=arn:ofthe:secret:manager \
+  -e YB_AWS_SSL_ROOT_CERT_SECRET_REGION=region-of-the-secret-manager \
   -e AWS_ACCESS_KEY_ID="XXX" \
   -e AWS_SECRET_ACCESS_KEY="XXX" \
   -e AWS_SESSION_TOKEN="XXX" \
@@ -144,9 +144,9 @@ docker run -p 8000:8000 \
   -e YUGABYTEDB_URL="host=... port=5433 dbname=... user=... password=... sslmode=verify-full" \
   -e YB_MCP_TRANSPORT=http \
   -e YB_MCP_STATELESS_HTTP=true \
-  -e YB_SSL_ROOT_CERT_SECRET_ARN=arn:ofthe:secret:manager \
-  -e YB_SSL_ROOT_CERT_KEY=cert-cluster-1 \
-  -e YB_SSL_ROOT_CERT_SECRET_REGION=region-of-the-secret-manager \
+  -e YB_AWS_SSL_ROOT_CERT_SECRET_ARN=arn:ofthe:secret:manager \
+  -e YB_AWS_SSL_ROOT_CERT_KEY=cert-cluster-1 \
+  -e YB_AWS_SSL_ROOT_CERT_SECRET_REGION=region-of-the-secret-manager \
   -e AWS_ACCESS_KEY_ID="XXX" \
   -e AWS_SECRET_ACCESS_KEY="XXX" \
   -e AWS_SESSION_TOKEN="XXX" \

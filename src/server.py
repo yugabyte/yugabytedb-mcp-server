@@ -65,7 +65,7 @@ def write_root_cert():
                 # Backward-compatible: allow exactly one entry
                 if len(data) != 1:
                     raise RuntimeError(
-                        "Multiple certificates found in secret; set YB_SSL_ROOT_CERT_KEY to select one"
+                        "Multiple certificates found in secret; set YB_AWS_SSL_ROOT_CERT_KEY to select one"
                     )
                 pem = next(iter(data.values()))
         
@@ -180,13 +180,13 @@ def parse_config() -> argparse.Namespace:
         help="YugabyteDB connection string (env: YUGABYTEDB_URL)",
     )
     parser.add_argument(
-        "--yb-ssl-root-cert-secret-arn", 
-        default=os.getenv("YB_SSL_ROOT_CERT_SECRET_ARN"),
+        "--yb-aws-ssl-root-cert-secret-arn", 
+        default=os.getenv("YB_AWS_SSL_ROOT_CERT_SECRET_ARN"),
         help="ARN of the AWS Secrets Manager secret containing the TLS root certificate",
     )
     parser.add_argument(
-        "--yb-ssl-root-cert-key", 
-        default=os.getenv("YB_SSL_ROOT_CERT_KEY"),
+        "--yb-aws-ssl-root-cert-key", 
+        default=os.getenv("YB_AWS_SSL_ROOT_CERT_KEY"),
         help="Key inside the secret JSON that selects which certificate to use",
     )
     parser.add_argument(
@@ -195,8 +195,8 @@ def parse_config() -> argparse.Namespace:
           help="Filesystem path where the root certificate will be written (default: `/tmp/yb-root.crt`)"
     )
     parser.add_argument(
-        "--yb-ssl-root-cert-secret-region",
-          default=os.getenv("YB_SSL_ROOT_CERT_SECRET_REGION"),
+        "--yb-aws-ssl-root-cert-secret-region",
+          default=os.getenv("YB_AWS_SSL_ROOT_CERT_SECRET_REGION"),
           help="Region of the AWS Secrets Manager secret containing the TLS root certificate",
     )
 
@@ -205,10 +205,10 @@ def parse_config() -> argparse.Namespace:
         yugabytedb_url=args.yugabytedb_url,
         transport=args.transport,
         stateless_http=args.stateless_http,
-        ssl_root_cert_secret_arn=args.yb_ssl_root_cert_secret_arn,
-        ssl_root_cert_key=args.yb_ssl_root_cert_key,
+        ssl_root_cert_secret_arn=args.yb_aws_ssl_root_cert_secret_arn,
+        ssl_root_cert_key=args.yb_aws_ssl_root_cert_key,
         ssl_root_cert_path=args.yb_ssl_root_cert_path,
-        ssl_root_cert_secret_region=args.yb_ssl_root_cert_secret_region,
+        ssl_root_cert_secret_region=args.yb_aws_ssl_root_cert_secret_region,
     )
 
 
