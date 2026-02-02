@@ -12,6 +12,14 @@ import uvicorn
 from fastapi import FastAPI
 from starlette.responses import JSONResponse
 import boto3
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from fastapi import Request
+
+import time
+
+def log(msg: str):
+    print(f"[{time.strftime('%H:%M:%S')}] [YugabyteDB MCP Server] {msg}", flush=True)
+
 
 @dataclass
 class AppContext:
@@ -26,6 +34,7 @@ class ServerConfig:
     ssl_root_cert_key: str | None
     ssl_root_cert_path: str
     ssl_root_cert_secret_region: str
+    allowed_hosts: list[str]
 
 def normalize_pem(pem: str) -> str:
     # Remove surrounding spaces
@@ -82,20 +91,23 @@ def write_root_cert():
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
+    log("App lifespan entered")
     if not CONFIG.yugabytedb_url:
         print("YUGABYTEDB_URL is not set", file=sys.stderr)
         sys.exit(1)
 
-    print("Connecting to database...", file=sys.stderr)
+    log("Connecting to database")
     database_url = CONFIG.yugabytedb_url
     cert_path = write_root_cert()
+    log(f"SSL cert path = {cert_path}")
     if cert_path and "sslrootcert" not in database_url:
         database_url += f" sslrootcert={cert_path}"
     conn = psycopg2.connect(database_url)
+    log("Database connection established")
     try:
         yield AppContext(conn=conn)
     finally:
-        print("Closing database connection...", file=sys.stderr)
+        log("Closing database connection")
         conn.close()
 
 
@@ -143,25 +155,37 @@ def run_read_only_query(ctx: Context, query: str) -> str:
     """
     Run a read-only SQL query and return the results as JSON.
     """
+    log("run_read_only_query called")
+    log(f"Query={query}")
     conn = ctx.request_context.lifespan_context.conn
+    log(f"Connection open={not conn.closed}")
     with conn.cursor() as cur:
         try:
+            log("Starting transaction")
             cur.execute("BEGIN READ ONLY")
+            log("Executing query")
             cur.execute(query)
             rows = cur.fetchall()
+            log(f"Fetched {len(rows)} rows")
             column_names = [desc[0] for desc in cur.description]
             result = [dict(zip(column_names, row)) for row in rows]
+            log("Query successful")
             return json.dumps(result, indent=2)
         except Exception as e:
+            log(f"Error executing query: {repr(e)}")
             return f"Error executing query: {e}"
         finally:
             try:
+                log("Rolling back transaction")
                 cur.execute("ROLLBACK")
             except Exception as e:
+                log(f"Couldn't ROLLBACK transaction: {repr(e)}")
                 return f"Couldn't ROLLBACK transaction: {e}"
 
 
 def parse_config() -> argparse.Namespace:
+
+    log("Parsing configuration")
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--transport",
@@ -199,8 +223,28 @@ def parse_config() -> argparse.Namespace:
           default=os.getenv("YB_AWS_SSL_ROOT_CERT_SECRET_REGION"),
           help="Region of the AWS Secrets Manager secret containing the TLS root certificate",
     )
+    parser.add_argument(
+    "--yb-allowed-hosts",
+    default=os.getenv("YB_ALLOWED_HOSTS", ""),
+    help="Comma-separated list of allowed Host headers (public HTTP mode)",
+)
 
     args = parser.parse_args()
+    is_bedrock = os.getenv("ALLOW_ALL_HOST_HEADERS", "").lower() == "true"
+    log(f"ALLOW_ALL_HOST_HEADERS={is_bedrock}")
+
+    if is_bedrock:
+        allowed_hosts = ["*"]
+    else:
+        allowed_hosts = [
+            h.strip()
+            for h in args.allowed_hosts.split(",")
+            if h.strip()
+        ] or ["localhost"]
+
+    log(f"Resolved allowed_hosts={allowed_hosts}")
+    log(f"Transport={args.transport}, Stateless={args.stateless_http}")
+
     return ServerConfig(
         yugabytedb_url=args.yugabytedb_url,
         transport=args.transport,
@@ -209,11 +253,15 @@ def parse_config() -> argparse.Namespace:
         ssl_root_cert_key=args.yb_aws_ssl_root_cert_key,
         ssl_root_cert_path=args.yb_ssl_root_cert_path,
         ssl_root_cert_secret_region=args.yb_aws_ssl_root_cert_secret_region,
+        allowed_hosts=allowed_hosts,
     )
 
 
 class YugabyteDBMCPServer:
     def __init__(self):
+
+        log("Initializing YugabyteDBMCPServer")
+        log(f"FastMCP stateless_http={CONFIG.stateless_http}")
 
         self.mcp = FastMCP(
             "yugabytedb-mcp",
@@ -225,28 +273,58 @@ class YugabyteDBMCPServer:
         self._register_tools()
 
     def _register_tools(self):
+        log("Registering MCP tools")
         self.mcp.add_tool(summarize_database)
         self.mcp.add_tool(run_read_only_query)
 
     def run(self, host="0.0.0.0", port=8000):
+
+        log(f"Server run() called with transport={CONFIG.transport}")
+
         if CONFIG.transport == "http":
             self._run_http(host, port)
         else:
             self.mcp.run(transport="stdio")
 
     def _run_http(self, host, port):
+
+        log("Starting HTTP server")
+        log(f"Allowed hosts = {CONFIG.allowed_hosts}")
         @asynccontextmanager
         async def lifespan(app: FastAPI):
+            log("FastAPI lifespan starting")
             async with AsyncExitStack() as stack:
+                log("Entering MCP session manager")
                 await stack.enter_async_context(self.mcp.session_manager.run())
                 yield
+            log("FastAPI lifespan ending")
 
         app = FastAPI(lifespan=lifespan)
+
+        app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=CONFIG.allowed_hosts
+        )
+
+        log("TrustedHostMiddleware installed")
+
+        @app.middleware("http")
+        async def log_requests(request: Request, call_next):
+            log(
+                f"Incoming request: method={request.method} "
+                f"path={request.url.path} "
+                f"host={request.headers.get('host')} "
+                f"user-agent={request.headers.get('user-agent')}"
+                )
+            response = await call_next(request)
+            log(f"Response status={response.status_code}")
+            return response
 
         @app.get("/ping")
         async def ping():
             return JSONResponse({"status": "ok"})
-
+        
+        log("Mounting MCP Streamable HTTP app")
         app.mount("/", self.mcp.streamable_http_app())
 
         uvicorn.run(app, host=host, port=port)
