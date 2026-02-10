@@ -18,7 +18,7 @@ from fastapi import Request
 import time
 
 def log(msg: str):
-    print(f"[{time.strftime('%H:%M:%S')}] [YugabyteDB MCP Server] {msg}", flush=True)
+    print(f"[{time.strftime('%H:%M:%S')}] [YugabyteDB MCP Server] {msg}",file=sys.stderr, flush=True)
 
 
 @dataclass
@@ -238,7 +238,7 @@ def parse_config() -> argparse.Namespace:
     else:
         allowed_hosts = [
             h.strip()
-            for h in args.allowed_hosts.split(",")
+            for h in args.yb_allowed_hosts.split(",")
             if h.strip()
         ] or ["localhost"]
 
