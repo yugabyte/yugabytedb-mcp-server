@@ -4,14 +4,24 @@ import os
 import sys
 import argparse
 import psycopg2
-from typing import List, Dict, Any, AsyncIterator
+from typing import AsyncIterator
 from dataclasses import dataclass
 from contextlib import asynccontextmanager, AsyncExitStack
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import FastMCP
 import uvicorn
 from fastapi import FastAPI
 from starlette.responses import JSONResponse
 import boto3
+
+from tools import (
+    summarize_database,
+    run_read_only_query,
+    add_document_source,
+    init_vector_index,
+    trigger_index_build,
+    check_index_status,
+    add_source_to_index,
+)
 
 @dataclass
 class AppContext:
@@ -99,68 +109,6 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         conn.close()
 
 
-def summarize_database(ctx: Context, schema: str = "public") -> List[Dict[str, Any]]:
-    """
-    Summarize the database: list tables with schema and row counts.
-    """
-    summary = []
-    conn = ctx.request_context.lifespan_context.conn
-    with conn.cursor() as cur:
-        try:
-            cur.execute("""
-                SELECT table_name
-                FROM information_schema.tables
-                WHERE table_schema = %s
-                ORDER BY table_name
-            """, (schema,))
-            tables = [row[0] for row in cur.fetchall()]
-
-            for table in tables:
-                cur.execute("""
-                    SELECT column_name, data_type
-                    FROM information_schema.columns
-                    WHERE table_schema = %s AND table_name = %s
-                    ORDER BY ordinal_position
-                """, (schema, table,))
-                schema_info = [{"column_name": col, "data_type": dtype} for col, dtype in cur.fetchall()]
-
-                cur.execute(f"SELECT COUNT(*) FROM {schema}.\"{table}\"")
-                row_count = cur.fetchone()[0]
-
-                summary.append({
-                    "table": table,
-                    "row_count": row_count,
-                    "schema": schema_info
-                })
-
-        except Exception as e:
-            summary.append({"error": str(e)})
-
-    return summary
-
-
-def run_read_only_query(ctx: Context, query: str) -> str:
-    """
-    Run a read-only SQL query and return the results as JSON.
-    """
-    conn = ctx.request_context.lifespan_context.conn
-    with conn.cursor() as cur:
-        try:
-            cur.execute("BEGIN READ ONLY")
-            cur.execute(query)
-            rows = cur.fetchall()
-            column_names = [desc[0] for desc in cur.description]
-            result = [dict(zip(column_names, row)) for row in rows]
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            return f"Error executing query: {e}"
-        finally:
-            try:
-                cur.execute("ROLLBACK")
-            except Exception as e:
-                return f"Couldn't ROLLBACK transaction: {e}"
-
-
 def parse_config() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -227,6 +175,11 @@ class YugabyteDBMCPServer:
     def _register_tools(self):
         self.mcp.add_tool(summarize_database)
         self.mcp.add_tool(run_read_only_query)
+        self.mcp.add_tool(add_document_source)
+        self.mcp.add_tool(init_vector_index)
+        self.mcp.add_tool(trigger_index_build)
+        self.mcp.add_tool(check_index_status)
+        self.mcp.add_tool(add_source_to_index)
 
     def run(self, host="0.0.0.0", port=8000):
         if CONFIG.transport == "http":
