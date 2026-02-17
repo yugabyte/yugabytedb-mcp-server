@@ -80,7 +80,7 @@ def run_read_only_query(ctx: Context, query: str) -> str:
 # pg_dist_rag tools
 # ---------------------------------------------------------------------------
 
-def add_document_source(ctx: Context, source_uri: str, metadata: str = "{}") -> str:
+def add_document_source(ctx: Context, source_uri: str) -> str:
     """
     Add a document source to pg_dist_rag for RAG pipeline processing.
 
@@ -91,7 +91,6 @@ def add_document_source(ctx: Context, source_uri: str, metadata: str = "{}") -> 
     Args:
         ctx: MCP context (injected automatically).
         source_uri: URI of the document source (e.g. ``s3://bucket/path/``).
-        metadata: Optional JSON string of metadata filters for the source.
 
     Returns:
         JSON string with the created ``source_id``, or an error message.
@@ -119,8 +118,10 @@ def init_vector_index(
     index_name: str,
     source_ids: str,
     ai_provider: str = "OPENAI",
-    embedding_model_params: str = '{"model": "text-embedding-3-large", "dimensions": 1536}',
-    chunk_params: str = '{"chunk_size": 1024, "chunk_overlap": 256}',
+    embedding_model: str = "text-embedding-3-large",
+    embedding_dimensions: int = 1536,
+    chunk_size: int = 1024,
+    chunk_overlap: int = 256,
 ) -> str:
     """
     Initialise a new vector index in pg_dist_rag.
@@ -133,14 +134,24 @@ def init_vector_index(
         index_name: Name for the new vector index.
         source_ids: Comma-separated list of source UUIDs to include.
         ai_provider: AI / embedding provider name (e.g. ``OPENAI``).
-        embedding_model_params: JSON string with embedding model parameters.
-        chunk_params: JSON string with chunking parameters.
+        embedding_model: Embedding model name (e.g. ``text-embedding-3-large``).
+        embedding_dimensions: Dimensions of the embedding vector (e.g. ``1536``).
+        chunk_size: Number of characters per chunk (e.g. ``1024``).
+        chunk_overlap: Number of overlapping characters between chunks (e.g. ``256``).
 
     Returns:
         JSON string with the created ``index_id``, or an error message.
     """
     conn = _get_conn(ctx)
     source_id_list = [s.strip() for s in source_ids.split(",") if s.strip()]
+    embedding_model_params = json.dumps({
+        "model": embedding_model,
+        "dimensions": embedding_dimensions,
+    })
+    chunk_params = json.dumps({
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+    })
     with conn.cursor() as cur:
         try:
             cur.execute(
@@ -265,7 +276,13 @@ def check_index_status(ctx: Context, index_name: str) -> str:
                 pass
 
 
-def add_source_to_index(ctx: Context, index_name: str, source_id: str, chunk_params: str = "{}") -> str:
+def add_source_to_index(
+    ctx: Context,
+    index_name: str,
+    source_id: str,
+    chunk_size: int = 1024,
+    chunk_overlap: int = 256,
+) -> str:
     """
     Add an additional document source to an existing vector index.
 
@@ -276,12 +293,17 @@ def add_source_to_index(ctx: Context, index_name: str, source_id: str, chunk_par
         ctx: MCP context (injected automatically).
         index_name: Name of the existing vector index.
         source_id: UUID of the source to attach.
-        chunk_params: Optional JSON string with chunking parameters for this source.
+        chunk_size: Number of characters per chunk (e.g. ``1024``).
+        chunk_overlap: Number of overlapping characters between chunks (e.g. ``256``).
 
     Returns:
         JSON string confirming the source was added, or an error message.
     """
     conn = _get_conn(ctx)
+    chunk_params = json.dumps({
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+    })
     with conn.cursor() as cur:
         try:
             cur.execute(
@@ -304,3 +326,33 @@ def add_source_to_index(ctx: Context, index_name: str, source_id: str, chunk_par
         except Exception as e:
             conn.rollback()
             return f"Error adding source to index: {e}"
+
+
+def run_write_query(ctx: Context, query: str) -> str:
+    """
+    Execute a write SQL statement against the database.
+
+    Runs the given SQL (e.g. INSERT, UPDATE, DELETE, CALL) inside a
+    transaction.  On success the transaction is committed and the number of
+    affected rows is returned.  On failure the transaction is rolled back
+    automatically.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        query: The SQL statement to execute.
+
+    Returns:
+        JSON string with the number of rows affected, or an error message.
+    """
+    conn = _get_conn(ctx)
+    with conn.cursor() as cur:
+        try:
+            cur.execute(query)
+            conn.commit()
+            rows_affected = cur.rowcount
+            return json.dumps({
+                "rows_affected": rows_affected,
+            })
+        except Exception as e:
+            conn.rollback()
+            return f"Error executing write query: {e}"

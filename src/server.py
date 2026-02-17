@@ -16,6 +16,7 @@ import boto3
 from tools import (
     summarize_database,
     run_read_only_query,
+    run_write_query,
     add_document_source,
     init_vector_index,
     trigger_index_build,
@@ -175,6 +176,7 @@ class YugabyteDBMCPServer:
     def _register_tools(self):
         self.mcp.add_tool(summarize_database)
         self.mcp.add_tool(run_read_only_query)
+        self.mcp.add_tool(run_write_query)
         self.mcp.add_tool(add_document_source)
         self.mcp.add_tool(init_vector_index)
         self.mcp.add_tool(trigger_index_build)
