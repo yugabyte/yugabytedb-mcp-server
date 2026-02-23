@@ -80,140 +80,140 @@ def run_read_only_query(ctx: Context, query: str) -> str:
 # pg_dist_rag tools
 # ---------------------------------------------------------------------------
 
-def add_document_source(ctx: Context, source_uri: str) -> str:
-    """
-    Add a document source to pg_dist_rag for RAG pipeline processing.
+# def add_document_source(ctx: Context, source_uri: str) -> str:
+#     """
+#     Add a document source to pg_dist_rag for RAG pipeline processing.
 
-    This registers a new source location (e.g. an S3 bucket path) so that
-    its documents can later be indexed.  The call inserts a row into
-    ``dist_rag.sources`` and returns the generated ``source_id``.
+#     This registers a new source location (e.g. an S3 bucket path) so that
+#     its documents can later be indexed.  The call inserts a row into
+#     ``dist_rag.sources`` and returns the generated ``source_id``.
 
-    Args:
-        ctx: MCP context (injected automatically).
-        source_uri: URI of the document source (e.g. ``s3://bucket/path/``).
+#     Args:
+#         ctx: MCP context (injected automatically).
+#         source_uri: URI of the document source (e.g. ``s3://bucket/path/``).
 
-    Returns:
-        JSON string with the created ``source_id``, or an error message.
-    """
-    conn = _get_conn(ctx)
-    with conn.cursor() as cur:
-        try:
-            cur.execute(
-                """
-                SELECT dist_rag.create_source(%s)
-                """,
-                (source_uri,),
-            )
-            result = cur.fetchone()
-            conn.commit()
-            source_id = str(result[0]) if result else None
-            return json.dumps({"source_id": source_id})
-        except Exception as e:
-            conn.rollback()
-            return f"Error adding document source: {e}"
-
-
-def init_vector_index(
-    ctx: Context,
-    index_name: str,
-    source_ids: str,
-    ai_provider: str = "OPENAI",
-    embedding_model: str = "text-embedding-3-large",
-    embedding_dimensions: int = 1536,
-    chunk_size: int = 1024,
-    chunk_overlap: int = 256,
-) -> str:
-    """
-    Initialise a new vector index in pg_dist_rag.
-
-    Creates the index metadata and associates it with the given sources so it
-    is ready to be built.
-
-    Args:
-        ctx: MCP context (injected automatically).
-        index_name: Name for the new vector index.
-        source_ids: Comma-separated list of source UUIDs to include.
-        ai_provider: AI / embedding provider name (e.g. ``OPENAI``).
-        embedding_model: Embedding model name (e.g. ``text-embedding-3-large``).
-        embedding_dimensions: Dimensions of the embedding vector (e.g. ``1536``).
-        chunk_size: Number of characters per chunk (e.g. ``1024``).
-        chunk_overlap: Number of overlapping characters between chunks (e.g. ``256``).
-
-    Returns:
-        JSON string with the created ``index_id``, or an error message.
-    """
-    conn = _get_conn(ctx)
-    source_id_list = [s.strip() for s in source_ids.split(",") if s.strip()]
-    embedding_model_params = json.dumps({
-        "model": embedding_model,
-        "dimensions": embedding_dimensions,
-    })
-    chunk_params = json.dumps({
-        "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap,
-    })
-    with conn.cursor() as cur:
-        try:
-            cur.execute(
-                """
-                SELECT dist_rag.init_vector_index(
-                    r_index_name := %s,
-                    r_sources := %s::UUID[],
-                    r_ai_provider := %s,
-                    r_embedding_model_params := %s,
-                    r_chunk_params := %s
-                ) AS index_id
-                """,
-                (
-                    index_name,
-                    source_id_list,
-                    ai_provider,
-                    embedding_model_params,
-                    chunk_params,
-                ),
-            )
-            result = cur.fetchone()
-            conn.commit()
-            index_id = str(result[0]) if result else None
-            return json.dumps({"index_id": index_id})
-        except Exception as e:
-            conn.rollback()
-            return f"Error initializing vector index: {e}"
+#     Returns:
+#         JSON string with the created ``source_id``, or an error message.
+#     """
+#     conn = _get_conn(ctx)
+#     with conn.cursor() as cur:
+#         try:
+#             cur.execute(
+#                 """
+#                 SELECT dist_rag.create_source(%s)
+#                 """,
+#                 (source_uri,),
+#             )
+#             result = cur.fetchone()
+#             conn.commit()
+#             source_id = str(result[0]) if result else None
+#             return json.dumps({"source_id": source_id})
+#         except Exception as e:
+#             conn.rollback()
+#             return f"Error adding document source: {e}"
 
 
-def trigger_index_build(ctx: Context, index_name: str) -> str:
-    """
-    Start building (or rebuilding) a vector index.
+# def init_vector_index(
+#     ctx: Context,
+#     index_name: str,
+#     source_ids: str,
+#     ai_provider: str = "OPENAI",
+#     embedding_model: str = "text-embedding-3-large",
+#     embedding_dimensions: int = 1536,
+#     chunk_size: int = 1024,
+#     chunk_overlap: int = 256,
+# ) -> str:
+#     """
+#     Initialise a new vector index in pg_dist_rag.
 
-    Triggers the pg_dist_rag preprocessing pipeline for the given index.
-    Workers will begin processing documents, generating chunks, and creating
-    embeddings.
+#     Creates the index metadata and associates it with the given sources so it
+#     is ready to be built.
 
-    Args:
-        ctx: MCP context (injected automatically).
-        index_name: Name of the vector index to build.
+#     Args:
+#         ctx: MCP context (injected automatically).
+#         index_name: Name for the new vector index.
+#         source_ids: Comma-separated list of source UUIDs to include.
+#         ai_provider: AI / embedding provider name (e.g. ``OPENAI``).
+#         embedding_model: Embedding model name (e.g. ``text-embedding-3-large``).
+#         embedding_dimensions: Dimensions of the embedding vector (e.g. ``1536``).
+#         chunk_size: Number of characters per chunk (e.g. ``1024``).
+#         chunk_overlap: Number of overlapping characters between chunks (e.g. ``256``).
 
-    Returns:
-        JSON string confirming the build was triggered, or an error message.
-    """
-    conn = _get_conn(ctx)
-    with conn.cursor() as cur:
-        try:
-            cur.execute(
-                """
-                SELECT dist_rag.build_index(r_index_name := %s)
-                """,
-                (index_name,),
-            )
-            conn.commit()
-            return json.dumps({
-                "status": "triggered",
-                "index_name": index_name,
-                "message": f"Index build triggered for '{index_name}'.",
-            })
-        except Exception as e:
-            conn.rollback()
-            return f"Error triggering index build: {e}"
+#     Returns:
+#         JSON string with the created ``index_id``, or an error message.
+#     """
+#     conn = _get_conn(ctx)
+#     source_id_list = [s.strip() for s in source_ids.split(",") if s.strip()]
+#     embedding_model_params = json.dumps({
+#         "model": embedding_model,
+#         "dimensions": embedding_dimensions,
+#     })
+#     chunk_params = json.dumps({
+#         "chunk_size": chunk_size,
+#         "chunk_overlap": chunk_overlap,
+#     })
+#     with conn.cursor() as cur:
+#         try:
+#             cur.execute(
+#                 """
+#                 SELECT dist_rag.init_vector_index(
+#                     r_index_name := %s,
+#                     r_sources := %s::UUID[],
+#                     r_ai_provider := %s,
+#                     r_embedding_model_params := %s,
+#                     r_chunk_params := %s
+#                 ) AS index_id
+#                 """,
+#                 (
+#                     index_name,
+#                     source_id_list,
+#                     ai_provider,
+#                     embedding_model_params,
+#                     chunk_params,
+#                 ),
+#             )
+#             result = cur.fetchone()
+#             conn.commit()
+#             index_id = str(result[0]) if result else None
+#             return json.dumps({"index_id": index_id})
+#         except Exception as e:
+#             conn.rollback()
+#             return f"Error initializing vector index: {e}"
+
+
+# def trigger_index_build(ctx: Context, index_name: str) -> str:
+#     """
+#     Start building (or rebuilding) a vector index.
+
+#     Triggers the pg_dist_rag preprocessing pipeline for the given index.
+#     Workers will begin processing documents, generating chunks, and creating
+#     embeddings.
+
+#     Args:
+#         ctx: MCP context (injected automatically).
+#         index_name: Name of the vector index to build.
+
+#     Returns:
+#         JSON string confirming the build was triggered, or an error message.
+#     """
+#     conn = _get_conn(ctx)
+#     with conn.cursor() as cur:
+#         try:
+#             cur.execute(
+#                 """
+#                 SELECT dist_rag.build_index(r_index_name := %s)
+#                 """,
+#                 (index_name,),
+#             )
+#             conn.commit()
+#             return json.dumps({
+#                 "status": "triggered",
+#                 "index_name": index_name,
+#                 "message": f"Index build triggered for '{index_name}'.",
+#             })
+#         except Exception as e:
+#             conn.rollback()
+#             return f"Error triggering index build: {e}"
 
 
 def check_index_status(ctx: Context, index_name: str) -> str:
@@ -356,3 +356,124 @@ def run_write_query(ctx: Context, query: str) -> str:
         except Exception as e:
             conn.rollback()
             return f"Error executing write query: {e}"
+
+
+def trigger_knowledge_base_build(
+    ctx: Context,
+    source_uris: str,
+    index_name: str,
+    ai_provider: str = "OPENAI",
+    embedding_model: str = "text-embedding-3-large",
+    embedding_dimensions: int = 1536,
+    chunk_size: int = 1024,
+    chunk_overlap: int = 256,
+) -> str:
+    """
+    End-to-end RAG index creation: registers one or more document sources,
+    initialises a vector index for them, and triggers the index build -- all
+    in one call.
+
+    This is a convenience wrapper that runs add_document_source (for each
+    source), init_vector_index, and trigger_index_build in sequence.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        source_uris: Comma-separated URIs of document sources
+            (e.g. ``s3://bucket/path1/,s3://bucket/path2/``).
+        index_name: Name for the new vector index.
+        ai_provider: AI / embedding provider name (e.g. ``OPENAI``).
+        embedding_model: Embedding model name (e.g. ``text-embedding-3-large``).
+        embedding_dimensions: Dimensions of the embedding vector (e.g. ``1536``).
+        chunk_size: Number of characters per chunk (e.g. ``1024``).
+        chunk_overlap: Number of overlapping characters between chunks (e.g. ``256``).
+
+    Returns:
+        JSON string with source_ids, index_id, and build status, or an error
+        message indicating which step failed.
+    """
+    conn = _get_conn(ctx)
+    uri_list = [u.strip() for u in source_uris.split(",") if u.strip()]
+
+    # Step 1: register each document source
+    source_ids = []
+    for uri in uri_list:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    "SELECT dist_rag.create_source(%s)",
+                    (uri,),
+                )
+                result = cur.fetchone()
+                conn.commit()
+                source_ids.append(str(result[0]) if result else None)
+            except Exception as e:
+                conn.rollback()
+                return (
+                    f"Error adding document source '{uri}' "
+                    f"(sources already created: {source_ids}): {e}"
+                )
+
+    # Step 2: init vector index with all sources
+    embedding_model_params = json.dumps({
+        "model": embedding_model,
+        "dimensions": embedding_dimensions,
+    })
+    chunk_params = json.dumps({
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+    })
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                """
+                SELECT dist_rag.init_vector_index(
+                    r_index_name := %s,
+                    r_sources := %s::UUID[],
+                    r_ai_provider := %s,
+                    r_embedding_model_params := %s,
+                    r_chunk_params := %s
+                ) AS index_id
+                """,
+                (
+                    index_name,
+                    source_ids,
+                    ai_provider,
+                    embedding_model_params,
+                    chunk_params,
+                ),
+            )
+            result = cur.fetchone()
+            conn.commit()
+            index_id = str(result[0]) if result else None
+        except Exception as e:
+            conn.rollback()
+            return (
+                f"Error initializing vector index "
+                f"(sources created: {source_ids}): {e}"
+            )
+
+    # Step 3: trigger index build
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                "SELECT dist_rag.build_index(r_index_name := %s)",
+                (index_name,),
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            return (
+                f"Error triggering index build (sources {source_ids} and "
+                f"index '{index_id}' were created): {e}"
+            )
+
+    return json.dumps({
+        "source_ids": source_ids,
+        "index_id": index_id,
+        "index_name": index_name,
+        "status": "build_triggered",
+        "message": (
+            f"{len(source_ids)} source(s) registered, index '{index_name}' "
+            f"initialised, and build triggered."
+        ),
+    })

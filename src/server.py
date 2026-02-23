@@ -17,11 +17,12 @@ from tools import (
     summarize_database,
     run_read_only_query,
     run_write_query,
-    add_document_source,
-    init_vector_index,
-    trigger_index_build,
+    # add_document_source,
+    # init_vector_index,
+    # trigger_index_build,
     check_index_status,
     add_source_to_index,
+    trigger_knowledge_base_build,
 )
 
 @dataclass
@@ -177,11 +178,12 @@ class YugabyteDBMCPServer:
         self.mcp.add_tool(summarize_database)
         self.mcp.add_tool(run_read_only_query)
         self.mcp.add_tool(run_write_query)
-        self.mcp.add_tool(add_document_source)
-        self.mcp.add_tool(init_vector_index)
-        self.mcp.add_tool(trigger_index_build)
+        # self.mcp.add_tool(add_document_source)
+        # self.mcp.add_tool(init_vector_index)
+        # self.mcp.add_tool(trigger_index_build)
         self.mcp.add_tool(check_index_status)
         self.mcp.add_tool(add_source_to_index)
+        self.mcp.add_tool(trigger_knowledge_base_build)
 
     def run(self, host="0.0.0.0", port=8000):
         if CONFIG.transport == "http":
