@@ -6,8 +6,8 @@ import argparse
 import psycopg2
 from typing import AsyncIterator
 from dataclasses import dataclass
-from contextlib import asynccontextmanager, AsyncExitStack
-from mcp.server.fastmcp import FastMCP
+from contextlib import asynccontextmanager
+from fastmcp import FastMCP
 import uvicorn
 from fastapi import FastAPI
 from starlette.responses import JSONResponse
@@ -25,9 +25,13 @@ from tools import (
     trigger_knowledge_base_build,
 )
 
-@dataclass
-class AppContext:
-    conn: psycopg2.extensions.connection
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from mcp_auth import create_auth_provider
 
 @dataclass
 class ServerConfig:
@@ -38,6 +42,7 @@ class ServerConfig:
     ssl_root_cert_key: str | None
     ssl_root_cert_path: str
     ssl_root_cert_secret_region: str
+    auth_provider: str
 
 def normalize_pem(pem: str) -> str:
     # Remove surrounding spaces
@@ -93,7 +98,7 @@ def write_root_cert():
 
 
 @asynccontextmanager
-async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
+async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
     if not CONFIG.yugabytedb_url:
         print("YUGABYTEDB_URL is not set", file=sys.stderr)
         sys.exit(1)
@@ -105,7 +110,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         database_url += f" sslrootcert={cert_path}"
     conn = psycopg2.connect(database_url)
     try:
-        yield AppContext(conn=conn)
+        yield {"conn": conn}
     finally:
         print("Closing database connection...", file=sys.stderr)
         conn.close()
@@ -149,6 +154,11 @@ def parse_config() -> argparse.Namespace:
           default=os.getenv("YB_AWS_SSL_ROOT_CERT_SECRET_REGION"),
           help="Region of the AWS Secrets Manager secret containing the TLS root certificate",
     )
+    parser.add_argument(
+        "--mcp-auth-provider",
+          default=os.getenv("MCP_AUTH_PROVIDER"),
+          help="Auth Provider for MCP",
+    )
 
     args = parser.parse_args()
     return ServerConfig(
@@ -159,17 +169,19 @@ def parse_config() -> argparse.Namespace:
         ssl_root_cert_key=args.yb_aws_ssl_root_cert_key,
         ssl_root_cert_path=args.yb_ssl_root_cert_path,
         ssl_root_cert_secret_region=args.yb_aws_ssl_root_cert_secret_region,
+        auth_provider=args.mcp_auth_provider,
     )
 
 
 class YugabyteDBMCPServer:
     def __init__(self):
 
+        auth = create_auth_provider(CONFIG.auth_provider)
+
         self.mcp = FastMCP(
             "yugabytedb-mcp",
             lifespan=app_lifespan,
-            json_response=True,
-            stateless_http=CONFIG.stateless_http,
+            auth=auth,
         )
 
         self._register_tools()
@@ -189,22 +201,25 @@ class YugabyteDBMCPServer:
         if CONFIG.transport == "http":
             self._run_http(host, port)
         else:
-            self.mcp.run(transport="stdio")
+            self.mcp.run(
+                transport="stdio",
+                json_response=True,
+            )
 
     def _run_http(self, host, port):
-        @asynccontextmanager
-        async def lifespan(app: FastAPI):
-            async with AsyncExitStack() as stack:
-                await stack.enter_async_context(self.mcp.session_manager.run())
-                yield
+        mcp_app = self.mcp.http_app(
+            path="/mcp",
+            json_response=True,
+            stateless_http=CONFIG.stateless_http,
+        )
 
-        app = FastAPI(lifespan=lifespan)
+        app = FastAPI(lifespan=mcp_app.lifespan)
 
         @app.get("/ping")
         async def ping():
             return JSONResponse({"status": "ok"})
 
-        app.mount("/", self.mcp.streamable_http_app())
+        app.mount("/", mcp_app)
 
         uvicorn.run(app, host=host, port=port)
 

@@ -2,12 +2,16 @@
 import json
 from typing import List, Dict, Any
 
-from mcp.server.fastmcp import Context
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from fastmcp import Context
+from mcp_auth import require_permission
 
 def _get_conn(ctx: Context):
     """Helper to extract the psycopg2 connection from the MCP lifespan context."""
-    return ctx.request_context.lifespan_context.conn
+    return ctx.lifespan_context["conn"]
 
 
 # ---------------------------------------------------------------------------
@@ -18,6 +22,7 @@ def summarize_database(ctx: Context, schema: str = "public") -> List[Dict[str, A
     """
     Summarize the database: list tables with schema and row counts.
     """
+    require_permission("read")
     summary = []
     conn = _get_conn(ctx)
     with conn.cursor() as cur:
@@ -58,6 +63,7 @@ def run_read_only_query(ctx: Context, query: str) -> str:
     """
     Run a read-only SQL query and return the results as JSON.
     """
+    require_permission("read")
     conn = _get_conn(ctx)
     with conn.cursor() as cur:
         try:
@@ -231,6 +237,7 @@ def check_index_status(ctx: Context, index_name: str) -> str:
     Returns:
         JSON string with pipeline details and stats, or an error message.
     """
+    require_permission("read")
     conn = _get_conn(ctx)
     with conn.cursor() as cur:
         try:
@@ -299,6 +306,7 @@ def add_source_to_index(
     Returns:
         JSON string confirming the source was added, or an error message.
     """
+    require_permission("write")
     conn = _get_conn(ctx)
     chunk_params = json.dumps({
         "chunk_size": chunk_size,
@@ -344,6 +352,7 @@ def run_write_query(ctx: Context, query: str) -> str:
     Returns:
         JSON string with the number of rows affected, or an error message.
     """
+    require_permission("write")
     conn = _get_conn(ctx)
     with conn.cursor() as cur:
         try:
@@ -391,6 +400,7 @@ def trigger_knowledge_base_build(
         JSON string with source_ids, index_id, and build status, or an error
         message indicating which step failed.
     """
+    require_permission("write")
     conn = _get_conn(ctx)
     uri_list = [u.strip() for u in source_uris.split(",") if u.strip()]
 
