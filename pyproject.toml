@@ -10,4 +10,6 @@ dependencies = [
     "fastapi>=0.115.12",
     "psycopg2-binary>=2.9.10",
     "boto3>=1.42.37",
+    "mem0ai",
+    "openai>=1.0.0",
 ]

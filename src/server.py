@@ -23,6 +23,14 @@ from tools import (
     check_index_status,
     add_source_to_index,
     trigger_knowledge_base_build,
+    add_memory,
+    delete_memory,
+    search_memories,
+    get_memory_by_id,
+    get_memories,
+    update_memory,
+    delete_all_memories,
+    set_transport_mode,
 )
 
 @dataclass
@@ -184,6 +192,13 @@ class YugabyteDBMCPServer:
         self.mcp.add_tool(check_index_status)
         self.mcp.add_tool(add_source_to_index)
         self.mcp.add_tool(trigger_knowledge_base_build)
+        self.mcp.add_tool(add_memory)
+        self.mcp.add_tool(delete_memory)
+        self.mcp.add_tool(search_memories)
+        self.mcp.add_tool(get_memory_by_id)
+        self.mcp.add_tool(get_memories)
+        self.mcp.add_tool(update_memory)
+        self.mcp.add_tool(delete_all_memories)
 
     def run(self, host="0.0.0.0", port=8000):
         if CONFIG.transport == "http":
@@ -211,5 +226,6 @@ class YugabyteDBMCPServer:
 
 if __name__ == "__main__":
     CONFIG = parse_config()
+    set_transport_mode(CONFIG.transport)
     server = YugabyteDBMCPServer()
     server.run()

@@ -10,3 +10,6 @@ wheels/
 .venv
 
 .idea/
+
+# Config file may contain database passwords
+config.json

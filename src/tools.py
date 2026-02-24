@@ -1,8 +1,10 @@
 # tools.py
 import json
-from typing import List, Dict, Any
+import os
+from typing import List, Dict, Any, Optional
 
 from mcp.server.fastmcp import Context
+from mem0 import Memory
 
 
 def _get_conn(ctx: Context):
@@ -477,3 +479,329 @@ def trigger_knowledge_base_build(
             f"initialised, and build triggered."
         ),
     })
+
+
+# ---------------------------------------------------------------------------
+# mem0 tools
+# ---------------------------------------------------------------------------
+
+_mem0_instance: Optional[Memory] = None
+
+
+def _get_mem0() -> Memory:
+    """Lazily initialise the local Mem0 Memory instance from config.json.
+
+    Uses pgvector as the vector store and Apache AGE as the graph store,
+    both configured in config.json.  Requires OPENAI_API_KEY in the
+    environment (used by the default embedder and LLM).
+    """
+    global _mem0_instance
+    if _mem0_instance is None:
+        config_path = os.environ.get(
+            "MEM0_CONFIG_PATH",
+            os.path.join(os.path.dirname(__file__), "..", "config.json"),
+        )
+        with open(config_path) as f:
+            config = json.load(f)
+        _mem0_instance = Memory.from_config(config["mem0"])
+    return _mem0_instance
+
+
+_transport_mode: str = "stdio"
+
+_USER_ID_REQUIRED_ERROR = json.dumps({
+    "error": "user_id_required",
+    "detail": "In HTTP mode, user_id must be provided explicitly by the client.",
+})
+
+
+def set_transport_mode(mode: str) -> None:
+    """Called by server.py at startup to set the transport mode."""
+    global _transport_mode
+    _transport_mode = mode
+
+
+def _resolve_user_id(
+    user_id: Optional[str],
+    agent_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve user_id based on transport mode.
+
+    In stdio mode: fall back to MEM0_USER_ID env var.
+    In HTTP mode: user_id must be provided explicitly (no env var fallback).
+    Returns None when another scoping param (agent_id / run_id) is set.
+    """
+    if user_id:
+        return user_id
+    if agent_id or run_id:
+        return None
+    if _transport_mode == "stdio":
+        return os.environ.get("MEM0_USER_ID", "yugabytedb-mcp")
+    return None
+
+
+def add_memory(
+    ctx: Context,
+    text: str,
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    app_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    metadata: Optional[str] = None,
+    messages: Optional[str] = None,
+    enable_graph: bool = True,
+) -> str:
+    """
+    Store a memory using Mem0 (a fact, preference, or conversation snippet).
+
+    Memories are stored in pgvector and, when graph is enabled, also
+    extracted as entity-relationship triples in Apache AGE.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        text: Plain text content to store as a memory.
+        user_id: User ID to scope the memory to. Defaults to the
+            MEM0_USER_ID environment variable.
+        agent_id: Optional agent identifier for scoping.
+        app_id: Optional app identifier for scoping.
+        run_id: Optional run identifier for scoping.
+        metadata: Optional JSON string of arbitrary metadata to attach.
+        messages: Optional JSON string of conversation history as a list of
+            ``{"role": "...", "content": "..."}`` objects.  When provided,
+            this is used instead of wrapping ``text`` as a single user message.
+        enable_graph: Whether to also store graph relations via Apache AGE.
+            Defaults to True.
+
+    Returns:
+        JSON string with the created memory details, or an error message.
+    """
+    m = _get_mem0()
+
+    kwargs: Dict[str, Any] = {"enable_graph": enable_graph}
+
+    uid = _resolve_user_id(user_id, agent_id, run_id)
+    if uid:
+        kwargs["user_id"] = uid
+    if agent_id:
+        kwargs["agent_id"] = agent_id
+    if app_id:
+        kwargs["app_id"] = app_id
+    if run_id:
+        kwargs["run_id"] = run_id
+
+    if not uid and not agent_id and not run_id:
+        return _USER_ID_REQUIRED_ERROR
+
+    if metadata:
+        try:
+            kwargs["metadata"] = json.loads(metadata)
+        except json.JSONDecodeError:
+            return "Error: metadata must be a valid JSON string."
+
+    if messages:
+        try:
+            conversation = json.loads(messages)
+        except json.JSONDecodeError:
+            return "Error: messages must be a valid JSON array of {role, content} objects."
+    elif text:
+        conversation = [{"role": "user", "content": text}]
+    else:
+        return json.dumps({
+            "error": "messages_missing",
+            "detail": "Provide either text or messages so Mem0 knows what to store.",
+        })
+
+    try:
+        result = m.add(conversation, **kwargs)
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except Exception as e:
+        return f"Error adding memory: {e}"
+
+
+def delete_memory(ctx: Context, memory_id: str) -> str:
+    """
+    Delete a single memory by its ID.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        memory_id: The exact ID of the memory to delete.
+
+    Returns:
+        JSON string confirming deletion, or an error message.
+    """
+    m = _get_mem0()
+    try:
+        result = m.delete(memory_id)
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except Exception as e:
+        return f"Error deleting memory: {e}"
+
+
+def search_memories(
+    ctx: Context,
+    query: str,
+    user_id: Optional[str] = None,
+    limit: int = 10,
+    enable_graph: bool = True,
+) -> str:
+    """
+    Semantic search across stored memories and graph relations.
+
+    Returns both vector-matched memories and, when graph is enabled,
+    entity-relationship triples from Apache AGE.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        query: Natural language description of what to find.
+        user_id: User ID to scope the search to. Defaults to the
+            MEM0_USER_ID environment variable.
+        limit: Maximum number of results to return.
+        enable_graph: Whether to also return graph relations.
+            Defaults to True.
+
+    Returns:
+        JSON string with matching memories (and relations when graph is
+        enabled), or an error message.
+    """
+    m = _get_mem0()
+    uid = _resolve_user_id(user_id)
+    if not uid:
+        return _USER_ID_REQUIRED_ERROR
+    try:
+        result = m.search(
+            query=query,
+            user_id=uid,
+            limit=limit,
+            enable_graph=enable_graph,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except Exception as e:
+        return f"Error searching memories: {e}"
+
+
+def get_memory_by_id(ctx: Context, memory_id: str) -> str:
+    """
+    Retrieve a single memory by its exact ID.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        memory_id: The exact ID of the memory to fetch.
+
+    Returns:
+        JSON string with the memory details, or an error message.
+    """
+    m = _get_mem0()
+    try:
+        result = m.get(memory_id)
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except Exception as e:
+        return f"Error fetching memory: {e}"
+
+
+def get_memories(
+    ctx: Context,
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    app_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> str:
+    """
+    List all memories for a given scope (user, agent, app, or run).
+
+    Args:
+        ctx: MCP context (injected automatically).
+        user_id: User ID to list memories for. Defaults to the
+            MEM0_USER_ID environment variable.
+        agent_id: Optional agent identifier to filter by.
+        app_id: Optional app identifier to filter by.
+        run_id: Optional run identifier to filter by.
+
+    Returns:
+        JSON string with the list of memories, or an error message.
+    """
+    m = _get_mem0()
+    kwargs: Dict[str, Any] = {}
+    uid = _resolve_user_id(user_id, agent_id, run_id)
+    if uid:
+        kwargs["user_id"] = uid
+    if agent_id:
+        kwargs["agent_id"] = agent_id
+    if app_id:
+        kwargs["app_id"] = app_id
+    if run_id:
+        kwargs["run_id"] = run_id
+
+    if not kwargs:
+        return _USER_ID_REQUIRED_ERROR
+
+    try:
+        result = m.get_all(**kwargs)
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except Exception as e:
+        return f"Error listing memories: {e}"
+
+
+def update_memory(ctx: Context, memory_id: str, text: str) -> str:
+    """
+    Overwrite an existing memory's text.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        memory_id: The exact ID of the memory to update.
+        text: The replacement text for the memory.
+
+    Returns:
+        JSON string with the updated memory details, or an error message.
+    """
+    m = _get_mem0()
+    try:
+        result = m.update(memory_id=memory_id, data=text)
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except Exception as e:
+        return f"Error updating memory: {e}"
+
+
+def delete_all_memories(
+    ctx: Context,
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    app_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> str:
+    """
+    Delete all memories in the given scope.
+
+    Provide at least one of user_id, agent_id, app_id, or run_id to
+    define which memories to delete.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        user_id: Delete all memories for this user.
+        agent_id: Delete all memories for this agent.
+        app_id: Delete all memories for this app.
+        run_id: Delete all memories for this run.
+
+    Returns:
+        JSON string confirming deletion, or an error message.
+    """
+    m = _get_mem0()
+    kwargs: Dict[str, Any] = {}
+    uid = _resolve_user_id(user_id, agent_id, run_id)
+    if uid:
+        kwargs["user_id"] = uid
+    if agent_id:
+        kwargs["agent_id"] = agent_id
+    if app_id:
+        kwargs["app_id"] = app_id
+    if run_id:
+        kwargs["run_id"] = run_id
+
+    if not kwargs:
+        return _USER_ID_REQUIRED_ERROR
+
+    try:
+        result = m.delete_all(**kwargs)
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    except Exception as e:
+        return f"Error deleting all memories: {e}"
