@@ -6,7 +6,7 @@ from typing import List, Dict, Any, Optional
 
 from mcp.server.fastmcp import Context
 from mem0 import Memory
-from mem0.graphs.configs import ApacheAgeConfig
+from mem0.graphs.configs import ApacheAgeConfig, GraphStoreConfig
 
 
 def _get_conn(ctx: Context):
@@ -382,13 +382,21 @@ def _get_mem0(agent_id: str) -> Memory:
         config.setdefault("vector_store", {}).setdefault("config", {})["collection_name"] = (
             f"{agent_id}_mem0_collection"
         )
-        # Pre-construct ApacheAgeConfig so Pydantic's Union resolution on
-        # GraphStoreConfig.config doesn't silently match KuzuConfig first
-        # and discard the apache_age fields.  Use model_construct() to
-        # bypass the model_validator that rejects empty passwords.
+        # Pre-construct the entire GraphStoreConfig with model_construct()
+        # to sidestep two bugs in the mem0 fork:
+        #  1. Pydantic Union resolution tries KuzuConfig first (which
+        #     swallows all fields) before reaching ApacheAgeConfig.
+        #  2. ApacheAgeConfig's model_validator rejects empty passwords.
+        # Passing a ready-made GraphStoreConfig instance means MemoryConfig
+        # accepts it as-is without re-running any nested validators.
         if config.get("graph_store", {}).get("provider") == "apache_age":
-            config["graph_store"]["config"] = ApacheAgeConfig.model_construct(
-                **config["graph_store"]["config"]
+            gs = config["graph_store"]
+            config["graph_store"] = GraphStoreConfig.model_construct(
+                provider="apache_age",
+                config=ApacheAgeConfig.model_construct(**gs["config"]),
+                llm=gs.get("llm"),
+                custom_prompt=gs.get("custom_prompt"),
+                threshold=gs.get("threshold", 0.7),
             )
         _mem0_cache[agent_id] = Memory.from_config(config)
     return _mem0_cache[agent_id]
