@@ -392,6 +392,8 @@ def _get_shared_graph_conn():
         password=gs_config.get("password", ""),
     )
     _shared_graph_conn.autocommit = True
+    with _shared_graph_conn.cursor() as cur:
+        cur.execute("SET search_path = ag_catalog, public;")
     return _shared_graph_conn
 
 
