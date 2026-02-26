@@ -46,15 +46,24 @@ with a single JSON object (no markdown fences, no extra text):
 1. The user wants to CREATE a new agent:
    {{"intent": "create_agent", "agent_name": "<name>", "agent_type": "writer|reader"}}
 
-2. The user wants to USE an existing agent for a database task:
+2. The user wants an agent to REMEMBER a fact, preference, or piece of info:
+   {{"intent": "agent_remember", "agent_name": "<name>", "text": "<what to remember>"}}
+
+3. The user wants to RECALL or ask what an agent remembers:
+   {{"intent": "agent_recall", "agent_name": "<name>", "query": "<what to search for>"}}
+
+4. The user wants to USE an existing agent for a database SQL task:
    {{"intent": "agent_task", "agent_name": "<name>", "task": "<what to do>"}}
 
-3. General conversation (none of the above):
+5. General conversation (none of the above):
    {{"intent": "general", "response": "<your reply>"}}
 
 Rules:
 - agent_type MUST be exactly "writer" or "reader".
-- For agent_task the agent_name MUST be one of the registered agents.
+- For intents 2-4 the agent_name MUST be one of the registered agents.
+- When the user says "remember", "store", "note", "save" -> use agent_remember.
+- When the user says "recall", "what do you remember", "what do you know" -> use agent_recall.
+- When the user asks to run SQL, query a table, insert/update/delete rows -> use agent_task.
 - Output ONLY the JSON object."""
 
 
@@ -119,7 +128,7 @@ def build_graph(mcp_session: ClientSession, llm: ChatOpenAI):
                 "tool_output": json.dumps(parsed),
             }
 
-        if intent == "agent_task":
+        if intent in ("agent_task", "agent_remember", "agent_recall"):
             agent_name = parsed.get("agent_name", "")
             if agent_name not in state.get("agents", {}):
                 return {
@@ -158,6 +167,74 @@ def build_graph(mcp_session: ClientSession, llm: ChatOpenAI):
                         f"`{agent_name}_mem0_graph` graph and "
                         f"`{agent_name}_mem0_collection` vector collection.",
             )],
+            "current_agent": None,
+            "tool_output": None,
+        }
+
+    async def agent_remember(state: ChatState) -> dict:
+        parsed = json.loads(state["tool_output"])
+        agent_name = state["current_agent"]
+        text = parsed["text"]
+
+        try:
+            await call_tool(mcp_session, "add_memory", {
+                "text": text,
+                "agent_id": agent_name,
+            })
+            msg = f"[{agent_name}] Stored in memory: \"{text}\""
+        except Exception as e:
+            msg = f"[{agent_name}] Failed to store memory: {e}"
+
+        return {
+            "messages": [AIMessage(content=msg)],
+            "current_agent": None,
+            "tool_output": None,
+        }
+
+    async def agent_recall(state: ChatState) -> dict:
+        parsed = json.loads(state["tool_output"])
+        agent_name = state["current_agent"]
+        query = parsed["query"]
+
+        try:
+            raw = await call_tool(mcp_session, "search_memories", {
+                "query": query,
+                "agent_id": agent_name,
+                "limit": 10,
+            })
+            mem_data = json.loads(raw)
+            results = (
+                mem_data.get("results", mem_data)
+                if isinstance(mem_data, dict) else mem_data
+            )
+            if results:
+                lines = []
+                for item in results:
+                    m = item.get("memory", "") if isinstance(item, dict) else str(item)
+                    if m:
+                        lines.append(f"  - {m}")
+                if lines:
+                    msg = f"[{agent_name}] Memories matching \"{query}\":\n" + "\n".join(lines)
+                else:
+                    msg = f"[{agent_name}] No memories found for \"{query}\"."
+            else:
+                msg = f"[{agent_name}] No memories found for \"{query}\"."
+
+            relations = mem_data.get("relations") if isinstance(mem_data, dict) else None
+            if relations:
+                rel_lines = []
+                for rel in relations:
+                    src = rel.get("source", "?")
+                    tgt = rel.get("target", rel.get("destination", "?"))
+                    label = rel.get("relationship", rel.get("label", "?"))
+                    rel_lines.append(f"  - {src} --[{label}]--> {tgt}")
+                if rel_lines:
+                    msg += "\n  Graph relations:\n" + "\n".join(rel_lines)
+        except Exception as e:
+            msg = f"[{agent_name}] Error recalling memories: {e}"
+
+        return {
+            "messages": [AIMessage(content=msg)],
             "current_agent": None,
             "tool_output": None,
         }
@@ -257,6 +334,10 @@ def build_graph(mcp_session: ClientSession, llm: ChatOpenAI):
                 intent = parsed.get("intent")
                 if intent == "create_agent":
                     return "create_agent"
+                if intent == "agent_remember":
+                    return "agent_remember"
+                if intent == "agent_recall":
+                    return "agent_recall"
                 if intent == "agent_task":
                     return "agent_executor"
             except (json.JSONDecodeError, KeyError):
@@ -268,15 +349,21 @@ def build_graph(mcp_session: ClientSession, llm: ChatOpenAI):
     graph = StateGraph(ChatState)
     graph.add_node("supervisor", supervisor)
     graph.add_node("create_agent", create_agent)
+    graph.add_node("agent_remember", agent_remember)
+    graph.add_node("agent_recall", agent_recall)
     graph.add_node("agent_executor", agent_executor)
 
     graph.add_edge(START, "supervisor")
     graph.add_conditional_edges("supervisor", route, {
         "create_agent": "create_agent",
+        "agent_remember": "agent_remember",
+        "agent_recall": "agent_recall",
         "agent_executor": "agent_executor",
         "__end__": END,
     })
     graph.add_edge("create_agent", END)
+    graph.add_edge("agent_remember", END)
+    graph.add_edge("agent_recall", END)
     graph.add_edge("agent_executor", END)
 
     return graph.compile()
@@ -290,7 +377,7 @@ async def chat_loop(url: str, model: str) -> None:
     llm = ChatOpenAI(model=model)
 
     print(f"Connecting to MCP server at {url} ...")
-    async with streamable_http_client(url) as (read_stream, write_stream):
+    async with streamable_http_client(url) as (read_stream, write_stream, _):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
 
@@ -298,12 +385,11 @@ async def chat_loop(url: str, model: str) -> None:
             tool_names = [t.name for t in tools.tools]
             print(f"Connected. {len(tool_names)} MCP tools available.")
             print(
-                "Create agents with natural language, e.g.:\n"
-                '  "Create a writer agent called db_writer"\n'
-                '  "Create a reader agent called db_reader"\n'
-                "Then issue tasks:\n"
-                '  "Using db_writer, insert a user Alice aged 30"\n'
-                '  "Using db_reader, show all users"\n'
+                "Commands (natural language):\n"
+                '  Create agents:  "Create a reader agent called db_reader"\n'
+                '  DB tasks:       "Using db_reader, show all customers"\n'
+                '  Remember:       "db_reader remember that I like ice cream"\n'
+                '  Recall:         "db_reader what do you remember?"\n'
             )
             print("Type 'quit' or 'exit' to end.\n")
 
