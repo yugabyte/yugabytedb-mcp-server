@@ -409,28 +409,53 @@ def _ensure_graph_conn(m: Memory) -> None:
         cur.execute("SET search_path = ag_catalog, public;")
 
 
-def _patch_graph_execute_sql(graph) -> None:
-    """Patch MemoryGraph._execute_sql to format vectors as pgvector strings.
+def _vec_to_str(v):
+    """Convert a float list to pgvector string format ``'[0.03,…]'``.
 
-    The fork passes embedding lists as psycopg2 parameters which are
-    serialised as ``ARRAY[0.03, …]``.  PostgreSQL handles the
-    ``::vector`` cast fine, but YugabyteDB's backend crashes (exit code 2)
-    on large arrays.  This patch converts float-list params to the
-    ``'[0.03,…]'`` string format that pgvector expects natively.
+    psycopg2 serialises Python lists as ``ARRAY[…]``.  YugabyteDB's
+    pgvector crashes (SIGILL / exit-code 2) when evaluating operators
+    like ``<=>`` against that format.  The native pgvector string
+    representation avoids the broken code path.
     """
+    if isinstance(v, list) and v and isinstance(v[0], float):
+        return "[" + ",".join(str(x) for x in v) + "]"
+    return v
+
+
+def _patch_graph_execute_sql(graph) -> None:
+    """Patch MemoryGraph._execute_sql for YugabyteDB vector compatibility."""
     original = graph._execute_sql
 
     def _patched(sql, params=None, fetch=False):
         if params:
-            params = [
-                "[" + ",".join(str(x) for x in p) + "]"
-                if isinstance(p, list) and p and isinstance(p[0], float)
-                else p
-                for p in params
-            ]
+            params = [_vec_to_str(p) for p in params]
         return original(sql, params, fetch)
 
     graph._execute_sql = _patched
+
+
+def _patch_vector_store(vs) -> None:
+    """Patch PGVector methods for YugabyteDB vector compatibility.
+
+    ``search`` and ``update`` pass embedding lists to psycopg2 which
+    serialises them as ``ARRAY[…]``.  The ``<=>`` operator and
+    ``::vector`` cast crash on YugabyteDB with that format.
+    """
+    orig_search = vs.search
+    orig_update = vs.update
+
+    def _patched_search(query, vectors, limit=5, filters=None):
+        return orig_search(
+            query=query, vectors=_vec_to_str(vectors), limit=limit, filters=filters,
+        )
+
+    def _patched_update(vector_id, vector=None, payload=None):
+        if vector is not None:
+            vector = _vec_to_str(vector)
+        return orig_update(vector_id=vector_id, vector=vector, payload=payload)
+
+    vs.search = _patched_search
+    vs.update = _patched_update
 
 
 def _build_mem0(agent_id: str) -> Memory:
@@ -457,9 +482,15 @@ def _build_mem0(agent_id: str) -> Memory:
 
     m = Memory.from_config(config)
 
+    # Patch both the graph store and vector store to send vectors as
+    # pgvector string literals instead of ARRAY[…] which crashes YugabyteDB.
     graph = getattr(m, "graph", None)
     if graph is not None and hasattr(graph, "_execute_sql"):
         _patch_graph_execute_sql(graph)
+
+    vs = getattr(m, "vector_store", None)
+    if vs is not None and hasattr(vs, "search"):
+        _patch_vector_store(vs)
 
     return m
 
