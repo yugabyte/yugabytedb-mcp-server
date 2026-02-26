@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional
 
 from mcp.server.fastmcp import Context
 from mem0 import Memory
+from mem0.graphs.configs import ApacheAgeConfig
 
 
 def _get_conn(ctx: Context):
@@ -381,6 +382,13 @@ def _get_mem0(agent_id: str) -> Memory:
         config.setdefault("vector_store", {}).setdefault("config", {})["collection_name"] = (
             f"{agent_id}_mem0_collection"
         )
+        # Pre-construct ApacheAgeConfig so Pydantic's Union resolution on
+        # GraphStoreConfig.config doesn't silently match KuzuConfig first
+        # and discard the apache_age fields.
+        if config.get("graph_store", {}).get("provider") == "apache_age":
+            config["graph_store"]["config"] = ApacheAgeConfig(
+                **config["graph_store"]["config"]
+            )
         _mem0_cache[agent_id] = Memory.from_config(config)
     return _mem0_cache[agent_id]
 

@@ -88,7 +88,10 @@ async def call_tool(session: ClientSession, name: str, args: dict[str, Any]) -> 
     for block in result.content:
         if hasattr(block, "text"):
             parts.append(block.text)
-    return "\n".join(parts)
+    text = "\n".join(parts)
+    if result.isError:
+        raise RuntimeError(f"MCP tool '{name}' returned error: {text}")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -177,12 +180,14 @@ def build_graph(mcp_session: ClientSession, llm: ChatOpenAI):
         text = parsed["text"]
 
         try:
-            await call_tool(mcp_session, "add_memory", {
+            raw = await call_tool(mcp_session, "add_memory", {
                 "text": text,
                 "agent_id": agent_name,
             })
+            print(f"  [{agent_name}] add_memory response: {raw[:200]}", file=sys.stderr)
             msg = f"[{agent_name}] Stored in memory: \"{text}\""
         except Exception as e:
+            print(f"  [{agent_name}] add_memory FAILED: {e}", file=sys.stderr)
             msg = f"[{agent_name}] Failed to store memory: {e}"
 
         return {
@@ -202,36 +207,58 @@ def build_graph(mcp_session: ClientSession, llm: ChatOpenAI):
                 "agent_id": agent_name,
                 "limit": 10,
             })
+            print(f"  [{agent_name}] search_memories raw ({len(raw)} chars): {raw[:300]}", file=sys.stderr)
+        except Exception as e:
+            print(f"  [{agent_name}] search_memories call FAILED: {e}", file=sys.stderr)
+            return {
+                "messages": [AIMessage(content=f"[{agent_name}] Error calling search_memories: {e}")],
+                "current_agent": None,
+                "tool_output": None,
+            }
+
+        if not raw or not raw.strip():
+            return {
+                "messages": [AIMessage(content=f"[{agent_name}] No memories found (empty response from server).")],
+                "current_agent": None,
+                "tool_output": None,
+            }
+
+        try:
             mem_data = json.loads(raw)
-            results = (
-                mem_data.get("results", mem_data)
-                if isinstance(mem_data, dict) else mem_data
-            )
-            if results:
-                lines = []
-                for item in results:
-                    m = item.get("memory", "") if isinstance(item, dict) else str(item)
-                    if m:
-                        lines.append(f"  - {m}")
-                if lines:
-                    msg = f"[{agent_name}] Memories matching \"{query}\":\n" + "\n".join(lines)
-                else:
-                    msg = f"[{agent_name}] No memories found for \"{query}\"."
+        except json.JSONDecodeError:
+            return {
+                "messages": [AIMessage(content=f"[{agent_name}] Server returned non-JSON: {raw[:200]}")],
+                "current_agent": None,
+                "tool_output": None,
+            }
+
+        results = (
+            mem_data.get("results", mem_data)
+            if isinstance(mem_data, dict) else mem_data
+        )
+        if results:
+            lines = []
+            for item in results:
+                m = item.get("memory", "") if isinstance(item, dict) else str(item)
+                if m:
+                    lines.append(f"  - {m}")
+            if lines:
+                msg = f"[{agent_name}] Memories matching \"{query}\":\n" + "\n".join(lines)
             else:
                 msg = f"[{agent_name}] No memories found for \"{query}\"."
+        else:
+            msg = f"[{agent_name}] No memories found for \"{query}\"."
 
-            relations = mem_data.get("relations") if isinstance(mem_data, dict) else None
-            if relations:
-                rel_lines = []
-                for rel in relations:
-                    src = rel.get("source", "?")
-                    tgt = rel.get("target", rel.get("destination", "?"))
-                    label = rel.get("relationship", rel.get("label", "?"))
-                    rel_lines.append(f"  - {src} --[{label}]--> {tgt}")
-                if rel_lines:
-                    msg += "\n  Graph relations:\n" + "\n".join(rel_lines)
-        except Exception as e:
-            msg = f"[{agent_name}] Error recalling memories: {e}"
+        relations = mem_data.get("relations") if isinstance(mem_data, dict) else None
+        if relations:
+            rel_lines = []
+            for rel in relations:
+                src = rel.get("source", "?")
+                tgt = rel.get("target", rel.get("destination", "?"))
+                label = rel.get("relationship", rel.get("label", "?"))
+                rel_lines.append(f"  - {src} --[{label}]--> {tgt}")
+            if rel_lines:
+                msg += "\n  Graph relations:\n" + "\n".join(rel_lines)
 
         return {
             "messages": [AIMessage(content=msg)],
@@ -266,8 +293,12 @@ def build_graph(mcp_session: ClientSession, llm: ChatOpenAI):
                     if m:
                         lines.append(f"- {m}")
                 memories = "\n".join(lines)
-        except Exception:
-            pass
+            if memories:
+                print(f"  [{agent_name}] recalled {len(lines)} memories", file=sys.stderr)
+            else:
+                print(f"  [{agent_name}] no prior memories found", file=sys.stderr)
+        except Exception as e:
+            print(f"  [{agent_name}] memory recall failed: {e}", file=sys.stderr)
 
         # 2. Generate SQL using the LLM
         role_hint = (
@@ -292,6 +323,8 @@ def build_graph(mcp_session: ClientSession, llm: ChatOpenAI):
                 sql = sql[:-3]
             sql = sql.strip()
 
+        print(f"  [{agent_name}] SQL: {sql}", file=sys.stderr)
+
         # 3. Execute via MCP
         tool_name = "run_write_query" if agent_type == "writer" else "run_read_only_query"
         try:
@@ -302,12 +335,13 @@ def build_graph(mcp_session: ClientSession, llm: ChatOpenAI):
         # 4. Store this interaction in the agent's isolated memory
         memory_text = f"Task: {task} | SQL: {sql} | Result: {result}"
         try:
-            await call_tool(mcp_session, "add_memory", {
+            store_result = await call_tool(mcp_session, "add_memory", {
                 "text": memory_text,
                 "agent_id": agent_name,
             })
-        except Exception:
-            pass
+            print(f"  [{agent_name}] memory stored successfully", file=sys.stderr)
+        except Exception as e:
+            print(f"  [{agent_name}] FAILED to store memory: {e}", file=sys.stderr)
 
         # 5. Summarise for the user
         summary_prompt = (
