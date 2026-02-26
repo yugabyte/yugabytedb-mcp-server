@@ -384,9 +384,10 @@ def _get_mem0(agent_id: str) -> Memory:
         )
         # Pre-construct ApacheAgeConfig so Pydantic's Union resolution on
         # GraphStoreConfig.config doesn't silently match KuzuConfig first
-        # and discard the apache_age fields.
+        # and discard the apache_age fields.  Use model_construct() to
+        # bypass the model_validator that rejects empty passwords.
         if config.get("graph_store", {}).get("provider") == "apache_age":
-            config["graph_store"]["config"] = ApacheAgeConfig(
+            config["graph_store"]["config"] = ApacheAgeConfig.model_construct(
                 **config["graph_store"]["config"]
             )
         _mem0_cache[agent_id] = Memory.from_config(config)
