@@ -1,0 +1,13 @@
+[project]
+name = "langgraph-mcp-chatbot"
+version = "0.1.0"
+description = "LangGraph multi-agent chatbot with per-agent MCP memory isolation"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2",
+    "langchain-openai>=0.3",
+    "mcp[cli]>=1.9.4",
+]
+
+[project.scripts]
+chatbot = "chatbot:main"

@@ -20,7 +20,8 @@
         "port": 5433,
         "dbname": "yugabyte",
         "user": "yugabyte",
-        "password": ""
+        "password": "",
+        "collection_name": "SET_DYNAMICALLY_PER_AGENT"
       }
     },
     "graph_store": {
@@ -31,7 +32,7 @@
         "database": "yugabyte",
         "user": "yugabyte",
         "password": "",
-        "graph_name": "mem0_graph"
+        "graph_name": "SET_DYNAMICALLY_PER_AGENT"
       },
       "threshold": 0.7
     }

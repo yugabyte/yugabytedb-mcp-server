@@ -1,4 +1,5 @@
 # tools.py
+import copy
 import json
 import os
 from typing import List, Dict, Any, Optional
@@ -12,9 +13,6 @@ def _get_conn(ctx: Context):
     return ctx.request_context.lifespan_context.conn
 
 
-# ---------------------------------------------------------------------------
-# Existing tools
-# ---------------------------------------------------------------------------
 
 def summarize_database(ctx: Context, schema: str = "public") -> List[Dict[str, Any]]:
     """
@@ -78,145 +76,39 @@ def run_read_only_query(ctx: Context, query: str) -> str:
                 return f"Couldn't ROLLBACK transaction: {e}"
 
 
+def run_write_query(ctx: Context, query: str) -> str:
+    """
+    Execute a write SQL statement against the database.
+
+    Runs the given SQL (e.g. INSERT, UPDATE, DELETE, CALL) inside a
+    transaction.  On success the transaction is committed and the number of
+    affected rows is returned.  On failure the transaction is rolled back
+    automatically.
+
+    Args:
+        ctx: MCP context (injected automatically).
+        query: The SQL statement to execute.
+
+    Returns:
+        JSON string with the number of rows affected, or an error message.
+    """
+    conn = _get_conn(ctx)
+    with conn.cursor() as cur:
+        try:
+            cur.execute(query)
+            conn.commit()
+            rows_affected = cur.rowcount
+            return json.dumps({
+                "rows_affected": rows_affected,
+            })
+        except Exception as e:
+            conn.rollback()
+            return f"Error executing write query: {e}"
+
+
 # ---------------------------------------------------------------------------
 # pg_dist_rag tools
 # ---------------------------------------------------------------------------
-
-# def add_document_source(ctx: Context, source_uri: str) -> str:
-#     """
-#     Add a document source to pg_dist_rag for RAG pipeline processing.
-
-#     This registers a new source location (e.g. an S3 bucket path) so that
-#     its documents can later be indexed.  The call inserts a row into
-#     ``dist_rag.sources`` and returns the generated ``source_id``.
-
-#     Args:
-#         ctx: MCP context (injected automatically).
-#         source_uri: URI of the document source (e.g. ``s3://bucket/path/``).
-
-#     Returns:
-#         JSON string with the created ``source_id``, or an error message.
-#     """
-#     conn = _get_conn(ctx)
-#     with conn.cursor() as cur:
-#         try:
-#             cur.execute(
-#                 """
-#                 SELECT dist_rag.create_source(%s)
-#                 """,
-#                 (source_uri,),
-#             )
-#             result = cur.fetchone()
-#             conn.commit()
-#             source_id = str(result[0]) if result else None
-#             return json.dumps({"source_id": source_id})
-#         except Exception as e:
-#             conn.rollback()
-#             return f"Error adding document source: {e}"
-
-
-# def init_vector_index(
-#     ctx: Context,
-#     index_name: str,
-#     source_ids: str,
-#     ai_provider: str = "OPENAI",
-#     embedding_model: str = "text-embedding-3-large",
-#     embedding_dimensions: int = 1536,
-#     chunk_size: int = 1024,
-#     chunk_overlap: int = 256,
-# ) -> str:
-#     """
-#     Initialise a new vector index in pg_dist_rag.
-
-#     Creates the index metadata and associates it with the given sources so it
-#     is ready to be built.
-
-#     Args:
-#         ctx: MCP context (injected automatically).
-#         index_name: Name for the new vector index.
-#         source_ids: Comma-separated list of source UUIDs to include.
-#         ai_provider: AI / embedding provider name (e.g. ``OPENAI``).
-#         embedding_model: Embedding model name (e.g. ``text-embedding-3-large``).
-#         embedding_dimensions: Dimensions of the embedding vector (e.g. ``1536``).
-#         chunk_size: Number of characters per chunk (e.g. ``1024``).
-#         chunk_overlap: Number of overlapping characters between chunks (e.g. ``256``).
-
-#     Returns:
-#         JSON string with the created ``index_id``, or an error message.
-#     """
-#     conn = _get_conn(ctx)
-#     source_id_list = [s.strip() for s in source_ids.split(",") if s.strip()]
-#     embedding_model_params = json.dumps({
-#         "model": embedding_model,
-#         "dimensions": embedding_dimensions,
-#     })
-#     chunk_params = json.dumps({
-#         "chunk_size": chunk_size,
-#         "chunk_overlap": chunk_overlap,
-#     })
-#     with conn.cursor() as cur:
-#         try:
-#             cur.execute(
-#                 """
-#                 SELECT dist_rag.init_vector_index(
-#                     r_index_name := %s,
-#                     r_sources := %s::UUID[],
-#                     r_ai_provider := %s,
-#                     r_embedding_model_params := %s,
-#                     r_chunk_params := %s
-#                 ) AS index_id
-#                 """,
-#                 (
-#                     index_name,
-#                     source_id_list,
-#                     ai_provider,
-#                     embedding_model_params,
-#                     chunk_params,
-#                 ),
-#             )
-#             result = cur.fetchone()
-#             conn.commit()
-#             index_id = str(result[0]) if result else None
-#             return json.dumps({"index_id": index_id})
-#         except Exception as e:
-#             conn.rollback()
-#             return f"Error initializing vector index: {e}"
-
-
-# def trigger_index_build(ctx: Context, index_name: str) -> str:
-#     """
-#     Start building (or rebuilding) a vector index.
-
-#     Triggers the pg_dist_rag preprocessing pipeline for the given index.
-#     Workers will begin processing documents, generating chunks, and creating
-#     embeddings.
-
-#     Args:
-#         ctx: MCP context (injected automatically).
-#         index_name: Name of the vector index to build.
-
-#     Returns:
-#         JSON string confirming the build was triggered, or an error message.
-#     """
-#     conn = _get_conn(ctx)
-#     with conn.cursor() as cur:
-#         try:
-#             cur.execute(
-#                 """
-#                 SELECT dist_rag.build_index(r_index_name := %s)
-#                 """,
-#                 (index_name,),
-#             )
-#             conn.commit()
-#             return json.dumps({
-#                 "status": "triggered",
-#                 "index_name": index_name,
-#                 "message": f"Index build triggered for '{index_name}'.",
-#             })
-#         except Exception as e:
-#             conn.rollback()
-#             return f"Error triggering index build: {e}"
-
 
 def check_index_status(ctx: Context, index_name: str) -> str:
     """
@@ -329,35 +221,6 @@ def add_source_to_index(
             conn.rollback()
             return f"Error adding source to index: {e}"
 
-
-def run_write_query(ctx: Context, query: str) -> str:
-    """
-    Execute a write SQL statement against the database.
-
-    Runs the given SQL (e.g. INSERT, UPDATE, DELETE, CALL) inside a
-    transaction.  On success the transaction is committed and the number of
-    affected rows is returned.  On failure the transaction is rolled back
-    automatically.
-
-    Args:
-        ctx: MCP context (injected automatically).
-        query: The SQL statement to execute.
-
-    Returns:
-        JSON string with the number of rows affected, or an error message.
-    """
-    conn = _get_conn(ctx)
-    with conn.cursor() as cur:
-        try:
-            cur.execute(query)
-            conn.commit()
-            rows_affected = cur.rowcount
-            return json.dumps({
-                "rows_affected": rows_affected,
-            })
-        except Exception as e:
-            conn.rollback()
-            return f"Error executing write query: {e}"
 
 
 def trigger_knowledge_base_build(
@@ -485,26 +348,41 @@ def trigger_knowledge_base_build(
 # mem0 tools
 # ---------------------------------------------------------------------------
 
-_mem0_instance: Optional[Memory] = None
+_mem0_cache: Dict[str, Memory] = {}
+_mem0_base_config: Optional[dict] = None
 
 
-def _get_mem0() -> Memory:
-    """Lazily initialise the local Mem0 Memory instance from config.json.
-
-    Uses pgvector as the vector store and Apache AGE as the graph store,
-    both configured in config.json.  Requires OPENAI_API_KEY in the
-    environment (used by the default embedder and LLM).
-    """
-    global _mem0_instance
-    if _mem0_instance is None:
+def _load_base_config() -> dict:
+    """Load and cache the base mem0 config from config.json."""
+    global _mem0_base_config
+    if _mem0_base_config is None:
         config_path = os.environ.get(
             "MEM0_CONFIG_PATH",
             os.path.join(os.path.dirname(__file__), "..", "config.json"),
         )
         with open(config_path) as f:
-            config = json.load(f)
-        _mem0_instance = Memory.from_config(config["mem0"])
-    return _mem0_instance
+            _mem0_base_config = json.load(f)["mem0"]
+    return _mem0_base_config
+
+
+def _get_mem0(agent_id: str) -> Memory:
+    """Return a Memory instance isolated to *agent_id*.
+
+    Each agent gets its own Apache AGE graph (``{agent_id}_mem0_graph``)
+    and pgvector collection (``{agent_id}_mem0_collection``).  Instances
+    are cached so repeated calls for the same agent are cheap.
+
+    Requires OPENAI_API_KEY in the environment (used by the default
+    embedder and LLM).
+    """
+    if agent_id not in _mem0_cache:
+        config = copy.deepcopy(_load_base_config())
+        config["graph_store"]["config"]["graph_name"] = f"{agent_id}_mem0_graph"
+        config.setdefault("vector_store", {}).setdefault("config", {})["collection_name"] = (
+            f"{agent_id}_mem0_collection"
+        )
+        _mem0_cache[agent_id] = Memory.from_config(config)
+    return _mem0_cache[agent_id]
 
 
 _transport_mode: str = "stdio"
@@ -544,8 +422,8 @@ def _resolve_user_id(
 def add_memory(
     ctx: Context,
     text: str,
+    agent_id: str,
     user_id: Optional[str] = None,
-    agent_id: Optional[str] = None,
     app_id: Optional[str] = None,
     run_id: Optional[str] = None,
     metadata: Optional[str] = None,
@@ -555,15 +433,17 @@ def add_memory(
     """
     Store a memory using Mem0 (a fact, preference, or conversation snippet).
 
-    Memories are stored in pgvector and, when graph is enabled, also
-    extracted as entity-relationship triples in Apache AGE.
+    Memories are stored in a per-agent pgvector collection and, when graph
+    is enabled, also extracted as entity-relationship triples in a per-agent
+    Apache AGE graph.
 
     Args:
         ctx: MCP context (injected automatically).
         text: Plain text content to store as a memory.
-        user_id: User ID to scope the memory to. Defaults to the
-            MEM0_USER_ID environment variable.
-        agent_id: Optional agent identifier for scoping.
+        agent_id: Agent identifier. Determines which isolated graph and
+            vector collection the memory is stored in.
+        user_id: Optional user ID for additional scoping within the agent's
+            memory store.
         app_id: Optional app identifier for scoping.
         run_id: Optional run identifier for scoping.
         metadata: Optional JSON string of arbitrary metadata to attach.
@@ -576,22 +456,17 @@ def add_memory(
     Returns:
         JSON string with the created memory details, or an error message.
     """
-    m = _get_mem0()
+    m = _get_mem0(agent_id)
 
-    kwargs: Dict[str, Any] = {"enable_graph": enable_graph}
+    kwargs: Dict[str, Any] = {"enable_graph": enable_graph, "agent_id": agent_id}
 
     uid = _resolve_user_id(user_id, agent_id, run_id)
     if uid:
         kwargs["user_id"] = uid
-    if agent_id:
-        kwargs["agent_id"] = agent_id
     if app_id:
         kwargs["app_id"] = app_id
     if run_id:
         kwargs["run_id"] = run_id
-
-    if not uid and not agent_id and not run_id:
-        return _USER_ID_REQUIRED_ERROR
 
     if metadata:
         try:
@@ -619,18 +494,19 @@ def add_memory(
         return f"Error adding memory: {e}"
 
 
-def delete_memory(ctx: Context, memory_id: str) -> str:
+def delete_memory(ctx: Context, memory_id: str, agent_id: str) -> str:
     """
     Delete a single memory by its ID.
 
     Args:
         ctx: MCP context (injected automatically).
         memory_id: The exact ID of the memory to delete.
+        agent_id: Agent identifier whose memory store contains this memory.
 
     Returns:
         JSON string confirming deletion, or an error message.
     """
-    m = _get_mem0()
+    m = _get_mem0(agent_id)
     try:
         result = m.delete(memory_id)
         return json.dumps(result, ensure_ascii=False, indent=2, default=str)
@@ -641,6 +517,7 @@ def delete_memory(ctx: Context, memory_id: str) -> str:
 def search_memories(
     ctx: Context,
     query: str,
+    agent_id: str,
     user_id: Optional[str] = None,
     limit: int = 10,
     enable_graph: bool = True,
@@ -649,13 +526,14 @@ def search_memories(
     Semantic search across stored memories and graph relations.
 
     Returns both vector-matched memories and, when graph is enabled,
-    entity-relationship triples from Apache AGE.
+    entity-relationship triples from the agent's Apache AGE graph.
 
     Args:
         ctx: MCP context (injected automatically).
         query: Natural language description of what to find.
-        user_id: User ID to scope the search to. Defaults to the
-            MEM0_USER_ID environment variable.
+        agent_id: Agent identifier whose memory store to search.
+        user_id: Optional user ID for additional scoping within the
+            agent's memory store.
         limit: Maximum number of results to return.
         enable_graph: Whether to also return graph relations.
             Defaults to True.
@@ -664,34 +542,36 @@ def search_memories(
         JSON string with matching memories (and relations when graph is
         enabled), or an error message.
     """
-    m = _get_mem0()
-    uid = _resolve_user_id(user_id)
-    if not uid:
-        return _USER_ID_REQUIRED_ERROR
+    m = _get_mem0(agent_id)
+    kwargs: Dict[str, Any] = {
+        "query": query,
+        "agent_id": agent_id,
+        "limit": limit,
+        "enable_graph": enable_graph,
+    }
+    uid = _resolve_user_id(user_id, agent_id)
+    if uid:
+        kwargs["user_id"] = uid
     try:
-        result = m.search(
-            query=query,
-            user_id=uid,
-            limit=limit,
-            enable_graph=enable_graph,
-        )
+        result = m.search(**kwargs)
         return json.dumps(result, ensure_ascii=False, indent=2, default=str)
     except Exception as e:
         return f"Error searching memories: {e}"
 
 
-def get_memory_by_id(ctx: Context, memory_id: str) -> str:
+def get_memory_by_id(ctx: Context, memory_id: str, agent_id: str) -> str:
     """
     Retrieve a single memory by its exact ID.
 
     Args:
         ctx: MCP context (injected automatically).
         memory_id: The exact ID of the memory to fetch.
+        agent_id: Agent identifier whose memory store contains this memory.
 
     Returns:
         JSON string with the memory details, or an error message.
     """
-    m = _get_mem0()
+    m = _get_mem0(agent_id)
     try:
         result = m.get(memory_id)
         return json.dumps(result, ensure_ascii=False, indent=2, default=str)
@@ -701,39 +581,33 @@ def get_memory_by_id(ctx: Context, memory_id: str) -> str:
 
 def get_memories(
     ctx: Context,
+    agent_id: str,
     user_id: Optional[str] = None,
-    agent_id: Optional[str] = None,
     app_id: Optional[str] = None,
     run_id: Optional[str] = None,
 ) -> str:
     """
-    List all memories for a given scope (user, agent, app, or run).
+    List all memories for a given agent (optionally narrowed by user, app, or run).
 
     Args:
         ctx: MCP context (injected automatically).
-        user_id: User ID to list memories for. Defaults to the
-            MEM0_USER_ID environment variable.
-        agent_id: Optional agent identifier to filter by.
+        agent_id: Agent identifier whose memory store to list.
+        user_id: Optional user ID for additional scoping.
         app_id: Optional app identifier to filter by.
         run_id: Optional run identifier to filter by.
 
     Returns:
         JSON string with the list of memories, or an error message.
     """
-    m = _get_mem0()
-    kwargs: Dict[str, Any] = {}
+    m = _get_mem0(agent_id)
+    kwargs: Dict[str, Any] = {"agent_id": agent_id}
     uid = _resolve_user_id(user_id, agent_id, run_id)
     if uid:
         kwargs["user_id"] = uid
-    if agent_id:
-        kwargs["agent_id"] = agent_id
     if app_id:
         kwargs["app_id"] = app_id
     if run_id:
         kwargs["run_id"] = run_id
-
-    if not kwargs:
-        return _USER_ID_REQUIRED_ERROR
 
     try:
         result = m.get_all(**kwargs)
@@ -742,7 +616,7 @@ def get_memories(
         return f"Error listing memories: {e}"
 
 
-def update_memory(ctx: Context, memory_id: str, text: str) -> str:
+def update_memory(ctx: Context, memory_id: str, text: str, agent_id: str) -> str:
     """
     Overwrite an existing memory's text.
 
@@ -750,11 +624,12 @@ def update_memory(ctx: Context, memory_id: str, text: str) -> str:
         ctx: MCP context (injected automatically).
         memory_id: The exact ID of the memory to update.
         text: The replacement text for the memory.
+        agent_id: Agent identifier whose memory store contains this memory.
 
     Returns:
         JSON string with the updated memory details, or an error message.
     """
-    m = _get_mem0()
+    m = _get_mem0(agent_id)
     try:
         result = m.update(memory_id=memory_id, data=text)
         return json.dumps(result, ensure_ascii=False, indent=2, default=str)
@@ -764,41 +639,33 @@ def update_memory(ctx: Context, memory_id: str, text: str) -> str:
 
 def delete_all_memories(
     ctx: Context,
+    agent_id: str,
     user_id: Optional[str] = None,
-    agent_id: Optional[str] = None,
     app_id: Optional[str] = None,
     run_id: Optional[str] = None,
 ) -> str:
     """
-    Delete all memories in the given scope.
-
-    Provide at least one of user_id, agent_id, app_id, or run_id to
-    define which memories to delete.
+    Delete all memories for a given agent (optionally narrowed by user, app, or run).
 
     Args:
         ctx: MCP context (injected automatically).
-        user_id: Delete all memories for this user.
-        agent_id: Delete all memories for this agent.
-        app_id: Delete all memories for this app.
-        run_id: Delete all memories for this run.
+        agent_id: Agent identifier whose memories to delete.
+        user_id: Optional user ID for additional scoping.
+        app_id: Optional app identifier for scoping.
+        run_id: Optional run identifier for scoping.
 
     Returns:
         JSON string confirming deletion, or an error message.
     """
-    m = _get_mem0()
-    kwargs: Dict[str, Any] = {}
+    m = _get_mem0(agent_id)
+    kwargs: Dict[str, Any] = {"agent_id": agent_id}
     uid = _resolve_user_id(user_id, agent_id, run_id)
     if uid:
         kwargs["user_id"] = uid
-    if agent_id:
-        kwargs["agent_id"] = agent_id
     if app_id:
         kwargs["app_id"] = app_id
     if run_id:
         kwargs["run_id"] = run_id
-
-    if not kwargs:
-        return _USER_ID_REQUIRED_ERROR
 
     try:
         result = m.delete_all(**kwargs)
