@@ -367,23 +367,33 @@ def _load_base_config() -> dict:
 
 
 def _ensure_graph_conn(m: Memory) -> None:
-    """Reconnect the MemoryGraph's psycopg2 connection if it has been closed.
+    """Reconnect the MemoryGraph's psycopg2 connection if it is unusable.
 
     The fork's graph methods (``_search_graph_db``, ``_delete_entities``,
     ``_add_entities``) wrap Cypher calls in broad ``except Exception:
-    continue`` handlers.  If a query triggers a server error that kills the
-    connection, the error is silently swallowed and the method returns
-    partial results.  The connection is left marked as closed, and the
-    *next* operation discovers it.  This function detects that state and
-    re-establishes the connection in-place so the cached Memory instance
-    remains fully usable.
+    continue`` handlers.  On YugabyteDB + Apache AGE, certain Cypher
+    queries (particularly MERGE) can trigger server errors that kill the
+    connection.  The error is silently swallowed and the method returns
+    partial results.  This function probes the connection with a real
+    query to catch both explicitly-closed and silently-broken states,
+    then re-establishes it in-place.
     """
     import psycopg2 as _pg2
 
     graph = getattr(m, "graph", None)
     if graph is None or not hasattr(graph, "conn"):
         return
+
+    alive = False
     if not graph.conn.closed:
+        try:
+            with graph.conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            alive = True
+        except Exception:
+            pass
+
+    if alive:
         return
 
     cfg = graph.config.graph_store.config
@@ -397,6 +407,30 @@ def _ensure_graph_conn(m: Memory) -> None:
     graph.conn.autocommit = True
     with graph.conn.cursor() as cur:
         cur.execute("SET search_path = ag_catalog, public;")
+
+
+def _patch_graph_execute_sql(graph) -> None:
+    """Patch MemoryGraph._execute_sql to format vectors as pgvector strings.
+
+    The fork passes embedding lists as psycopg2 parameters which are
+    serialised as ``ARRAY[0.03, …]``.  PostgreSQL handles the
+    ``::vector`` cast fine, but YugabyteDB's backend crashes (exit code 2)
+    on large arrays.  This patch converts float-list params to the
+    ``'[0.03,…]'`` string format that pgvector expects natively.
+    """
+    original = graph._execute_sql
+
+    def _patched(sql, params=None, fetch=False):
+        if params:
+            params = [
+                "[" + ",".join(str(x) for x in p) + "]"
+                if isinstance(p, list) and p and isinstance(p[0], float)
+                else p
+                for p in params
+            ]
+        return original(sql, params, fetch)
+
+    graph._execute_sql = _patched
 
 
 def _build_mem0(agent_id: str) -> Memory:
@@ -420,7 +454,14 @@ def _build_mem0(agent_id: str) -> Memory:
             custom_prompt=gs.get("custom_prompt"),
             threshold=gs.get("threshold", 0.7),
         )
-    return Memory.from_config(config)
+
+    m = Memory.from_config(config)
+
+    graph = getattr(m, "graph", None)
+    if graph is not None and hasattr(graph, "_execute_sql"):
+        _patch_graph_execute_sql(graph)
+
+    return m
 
 
 def _get_mem0(agent_id: str) -> Memory:
