@@ -366,39 +366,91 @@ def _load_base_config() -> dict:
     return _mem0_base_config
 
 
+_shared_graph_conn = None
+
+
+def _get_shared_graph_conn():
+    """Return a single shared psycopg2 connection for all Apache AGE graphs.
+
+    All MemoryGraph instances use graph_name-qualified queries and SET
+    search_path before every operation, so sharing one connection is safe.
+    If the connection has been closed (server-side timeout, transient
+    error, etc.) it is transparently re-established.
+    """
+    import psycopg2 as _pg2
+
+    global _shared_graph_conn
+    if _shared_graph_conn is not None and not _shared_graph_conn.closed:
+        return _shared_graph_conn
+
+    gs_config = _load_base_config()["graph_store"]["config"]
+    _shared_graph_conn = _pg2.connect(
+        host=gs_config["host"],
+        port=gs_config["port"],
+        database=gs_config["database"],
+        user=gs_config["user"],
+        password=gs_config.get("password", ""),
+    )
+    _shared_graph_conn.autocommit = True
+    return _shared_graph_conn
+
+
+def _build_mem0(agent_id: str) -> Memory:
+    """Create a Memory instance for *agent_id*, wired to the shared graph connection."""
+    config = copy.deepcopy(_load_base_config())
+    config["graph_store"]["config"]["graph_name"] = f"{agent_id}_mem0_graph"
+    config.setdefault("vector_store", {}).setdefault("config", {})["collection_name"] = (
+        f"{agent_id}_mem0_collection"
+    )
+    # Pre-construct the entire GraphStoreConfig with model_construct()
+    # to sidestep two bugs in the mem0 fork:
+    #  1. Pydantic Union resolution tries KuzuConfig first (which
+    #     swallows all fields) before reaching ApacheAgeConfig.
+    #  2. ApacheAgeConfig's model_validator rejects empty passwords.
+    if config.get("graph_store", {}).get("provider") == "apache_age":
+        gs = config["graph_store"]
+        config["graph_store"] = GraphStoreConfig.model_construct(
+            provider="apache_age",
+            config=ApacheAgeConfig.model_construct(**gs["config"]),
+            llm=gs.get("llm"),
+            custom_prompt=gs.get("custom_prompt"),
+            threshold=gs.get("threshold", 0.7),
+        )
+
+    m = Memory.from_config(config)
+
+    # Replace the per-instance graph connection with the shared one.
+    # The fork creates a new psycopg2.connect() per MemoryGraph; close
+    # that duplicate and point at the single long-lived connection instead.
+    graph = getattr(m, "graph", None)
+    if graph is not None and hasattr(graph, "conn"):
+        try:
+            graph.conn.close()
+        except Exception:
+            pass
+        graph.conn = _get_shared_graph_conn()
+
+    return m
+
+
 def _get_mem0(agent_id: str) -> Memory:
     """Return a Memory instance isolated to *agent_id*.
 
     Each agent gets its own Apache AGE graph (``{agent_id}_mem0_graph``)
     and pgvector collection (``{agent_id}_mem0_collection``).  Instances
-    are cached so repeated calls for the same agent are cheap.
+    are cached so repeated calls for the same agent are cheap.  All
+    agents share a single psycopg2 connection for graph operations.
 
     Requires OPENAI_API_KEY in the environment (used by the default
     embedder and LLM).
     """
-    if agent_id not in _mem0_cache:
-        config = copy.deepcopy(_load_base_config())
-        config["graph_store"]["config"]["graph_name"] = f"{agent_id}_mem0_graph"
-        config.setdefault("vector_store", {}).setdefault("config", {})["collection_name"] = (
-            f"{agent_id}_mem0_collection"
-        )
-        # Pre-construct the entire GraphStoreConfig with model_construct()
-        # to sidestep two bugs in the mem0 fork:
-        #  1. Pydantic Union resolution tries KuzuConfig first (which
-        #     swallows all fields) before reaching ApacheAgeConfig.
-        #  2. ApacheAgeConfig's model_validator rejects empty passwords.
-        # Passing a ready-made GraphStoreConfig instance means MemoryConfig
-        # accepts it as-is without re-running any nested validators.
-        if config.get("graph_store", {}).get("provider") == "apache_age":
-            gs = config["graph_store"]
-            config["graph_store"] = GraphStoreConfig.model_construct(
-                provider="apache_age",
-                config=ApacheAgeConfig.model_construct(**gs["config"]),
-                llm=gs.get("llm"),
-                custom_prompt=gs.get("custom_prompt"),
-                threshold=gs.get("threshold", 0.7),
-            )
-        _mem0_cache[agent_id] = Memory.from_config(config)
+    if agent_id in _mem0_cache:
+        # Ensure the cached instance still points to a live connection.
+        graph = getattr(_mem0_cache[agent_id], "graph", None)
+        if graph is not None:
+            graph.conn = _get_shared_graph_conn()
+    else:
+        _mem0_cache[agent_id] = _build_mem0(agent_id)
     return _mem0_cache[agent_id]
 
 
