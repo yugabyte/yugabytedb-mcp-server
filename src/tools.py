@@ -366,39 +366,41 @@ def _load_base_config() -> dict:
     return _mem0_base_config
 
 
-_shared_graph_conn = None
+def _ensure_graph_conn(m: Memory) -> None:
+    """Reconnect the MemoryGraph's psycopg2 connection if it has been closed.
 
-
-def _get_shared_graph_conn():
-    """Return a single shared psycopg2 connection for all Apache AGE graphs.
-
-    All MemoryGraph instances use graph_name-qualified queries and SET
-    search_path before every operation, so sharing one connection is safe.
-    If the connection has been closed (server-side timeout, transient
-    error, etc.) it is transparently re-established.
+    The fork's graph methods (``_search_graph_db``, ``_delete_entities``,
+    ``_add_entities``) wrap Cypher calls in broad ``except Exception:
+    continue`` handlers.  If a query triggers a server error that kills the
+    connection, the error is silently swallowed and the method returns
+    partial results.  The connection is left marked as closed, and the
+    *next* operation discovers it.  This function detects that state and
+    re-establishes the connection in-place so the cached Memory instance
+    remains fully usable.
     """
     import psycopg2 as _pg2
 
-    global _shared_graph_conn
-    if _shared_graph_conn is not None and not _shared_graph_conn.closed:
-        return _shared_graph_conn
+    graph = getattr(m, "graph", None)
+    if graph is None or not hasattr(graph, "conn"):
+        return
+    if not graph.conn.closed:
+        return
 
-    gs_config = _load_base_config()["graph_store"]["config"]
-    _shared_graph_conn = _pg2.connect(
-        host=gs_config["host"],
-        port=gs_config["port"],
-        database=gs_config["database"],
-        user=gs_config["user"],
-        password=gs_config.get("password", ""),
+    cfg = graph.config.graph_store.config
+    graph.conn = _pg2.connect(
+        host=cfg.host,
+        port=cfg.port,
+        database=cfg.database,
+        user=cfg.user,
+        password=getattr(cfg, "password", "") or "",
     )
-    _shared_graph_conn.autocommit = True
-    with _shared_graph_conn.cursor() as cur:
+    graph.conn.autocommit = True
+    with graph.conn.cursor() as cur:
         cur.execute("SET search_path = ag_catalog, public;")
-    return _shared_graph_conn
 
 
 def _build_mem0(agent_id: str) -> Memory:
-    """Create a Memory instance for *agent_id*, wired to the shared graph connection."""
+    """Create a Memory instance for *agent_id*."""
     config = copy.deepcopy(_load_base_config())
     config["graph_store"]["config"]["graph_name"] = f"{agent_id}_mem0_graph"
     config.setdefault("vector_store", {}).setdefault("config", {})["collection_name"] = (
@@ -418,21 +420,7 @@ def _build_mem0(agent_id: str) -> Memory:
             custom_prompt=gs.get("custom_prompt"),
             threshold=gs.get("threshold", 0.7),
         )
-
-    m = Memory.from_config(config)
-
-    # Replace the per-instance graph connection with the shared one.
-    # The fork creates a new psycopg2.connect() per MemoryGraph; close
-    # that duplicate and point at the single long-lived connection instead.
-    graph = getattr(m, "graph", None)
-    if graph is not None and hasattr(graph, "conn"):
-        try:
-            graph.conn.close()
-        except Exception:
-            pass
-        graph.conn = _get_shared_graph_conn()
-
-    return m
+    return Memory.from_config(config)
 
 
 def _get_mem0(agent_id: str) -> Memory:
@@ -440,19 +428,17 @@ def _get_mem0(agent_id: str) -> Memory:
 
     Each agent gets its own Apache AGE graph (``{agent_id}_mem0_graph``)
     and pgvector collection (``{agent_id}_mem0_collection``).  Instances
-    are cached so repeated calls for the same agent are cheap.  All
-    agents share a single psycopg2 connection for graph operations.
+    are cached so repeated calls for the same agent are cheap.  If the
+    underlying graph connection has died (silently killed by a caught
+    Cypher error), it is reconnected in-place without rebuilding the
+    Memory.
 
     Requires OPENAI_API_KEY in the environment (used by the default
     embedder and LLM).
     """
-    if agent_id in _mem0_cache:
-        # Ensure the cached instance still points to a live connection.
-        graph = getattr(_mem0_cache[agent_id], "graph", None)
-        if graph is not None:
-            graph.conn = _get_shared_graph_conn()
-    else:
+    if agent_id not in _mem0_cache:
         _mem0_cache[agent_id] = _build_mem0(agent_id)
+    _ensure_graph_conn(_mem0_cache[agent_id])
     return _mem0_cache[agent_id]
 
 
