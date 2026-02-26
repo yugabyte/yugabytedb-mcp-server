@@ -475,7 +475,7 @@ def add_memory(
     """
     m = _get_mem0(agent_id)
 
-    kwargs: Dict[str, Any] = {"enable_graph": enable_graph, "agent_id": agent_id}
+    kwargs: Dict[str, Any] = {"agent_id": agent_id}
 
     uid = _resolve_user_id(user_id, agent_id, run_id)
     if uid:
@@ -564,7 +564,6 @@ def search_memories(
         "query": query,
         "agent_id": agent_id,
         "limit": limit,
-        "enable_graph": enable_graph,
     }
     uid = _resolve_user_id(user_id, agent_id)
     if uid:
