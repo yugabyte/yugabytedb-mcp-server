@@ -536,15 +536,16 @@ def _resolve_user_id(
     """Resolve user_id based on transport mode.
 
     In stdio mode: fall back to MEM0_USER_ID env var.
-    In HTTP mode: user_id must be provided explicitly (no env var fallback).
-    Returns None when another scoping param (agent_id / run_id) is set.
+    In HTTP mode: derive a default from agent_id/run_id when no explicit
+    user_id is given (the Apache AGE graph backend requires user_id in
+    filters).
     """
     if user_id:
         return user_id
-    if agent_id or run_id:
-        return None
     if _transport_mode == "stdio":
         return os.environ.get("MEM0_USER_ID", "yugabytedb-mcp")
+    if agent_id or run_id:
+        return f"{agent_id or run_id}_user"
     return None
 
 
