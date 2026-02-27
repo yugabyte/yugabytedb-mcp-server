@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import uuid
 from typing import List, Dict, Any, Optional
 
 from mcp.server.fastmcp import Context
@@ -514,6 +515,22 @@ def _get_mem0(agent_id: str) -> Memory:
     return _mem0_cache[agent_id]
 
 
+def _validate_memory_id(memory_id: str) -> Optional[str]:
+    """Return an error JSON string if *memory_id* is not a valid UUID, else None."""
+    try:
+        uuid.UUID(memory_id)
+        return None
+    except (ValueError, AttributeError):
+        return json.dumps({
+            "error": "invalid_memory_id",
+            "detail": (
+                f"'{memory_id}' is not a valid memory ID (UUID).  "
+                "Use the UUID from the 'id' field in search_memories or "
+                "get_memories results — not a graph relation string."
+            ),
+        })
+
+
 _transport_mode: str = "stdio"
 
 _USER_ID_REQUIRED_ERROR = json.dumps({
@@ -626,16 +643,20 @@ def add_memory(
 
 def delete_memory(ctx: Context, memory_id: str, agent_id: str) -> str:
     """
-    Delete a single memory by its ID.
+    Delete a single memory by its UUID.
 
     Args:
         ctx: MCP context (injected automatically).
-        memory_id: The exact ID of the memory to delete.
+        memory_id: UUID of the memory to delete.  Obtain this from the ``id``
+            field returned by ``search_memories`` or ``get_memories`` — it must
+            be a valid UUID, **not** a graph relation string.
         agent_id: Agent identifier whose memory store contains this memory.
 
     Returns:
         JSON string confirming deletion, or an error message.
     """
+    if err := _validate_memory_id(memory_id):
+        return err
     m = _get_mem0(agent_id)
     try:
         result = m.delete(memory_id)
@@ -690,16 +711,20 @@ def search_memories(
 
 def get_memory_by_id(ctx: Context, memory_id: str, agent_id: str) -> str:
     """
-    Retrieve a single memory by its exact ID.
+    Retrieve a single memory by its UUID.
 
     Args:
         ctx: MCP context (injected automatically).
-        memory_id: The exact ID of the memory to fetch.
+        memory_id: UUID of the memory to fetch.  Obtain this from the ``id``
+            field returned by ``search_memories`` or ``get_memories`` — it must
+            be a valid UUID, **not** a graph relation string.
         agent_id: Agent identifier whose memory store contains this memory.
 
     Returns:
         JSON string with the memory details, or an error message.
     """
+    if err := _validate_memory_id(memory_id):
+        return err
     m = _get_mem0(agent_id)
     try:
         result = m.get(memory_id)
@@ -747,17 +772,21 @@ def get_memories(
 
 def update_memory(ctx: Context, memory_id: str, text: str, agent_id: str) -> str:
     """
-    Overwrite an existing memory's text.
+    Overwrite an existing memory's text by its UUID.
 
     Args:
         ctx: MCP context (injected automatically).
-        memory_id: The exact ID of the memory to update.
+        memory_id: UUID of the memory to update.  Obtain this from the ``id``
+            field returned by ``search_memories`` or ``get_memories`` — it must
+            be a valid UUID, **not** a graph relation string.
         text: The replacement text for the memory.
         agent_id: Agent identifier whose memory store contains this memory.
 
     Returns:
         JSON string with the updated memory details, or an error message.
     """
+    if err := _validate_memory_id(memory_id):
+        return err
     m = _get_mem0(agent_id)
     try:
         result = m.update(memory_id=memory_id, data=text)
