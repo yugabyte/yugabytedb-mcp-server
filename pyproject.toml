@@ -1,13 +1,62 @@
 [project]
 name = "yugabytedb-mcp-server"
-version = "1.0.3"
-description = "Add your description here"
+version = "2.0.0rc1"
+description = "MCP server for YugabyteDB/PostgreSQL — read and write tools, optional OAuth"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Yugabyte", email = "support@yugabyte.com" },
+]
+keywords = ["yugabytedb", "postgresql", "mcp", "llm", "claude", "model-context-protocol"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries",
+]
 dependencies = [
-    "mcp[cli]>=1.9.4",
+    "fastmcp>=3.0.0",
     "httpx~=0.28.0",
     "fastapi>=0.115.12",
-    "psycopg2-binary>=2.9.10",
+    "psycopg>=3.2.8",
+    "psycopg-pool>=3.2.6",
+    "sqlparse>=0.5.0",
     "boto3>=1.42.37",
+    "uvicorn>=0.30",
+]
+
+[project.urls]
+Homepage = "https://github.com/yugabyte/yugabytedb-mcp-server"
+Repository = "https://github.com/yugabyte/yugabytedb-mcp-server"
+Issues = "https://github.com/yugabyte/yugabytedb-mcp-server/issues"
+
+[project.scripts]
+yugabytedb-mcp = "yugabytedb_mcp_server.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yugabytedb_mcp_server"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/yugabytedb_mcp_server",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "cryptography>=42.0",
 ]
