@@ -12,7 +12,7 @@ from fastmcp import FastMCP
 from psycopg_pool import ConnectionPool
 import uvicorn
 from fastapi import FastAPI
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 import boto3
 
@@ -253,22 +253,68 @@ class YugabyteDBMCPServer:
             self.mcp.run(transport="stdio")
 
     def _run_http(self, host, port):
+        # Note: json_response is intentionally NOT set here. The MCP spec
+        # (Streamable HTTP §2.1 #5) requires the server to be able to return
+        # text/event-stream as well as application/json. Forcing json_response
+        # silently drops intermediate SSE messages and relaxes Accept header
+        # validation.
         mcp_app = self.mcp.http_app(
             path="/mcp",
-            json_response=True,
             stateless_http=CONFIG.stateless_http,
         )
 
         app = FastAPI(lifespan=mcp_app.lifespan)
 
-        # DNS-rebinding defense: validate Origin header for browser-originated
-        # requests. Non-browser tools (curl, mcp-remote, AWS CLI) don't send
-        # Origin and are unaffected. Configure via MCP_ALLOWED_ORIGINS
-        # (comma-separated). Default: same-origin to MCP_BASE_URL.
+        # Middleware stack — request flow is OUTERMOST-first
+        # (Starlette/FastAPI wraps each add_middleware around the previous):
+        #
+        #   request → reject_null_id → WWWAuthScope → OriginValidation → CORS? → MCP app
+        #   response ← reject_null_id ← WWWAuthScope ← OriginValidation ← CORS? ← MCP app
+        #
+        # We add them innermost first.
+
+        # DNS-rebinding defense: reject browser requests with disallowed Origin.
+        # Non-browser tools (curl, mcp-remote, AWS CLI) don't send Origin and
+        # are unaffected. Configure via MCP_ALLOWED_ORIGINS (comma-separated).
+        # Default: same-origin to MCP_BASE_URL.
         allowed = _parse_allowed_origins()
         app.add_middleware(OriginValidationMiddleware, allowed_origins=allowed)
         if allowed:
             logger.info("Origin allowlist: %s", ", ".join(sorted(allowed)))
+
+        # RFC 6750 §3: append `scope=` to WWW-Authenticate on 401 so clients
+        # know exactly which scopes to request from the AS. The scope string
+        # is the same one configured on the OAuth proxy.
+        auth_scope = _resolve_auth_scope()
+        if auth_scope:
+            app.add_middleware(WWWAuthenticateScopeMiddleware, scope_param=auth_scope)
+            logger.info("WWW-Authenticate scope injection enabled (scope=%s)", auth_scope)
+
+        # MCP spec §4.2 + JSON-RPC 2.0 §4: id MUST NOT be null on requests.
+        # The MCP SDK (v1.27+) misclassifies these as notifications and
+        # returns 202 instead of 400. We intercept at the HTTP layer and
+        # return a proper JSON-RPC error response.
+        # See: https://github.com/modelcontextprotocol/python-sdk/issues/2057
+        @app.middleware("http")
+        async def reject_null_id_requests(request, call_next):
+            if request.method == "POST" and request.url.path == "/mcp":
+                body = await request.body()
+                try:
+                    data = json.loads(body)
+                    if isinstance(data, dict) and "id" in data and data["id"] is None:
+                        return JSONResponse(
+                            {
+                                "jsonrpc": "2.0",
+                                "error": {
+                                    "code": -32600,
+                                    "message": "Invalid Request: request id must not be null",
+                                },
+                            },
+                            status_code=400,
+                        )
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    pass
+            return await call_next(request)
 
         @app.get("/ping")
         async def ping():
@@ -319,6 +365,19 @@ class YugabyteDBMCPServer:
         uvicorn.run(app, host=host, port=port)
 
 
+def _resolve_auth_scope() -> str | None:
+    """Return the scope string to inject into WWW-Authenticate, or None.
+
+    For Cognito we mirror what's configured on OIDCProxy (`openid email
+    profile`). Returns None when auth is disabled or for providers we
+    don't recognize, so the middleware skips registration entirely.
+    """
+    provider = (CONFIG.auth_provider or "").lower() if CONFIG.auth_provider else ""
+    if provider in ("cognito", "oidc"):
+        return "openid email profile"
+    return None
+
+
 def _parse_allowed_origins() -> set[str]:
     """Allowed Origin values for the HTTP transport.
 
@@ -336,28 +395,92 @@ def _parse_allowed_origins() -> set[str]:
     return {base} if base else set()
 
 
-class OriginValidationMiddleware(BaseHTTPMiddleware):
-    """Block cross-origin browser requests as a DNS-rebinding defense.
+class OriginValidationMiddleware:
+    """DNS-rebinding defense per MCP Transports §Security Warning #1.
+
+    Pure ASGI middleware (not BaseHTTPMiddleware) — doesn't buffer request
+    bodies, so it composes cleanly with the SSE streaming path on /mcp.
 
     Browsers send the Origin header on cross-origin requests; non-browser
     clients (curl, mcp-remote, AWS CLI) typically omit it. We only enforce
     when the allowlist is non-empty AND the request includes an Origin.
+
+    On rejection, returns 403 with a JSON-RPC error body (no `id`, per
+    MCP Transports §2.1 #4 — "the HTTP response body MAY comprise a
+    JSON-RPC error response that has no `id`").
     """
 
-    def __init__(self, app, allowed_origins: set[str]):
-        super().__init__(app)
+    def __init__(self, asgi_app, allowed_origins: set[str]):
+        self.app = asgi_app
         self.allowed_origins = allowed_origins
 
-    async def dispatch(self, request, call_next):
-        if self.allowed_origins:
-            origin = request.headers.get("origin")
-            if origin and origin.rstrip("/") not in self.allowed_origins:
-                logger.warning("Rejected request with disallowed Origin: %s", origin)
-                return JSONResponse(
-                    {"error": "origin_not_allowed", "origin": origin},
-                    status_code=403,
-                )
-        return await call_next(request)
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not self.allowed_origins:
+            await self.app(scope, receive, send)
+            return
+
+        headers = Headers(scope=scope)
+        origin = headers.get("origin")
+        if origin is None or origin.rstrip("/") in self.allowed_origins:
+            await self.app(scope, receive, send)
+            return
+
+        logger.warning("Rejected request with disallowed Origin: %s", origin)
+        body = json.dumps({
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32600,
+                "message": "Forbidden: origin not allowed",
+            },
+        }).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 403,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+class WWWAuthenticateScopeMiddleware:
+    """Inject `scope=` into the WWW-Authenticate header on 401 responses
+    (RFC 6750 §3 SHOULD, surfaced as a separate check by mcpdebugger.dev).
+
+    Tells the client exactly which scopes to request from the AS instead
+    of leaving it to guess by reading scopes_supported from PRM. FastMCP's
+    RequireAuthMiddleware omits this; we patch the response header here.
+
+    Pure ASGI middleware — only touches response headers, never the body,
+    so SSE streams are untouched.
+    """
+
+    def __init__(self, asgi_app, scope_param: str):
+        self.app = asgi_app
+        self.scope_param = scope_param
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_scope(message):
+            if (
+                message["type"] == "http.response.start"
+                and message.get("status") == 401
+            ):
+                headers = list(message.get("headers", []))
+                for i, (name, value) in enumerate(headers):
+                    if name.lower() == b"www-authenticate":
+                        decoded = value.decode()
+                        if "scope=" not in decoded:
+                            patched = f'{decoded}, scope="{self.scope_param}"'
+                            headers[i] = (name, patched.encode())
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_scope)
 
 
 def _configure_logging() -> None:
