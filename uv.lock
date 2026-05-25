@@ -1706,7 +1706,7 @@ wheels = [
 
 [[package]]
 name = "yugabytedb-mcp-server"
-version = "2.0.0rc1"
+version = "2.0.0rc2"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },

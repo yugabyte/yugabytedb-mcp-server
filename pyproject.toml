@@ -1,6 +1,6 @@
 [project]
 name = "yugabytedb-mcp-server"
-version = "2.0.0rc1"
+version = "2.0.0rc2"
 description = "MCP server for YugabyteDB/PostgreSQL — read and write tools, optional OAuth"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,7 +37,13 @@ Repository = "https://github.com/yugabyte/yugabytedb-mcp-server"
 Issues = "https://github.com/yugabyte/yugabytedb-mcp-server/issues"
 
 [project.scripts]
+# Two entry-point names pointing at the same main() so callers can use
+# either form. `yugabytedb-mcp-server` matches the package name, which lets
+# `uvx yugabytedb-mcp-server` resolve correctly (uvx defaults to looking up
+# an executable matching the package name). `yugabytedb-mcp` is the shorter
+# form for direct invocation after `pipx install` / `uv tool install`.
 yugabytedb-mcp = "yugabytedb_mcp_server.server:main"
+yugabytedb-mcp-server = "yugabytedb_mcp_server.server:main"
 
 [build-system]
 requires = ["hatchling"]

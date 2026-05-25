@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "yugabytedb-mcp-server",
   "display_name": "YugabyteDB",
-  "version": "2.0.0-rc.1",
+  "version": "2.0.0-rc.2",
   "description": "Query your YugabyteDB or PostgreSQL database from Claude with read and write tools.",
   "long_description": "Connect Claude to a YugabyteDB or PostgreSQL database and use natural language to summarize schemas, run read-only SELECTs, and execute INSERT/UPDATE/DELETE/DDL statements behind a configurable guardrail layer.\n\n**Tools**\n\n- **Summarize database** — list tables, columns, and row counts for a schema\n- **Run a read-only SQL query** — wrap any SELECT in BEGIN READ ONLY\n- **Run a write SQL query (with guardrails)** — INSERT/UPDATE/DELETE/MERGE/TRUNCATE/DDL, with a configurable blocklist for destructive ops (DROP DATABASE, ALTER SYSTEM, COPY, dblink, role/privilege ops, multi-statement, psql meta-commands) and per-statement row-limit enforcement\n\n**Defense in depth**: write operations are marked `destructiveHint: true` so Claude Desktop surfaces a confirmation before each call, even though the guardrails reject the most dangerous statement classes.\n\n**Self-hosted remote mode** (advanced): when `MCP_AUTH_PROVIDER=cognito`, the server runs as a Streamable HTTP MCP behind AWS Cognito OAuth.",
   "author": {

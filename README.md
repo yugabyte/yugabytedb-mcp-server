@@ -21,22 +21,39 @@ Optional OAuth (AWS Cognito) and Origin-header validation for self-hosted remote
 
 ## Installation
 
+Three install options, in roughly the order of how end users will reach for them:
+
 ```bash
-# pipx (recommended for end users)
+# uvx — no install at all; fetches and runs on demand. Handy for one-off use
+# and also the form the MCPB Desktop extension uses internally.
+uvx yugabytedb-mcp-server --help
+
+# pipx — installs to an isolated venv, puts the script on $PATH.
 pipx install yugabytedb-mcp-server
 
-# or uv tool
+# uv tool — same idea, uv-managed.
 uv tool install yugabytedb-mcp-server
 
-# or pip
+# pip — system-level or current-venv install.
 pip install yugabytedb-mcp-server
 ```
 
-Verify the install:
+After any of the persistent installs (pipx / uv tool / pip), verify with:
 
 ```bash
 yugabytedb-mcp --help
+# or, equivalently:
+yugabytedb-mcp-server --help
 ```
+
+Both console scripts are registered and point at the same entry point —
+`yugabytedb-mcp` is the short form, `yugabytedb-mcp-server` matches the
+package name and is what `uvx` resolves to by default.
+
+> **Pre-release note**: while v2 is in release-candidate (e.g. `2.0.0rc2`),
+> default installs won't pick it up. For now, install with an explicit
+> version (`pipx install yugabytedb-mcp-server==2.0.0rc2`) or with
+> `--pip-args='--pre'`. This goes away once `2.0.0` stable is published.
 
 For development from source, see [Development](#development) below.
 
@@ -72,7 +89,29 @@ A starter template is in `.env.example`.
 
 ## Quickstart — Claude Desktop
 
-After `pipx install yugabytedb-mcp-server`, add the following to `claude_desktop_config.json`:
+Two ways to wire it up. The first uses `uvx` and requires no install at all
+— `uv` only. The second assumes you've already run `pipx install` (or
+equivalent) and have the `yugabytedb-mcp` script on `$PATH`.
+
+**Option 1 — via `uvx` (no install):**
+
+```json
+{
+  "mcpServers": {
+    "yugabytedb": {
+      "command": "uvx",
+      "args": ["yugabytedb-mcp-server"],
+      "env": {
+        "YUGABYTEDB_URL": "host=… port=5433 dbname=… user=… password=…"
+      }
+    }
+  }
+}
+```
+
+**Option 2 — via an installed script:**
+
+After `pipx install yugabytedb-mcp-server` (or `uv tool install …`):
 
 ```json
 {
@@ -87,15 +126,20 @@ After `pipx install yugabytedb-mcp-server`, add the following to `claude_desktop
 }
 ```
 
-Locations:
+Locations of `claude_desktop_config.json`:
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 
 Restart Claude Desktop. The three tools will appear with titles and hint badges (read-only icons on the read tools, a confirmation prompt before each `run_write_query` call).
 
+> While `2.0.0rc2` is the only published version, the `uvx` snippet needs
+> `["yugabytedb-mcp-server@2.0.0rc2"]` in the args (or `["--pre",
+> "yugabytedb-mcp-server"]`). Drop the explicit version once `2.0.0` stable
+> is out.
+
 ## Other MCP Clients
 
-The same `command: "yugabytedb-mcp"` + `env: { YUGABYTEDB_URL }` config works with **Cursor** (Settings → MCP → Add a new global MCP server) and **Windsurf** (Settings → Cascade → MCP Servers → Add custom server).
+The same approach works with **Cursor** (Settings → MCP → Add a new global MCP server) and **Windsurf** (Settings → Cascade → MCP Servers → Add custom server) — use either the `uvx` form or the installed-script form from above.
 
 For MCP Inspector against an HTTP-mode server:
 
@@ -263,10 +307,10 @@ Restart Claude Desktop. Use `~/Library/Logs/Claude/mcp-server-yugabytedb-dev.log
 ```bash
 npm install -g @modelcontextprotocol/mcpb-cli   # one-time
 mcpb validate manifest.json                      # static check
-mcpb pack .                                      # produces yugabytedb-mcp-server-2.0.0.mcpb
+mcpb pack .                                      # produces yugabytedb-mcp-server-<version>.mcpb
 ```
 
-Drag the resulting `.mcpb` into Claude Desktop — the connector installer UI takes it from there, prompting for the `user_config` values defined in `manifest.json`. The `.mcpb` route is closest to what reviewers will exercise. **Note**: the manifest currently uses `uvx yugabytedb-mcp-server` to launch, so the package needs to be on PyPI for end users; for your own smoke test, the local entry point above is faster.
+Drag the resulting `.mcpb` into Claude Desktop — the connector installer UI takes it from there, prompting for the `user_config` values defined in `manifest.json`. The `.mcpb` route is closest to what reviewers will exercise. **Note**: the manifest's `mcp_config` runs `uvx yugabytedb-mcp-server`, which fetches the package from PyPI on first launch. Make sure the version referenced by your `.mcpb` is published before sharing the bundle.
 
 ## Testing
 
