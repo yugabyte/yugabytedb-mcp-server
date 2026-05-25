@@ -10,3 +10,6 @@ wheels/
 .venv
 
 .idea/
+
+# Local environment overrides
+.env

@@ -1,0 +1,91 @@
+{
+  "manifest_version": "0.3",
+  "name": "yugabytedb-mcp-server",
+  "display_name": "YugabyteDB",
+  "version": "2.0.0-rc.1",
+  "description": "Query your YugabyteDB or PostgreSQL database from Claude with read and write tools.",
+  "long_description": "Connect Claude to a YugabyteDB or PostgreSQL database and use natural language to summarize schemas, run read-only SELECTs, and execute INSERT/UPDATE/DELETE/DDL statements behind a configurable guardrail layer.\n\n**Tools**\n\n- **Summarize database** — list tables, columns, and row counts for a schema\n- **Run a read-only SQL query** — wrap any SELECT in BEGIN READ ONLY\n- **Run a write SQL query (with guardrails)** — INSERT/UPDATE/DELETE/MERGE/TRUNCATE/DDL, with a configurable blocklist for destructive ops (DROP DATABASE, ALTER SYSTEM, COPY, dblink, role/privilege ops, multi-statement, psql meta-commands) and per-statement row-limit enforcement\n\n**Defense in depth**: write operations are marked `destructiveHint: true` so Claude Desktop surfaces a confirmation before each call, even though the guardrails reject the most dangerous statement classes.\n\n**Self-hosted remote mode** (advanced): when `MCP_AUTH_PROVIDER=cognito`, the server runs as a Streamable HTTP MCP behind AWS Cognito OAuth.",
+  "author": {
+    "name": "Yugabyte",
+    "url": "https://www.yugabyte.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yugabyte/yugabytedb-mcp-server.git"
+  },
+  "homepage": "https://github.com/yugabyte/yugabytedb-mcp-server",
+  "documentation": "https://github.com/yugabyte/yugabytedb-mcp-server#readme",
+  "support": "https://github.com/yugabyte/yugabytedb-mcp-server/issues",
+  "_TODO_icon": "TODO: drop a 512x512 PNG at assets/icon.png and replace this field with `\"icon\": \"assets/icon.png\"`.",
+  "_TODO_screenshots": "TODO: capture 3-5 PNGs (>=1000px wide) of the tools in Claude Desktop, save under assets/screenshots/, and add a `\"screenshots\": [...]` field.",
+  "license": "Apache-2.0",
+  "keywords": ["yugabytedb", "postgresql", "database", "sql"],
+  "server": {
+    "type": "uv",
+    "entry_point": "yugabytedb_mcp_server.server:main",
+    "mcp_config": {
+      "command": "uvx",
+      "args": ["yugabytedb-mcp-server"],
+      "env": {
+        "YUGABYTEDB_URL": "${user_config.yugabytedb_url}",
+        "YB_MCP_MAX_INSERT_ROWS": "${user_config.max_insert_rows}",
+        "YB_MCP_REQUIRE_WHERE_ON_UPDATE": "${user_config.require_where_on_update}",
+        "YB_MCP_REQUIRE_WHERE_ON_DELETE": "${user_config.require_where_on_delete}"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "summarize_database",
+      "description": "List all tables in a schema with column names, data types, and row counts."
+    },
+    {
+      "name": "run_read_only_query",
+      "description": "Execute a SELECT query under BEGIN READ ONLY and return the result rows as JSON."
+    },
+    {
+      "name": "run_write_query",
+      "description": "Execute an INSERT/UPDATE/DELETE/MERGE/TRUNCATE/DDL statement after passing a guardrail blocklist. Destructive operations (DROP DATABASE, ALTER SYSTEM, role/privilege changes, COPY, etc.) are rejected."
+    }
+  ],
+  "_TODO_privacy_policies": "TODO: legal team to confirm Yugabyte's privacy policy covers MCP server usage (data collection, retention, third-party sharing, contact). Replace with `\"privacy_policies\": [\"https://www.yugabyte.com/privacy-policy/\"]` once confirmed.",
+  "compatibility": {
+    "claude_desktop": ">=1.0.0",
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "python": ">=3.10"
+    }
+  },
+  "user_config": {
+    "yugabytedb_url": {
+      "type": "string",
+      "title": "Database connection string",
+      "description": "libpq keyword string for your YugabyteDB or PostgreSQL database (e.g. `host=cloud.yugabyte.com port=5433 dbname=yugabyte user=admin password=… sslmode=require`).",
+      "required": true,
+      "sensitive": true
+    },
+    "max_insert_rows": {
+      "type": "number",
+      "title": "Maximum rows per INSERT VALUES",
+      "description": "Reject INSERT … VALUES statements with more rows than this. Default 1000.",
+      "default": 1000,
+      "required": false,
+      "min": 1,
+      "max": 100000
+    },
+    "require_where_on_update": {
+      "type": "boolean",
+      "title": "Require WHERE clause on UPDATE",
+      "description": "Reject any UPDATE without a WHERE clause. Off by default.",
+      "default": false,
+      "required": false
+    },
+    "require_where_on_delete": {
+      "type": "boolean",
+      "title": "Require WHERE clause on DELETE",
+      "description": "Reject any DELETE without a WHERE clause. Off by default.",
+      "default": false,
+      "required": false
+    }
+  }
+}

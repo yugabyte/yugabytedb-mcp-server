@@ -1,28 +1,25 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install build dependencies and uv
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
+# Install uv for fast dependency resolution + virtualenv management.
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
     && curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Add uv to PATH
 ENV PATH="/root/.local/bin:${PATH}"
 
-# Copy application files
+# Copy project metadata and source.
+COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src/ /app/src/
-COPY pyproject.toml README.md ./
 
-# Install dependencies
-RUN uv pip install --system -e .
+# Install the package + dependencies into the system Python so the
+# entry point is discoverable on PATH.
+RUN uv pip install --system .
 
-# Environment variables with defaults
-ENV YUGABYTEDB_URL="dbname=yugabyte host=host.docker.internal port=5433 user=yugabyte password=yugabyte load_balance=false"
-
-# Expose HTTP/SSE port
 EXPOSE 8000
 
-# Run the server using uv
-ENTRYPOINT ["uv","--verbose", "run", "src/server.py"]
+# Default to HTTP transport so the container is useful out of the box.
+# Override via `docker run … yugabytedb-mcp <flags>`.
+ENTRYPOINT ["yugabytedb-mcp"]
+CMD ["--transport", "http"]
