@@ -17,13 +17,13 @@ from _helpers import requires_yugabytedb, parse_json, raw_text  # noqa: E402
 pytestmark = [requires_yugabytedb, pytest.mark.asyncio]
 
 
-async def test_insert_round_trip(mcp_session, test_schema, db_conn):
+async def test_insert_round_trip(mcp_session_write_enabled, test_schema, db_conn):
     # Seed empty table via side-channel
     with db_conn.cursor() as cur:
         cur.execute(f'CREATE TABLE "{test_schema}".t (id INT, name TEXT)')
 
     # Insert via MCP tool
-    result = await mcp_session.call_tool(
+    result = await mcp_session_write_enabled.call_tool(
         "run_write_query",
         {"query": f'INSERT INTO "{test_schema}".t (id, name) VALUES (1, \'alice\')'},
     )
@@ -37,12 +37,12 @@ async def test_insert_round_trip(mcp_session, test_schema, db_conn):
     assert rows == [(1, "alice")]
 
 
-async def test_update_round_trip(mcp_session, test_schema, db_conn):
+async def test_update_round_trip(mcp_session_write_enabled, test_schema, db_conn):
     with db_conn.cursor() as cur:
         cur.execute(f'CREATE TABLE "{test_schema}".t (id INT, c TEXT)')
         cur.execute(f'INSERT INTO "{test_schema}".t VALUES (1, \'old\'), (2, \'keep\')')
 
-    result = await mcp_session.call_tool(
+    result = await mcp_session_write_enabled.call_tool(
         "run_write_query",
         {"query": f'UPDATE "{test_schema}".t SET c = \'new\' WHERE id = 1'},
     )
@@ -55,12 +55,12 @@ async def test_update_round_trip(mcp_session, test_schema, db_conn):
     assert rows == [(1, "new"), (2, "keep")]
 
 
-async def test_delete_round_trip(mcp_session, test_schema, db_conn):
+async def test_delete_round_trip(mcp_session_write_enabled, test_schema, db_conn):
     with db_conn.cursor() as cur:
         cur.execute(f'CREATE TABLE "{test_schema}".t (id INT)')
         cur.execute(f'INSERT INTO "{test_schema}".t VALUES (1), (2), (3)')
 
-    result = await mcp_session.call_tool(
+    result = await mcp_session_write_enabled.call_tool(
         "run_write_query",
         {"query": f'DELETE FROM "{test_schema}".t WHERE id IN (1, 3)'},
     )
@@ -73,12 +73,12 @@ async def test_delete_round_trip(mcp_session, test_schema, db_conn):
     assert rows == [(2,)]
 
 
-async def test_bulk_insert_under_limit_succeeds(mcp_session, test_schema, db_conn):
+async def test_bulk_insert_under_limit_succeeds(mcp_session_write_enabled, test_schema, db_conn):
     with db_conn.cursor() as cur:
         cur.execute(f'CREATE TABLE "{test_schema}".t (id INT)')
 
     rows = ", ".join(f"({i})" for i in range(10))
-    result = await mcp_session.call_tool(
+    result = await mcp_session_write_enabled.call_tool(
         "run_write_query",
         {"query": f'INSERT INTO "{test_schema}".t VALUES {rows}'},
     )
@@ -147,10 +147,10 @@ async def test_strict_delete_without_where_blocked(mcp_session_strict, test_sche
         assert cur.fetchone()[0] == 2
 
 
-async def test_write_query_postgres_error_returns_json(mcp_session, test_schema, db_conn):
+async def test_write_query_postgres_error_returns_json(mcp_session_write_enabled, test_schema, db_conn):
     """Errors from the DB (not from guardrails) should also come back as a
     well-formed JSON response, not crash the tool."""
-    result = await mcp_session.call_tool(
+    result = await mcp_session_write_enabled.call_tool(
         "run_write_query",
         {"query": f'INSERT INTO "{test_schema}".does_not_exist VALUES (1)'},
     )

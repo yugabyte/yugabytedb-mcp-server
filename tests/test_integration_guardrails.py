@@ -29,7 +29,7 @@ pytestmark = [requires_yugabytedb, pytest.mark.asyncio]
     ("\\d", "meta-command"),
 ])
 async def test_blocked_query_returns_guardrail_error(
-    mcp_session, blocked_query, expected_fragment, test_schema, db_conn
+    mcp_session_write_enabled, blocked_query, expected_fragment, test_schema, db_conn
 ):
     """For each class of blocked statement, confirm:
     - tool returns {"error": ..., "blocked_by_guardrail": True}
@@ -40,7 +40,7 @@ async def test_blocked_query_returns_guardrail_error(
         cur.execute(f'CREATE TABLE "{test_schema}".witness (id INT)')
         cur.execute(f'INSERT INTO "{test_schema}".witness VALUES (1)')
 
-    result = await mcp_session.call_tool("run_write_query", {"query": blocked_query})
+    result = await mcp_session_write_enabled.call_tool("run_write_query", {"query": blocked_query})
     payload = parse_json(result)
     assert payload.get("blocked_by_guardrail") is True, payload
     assert expected_fragment in payload.get("error", ""), payload
@@ -51,11 +51,11 @@ async def test_blocked_query_returns_guardrail_error(
         assert cur.fetchone() == (1,)
 
 
-async def test_blocked_create_extension_no_side_effect(mcp_session, db_conn):
+async def test_blocked_create_extension_no_side_effect(mcp_session_write_enabled, db_conn):
     """CREATE EXTENSION is blocked. Confirm by attempting to create an extension
     that would otherwise succeed (citext is on most YugabyteDB installs) and
     verify it's NOT in pg_extension after the call."""
-    result = await mcp_session.call_tool(
+    result = await mcp_session_write_enabled.call_tool(
         "run_write_query",
         {"query": "CREATE EXTENSION IF NOT EXISTS citext"},
     )
