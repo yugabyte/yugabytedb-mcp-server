@@ -37,6 +37,8 @@ class ServerConfig:
     require_where_on_delete: bool
     auth_provider: str | None
     enable_write_query: bool
+    identity_claim: str
+    identity_transform: str
 
 
 def normalize_pem(pem: str) -> str:
@@ -133,8 +135,20 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
         guardrail_config.require_where_on_update,
         guardrail_config.require_where_on_delete,
     )
+    if CONFIG.auth_provider:
+        logger.info(
+            "Per-user SET ROLE enabled (claim=%s, transform=%s). "
+            "The pool user must be a superuser or have membership in target roles.",
+            CONFIG.identity_claim, CONFIG.identity_transform,
+        )
+
     try:
-        yield {"pool": pool, "guardrail_config": guardrail_config}
+        yield {
+            "pool": pool,
+            "guardrail_config": guardrail_config,
+            "identity_claim": CONFIG.identity_claim,
+            "identity_transform": CONFIG.identity_transform,
+        }
     finally:
         logger.info("Closing database connections")
         pool.close()
@@ -208,6 +222,19 @@ def parse_config() -> ServerConfig:
         default=os.environ.get("MCP_AUTH_PROVIDER"),
         help="Auth provider for the MCP server: 'cognito' or 'oidc'. Leave unset to disable auth (env: MCP_AUTH_PROVIDER)",
     )
+    parser.add_argument(
+        "--identity-claim",
+        default=os.environ.get("YB_MCP_IDENTITY_CLAIM", "email"),
+        help="JWT claim to use as the DB role identifier (env: YB_MCP_IDENTITY_CLAIM, default: email)",
+    )
+    parser.add_argument(
+        "--identity-transform",
+        default=os.environ.get("YB_MCP_IDENTITY_TRANSFORM", "none"),
+        choices=["none", "strip_domain"],
+        help="Transform applied to the identity claim before using as DB role: "
+             "'none' (use as-is) or 'strip_domain' (strip @... from email) "
+             "(env: YB_MCP_IDENTITY_TRANSFORM, default: none)",
+    )
 
     args = parser.parse_args()
     return ServerConfig(
@@ -223,6 +250,8 @@ def parse_config() -> ServerConfig:
         require_where_on_delete=args.require_where_on_delete,
         auth_provider=args.mcp_auth_provider,
         enable_write_query=args.enable_write_query,
+        identity_claim=args.identity_claim,
+        identity_transform=args.identity_transform,
     )
 
 
