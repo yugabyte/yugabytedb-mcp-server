@@ -6,7 +6,7 @@ An [MCP](https://modelcontextprotocol.io/) server for YugabyteDB and PostgreSQL 
 
 - **`summarize_database`** — list tables with columns and row counts for a schema (read-only)
 - **`run_read_only_query`** — execute a SELECT under `BEGIN READ ONLY`; results returned as JSON (read-only)
-- **`run_write_query`** — INSERT/UPDATE/DELETE/MERGE/TRUNCATE/DDL gated by a guardrail blocklist (destructive)
+- **`run_write_query`** — INSERT/UPDATE/DELETE/MERGE/TRUNCATE/DDL gated by a guardrail blocklist (destructive, **disabled by default** — enable with `--enable-write-query` or `YB_MCP_ENABLE_WRITE_QUERY=true`)
 
 Defense in depth: the write tool is annotated `destructiveHint: true`, so Claude Desktop surfaces a confirmation prompt before every call even when the guardrails would let the statement through.
 
@@ -67,7 +67,10 @@ For development from source, see [Development](#development) below.
 | `YB_MCP_MAX_INSERT_ROWS` | `--max-insert-rows` | No | Reject INSERT … VALUES with more rows than this. Default `1000`. |
 | `YB_MCP_REQUIRE_WHERE_ON_UPDATE` | `--require-where-on-update` | No | Reject UPDATE without a WHERE clause. Default `false`. |
 | `YB_MCP_REQUIRE_WHERE_ON_DELETE` | `--require-where-on-delete` | No | Reject DELETE without a WHERE clause. Default `false`. |
+| `YB_MCP_ENABLE_WRITE_QUERY` | `--enable-write-query` | No | Enable the `run_write_query` tool. Default `false` (write tool disabled). |
 | `MCP_AUTH_PROVIDER` | `--mcp-auth-provider` | No | `cognito` (tested) or `oidc` (untested). Leave unset to disable auth. |
+| `YB_MCP_IDENTITY_CLAIM` | `--identity-claim` | No | JWT claim to use as the DB role identifier for per-user `SET ROLE`. Default `email`. |
+| `YB_MCP_IDENTITY_TRANSFORM` | `--identity-transform` | No | Transform applied to the claim before using as a DB role: `none` (default) or `strip_domain` (strips `@…` from emails). |
 | `MCP_BASE_URL` | — | When auth enabled | Public base URL the server is reachable at (e.g. `https://mcp.example.com`). |
 | `MCP_ALLOWED_ORIGINS` | — | No | Comma-separated allowlist of Origin values for DNS-rebinding defense. Defaults to `MCP_BASE_URL`. |
 | `YB_LOG_LEVEL` | — | No | Log level for the `yugabytedb-mcp` logger family (default `INFO`). |
@@ -156,7 +159,7 @@ npx @modelcontextprotocol/inspector
 |---|---|---|---|
 | `summarize_database(schema='public')` | "Summarize database schema and row counts" | `readOnlyHint: true` | Lists tables in `schema` with columns and row counts |
 | `run_read_only_query(query)` | "Run a read-only SQL query" | `readOnlyHint: true` | Wraps the query in `BEGIN READ ONLY` and returns rows as JSON |
-| `run_write_query(query)` | "Run a write SQL query (with guardrails)" | `destructiveHint: true` | Validates the query against the guardrail blocklist, then executes |
+| `run_write_query(query)` | "Run a write SQL query (with guardrails)" | `destructiveHint: true` | Validates the query against the guardrail blocklist, then executes. **Disabled by default** — requires `--enable-write-query`. |
 
 ### Guardrails for `run_write_query`
 
@@ -226,6 +229,44 @@ The endpoint uses Cognito's `USER_PASSWORD_AUTH` flow under the hood — the Cog
 
 OIDC (`MCP_AUTH_PROVIDER=oidc`) wiring exists but is untested; please share findings if you exercise it.
 
+### Per-user database roles (SET ROLE)
+
+When OIDC auth is enabled, the server can map each authenticated user to a YugabyteDB database role using `SET ROLE`. This enforces row-level security, schema-level grants, and per-user privilege boundaries — the same connection pool is used, but each tool call runs under the caller's database role.
+
+```bash
+export YB_MCP_IDENTITY_CLAIM=email             # JWT claim to extract (default)
+export YB_MCP_IDENTITY_TRANSFORM=strip_domain  # alice@example.com → alice
+```
+
+**How it works:**
+
+1. The server extracts the configured claim from the OIDC access token.
+2. An optional transform derives the DB role name (e.g., stripping `@domain`).
+3. Before executing tool SQL, the server issues `SET ROLE <role>` on the pooled connection.
+4. After execution, `RESET ROLE` restores the connection to the pool user.
+
+**Requirements:**
+
+- The pool user (from `YUGABYTEDB_URL`) must be a superuser **or** have `GRANT <target_role> TO <pool_user>` for every role that can authenticate.
+- Target roles must already exist in the database — the server does not create them.
+- When auth is disabled (no `MCP_AUTH_PROVIDER`), SET ROLE is not used and the pool operates with its configured credentials as before.
+
+**Example setup:**
+
+```sql
+-- Create per-user roles matching the identity claim
+CREATE ROLE alice LOGIN;
+CREATE ROLE bob LOGIN;
+
+-- Grant them to the pool user so SET ROLE works
+GRANT alice TO mcp_admin;
+GRANT bob TO mcp_admin;
+
+-- Apply per-role permissions as needed
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO alice;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO bob;
+```
+
 ## AWS Secrets Manager for TLS certificates
 
 If your database TLS root certificate is stored in AWS Secrets Manager, the server can fetch and use it automatically. Plaintext PEM is supported; JSON-keyed bundles too (set `YB_AWS_SSL_ROOT_CERT_KEY` to pick one).
@@ -247,8 +288,10 @@ docker run -p 8000:8000 -e YUGABYTEDB_URL="…" mcp/yugabytedb yugabytedb-mcp --
 ## Security
 
 - All SQL is run through parameterized queries; user input is never interpolated into statement strings.
+- The write tool is **disabled by default** — must be explicitly enabled with `--enable-write-query`.
 - The write tool's guardrail list (above) blocks the highest-risk statement classes.
 - `destructiveHint: true` ensures Claude Desktop surfaces a per-call confirmation for write operations.
+- When OIDC auth is active, per-user `SET ROLE` enforces database-level privilege boundaries per caller. Role names are safely quoted with `psycopg.sql.Identifier`.
 - HTTP transport requires a valid Bearer token when `MCP_AUTH_PROVIDER` is configured.
 - HTTP transport validates the `Origin` header against `MCP_ALLOWED_ORIGINS` (defaults to `MCP_BASE_URL`).
 - HTTPS is the operator's responsibility — terminate TLS at a reverse proxy (nginx, ALB, etc.) in front of the server.
@@ -316,7 +359,7 @@ Drag the resulting `.mcpb` into Claude Desktop — the connector installer UI ta
 
 ```bash
 # unit tests (no DB, no network)
-uv run pytest tests/test_guardrails.py tests/test_auth.py
+uv run pytest tests/test_guardrails.py tests/test_auth.py tests/test_identity_mapping.py
 
 # integration tests (require a reachable Postgres-compatible DB)
 YUGABYTEDB_URL="host=… port=… …" uv run pytest tests/
