@@ -1,0 +1,33 @@
+# Local Keycloak instance for the OIDC tutorial.
+#
+# Boots a single Keycloak container, imports the pre-configured `yb-mcp` realm
+# from ./keycloak/realm-export.json (which includes one confidential client
+# named `yb-mcp-server` and one test user `demo`/`Demo123!`).
+#
+# The Keycloak Admin Console is at http://localhost:18080 with admin/admin.
+# Tutorial users should NOT need to touch the console — the realm is
+# pre-provisioned. The credentials are intentionally dev-only.
+#
+# Start with:    docker compose up -d
+# Stop with:     docker compose down
+# Reset state:   docker compose down -v
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: yb-mcp-keycloak
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "18080:8080"
+    volumes:
+      - ./keycloak:/opt/keycloak/data/import:ro
+    command:
+      - start-dev
+      - --import-realm
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /realms/yb-mcp/.well-known/openid-configuration HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q 200"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
