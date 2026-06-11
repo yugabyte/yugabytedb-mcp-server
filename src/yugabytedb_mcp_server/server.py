@@ -36,6 +36,7 @@ class ServerConfig:
     require_where_on_update: bool
     require_where_on_delete: bool
     auth_provider: str | None
+    enable_write_query: bool
 
 
 def normalize_pem(pem: str) -> str:
@@ -197,6 +198,12 @@ def parse_config() -> ServerConfig:
         help="Reject DELETE without WHERE clause (env: YB_MCP_REQUIRE_WHERE_ON_DELETE=true)",
     )
     parser.add_argument(
+        "--enable-write-query",
+        action="store_true",
+        default=os.environ.get("YB_MCP_ENABLE_WRITE_QUERY", "").lower() == "true",
+        help="Enable the run_write_query tool (disabled by default) (env: YB_MCP_ENABLE_WRITE_QUERY=true)",
+    )
+    parser.add_argument(
         "--mcp-auth-provider",
         default=os.environ.get("MCP_AUTH_PROVIDER"),
         help="Auth provider for the MCP server: 'cognito' or 'oidc'. Leave unset to disable auth (env: MCP_AUTH_PROVIDER)",
@@ -215,6 +222,7 @@ def parse_config() -> ServerConfig:
         require_where_on_update=args.require_where_on_update,
         require_where_on_delete=args.require_where_on_delete,
         auth_provider=args.mcp_auth_provider,
+        enable_write_query=args.enable_write_query,
     )
 
 
@@ -241,10 +249,14 @@ class YugabyteDBMCPServer:
             run_read_only_query,
             annotations={**_ro, "title": "Run a read-only SQL query"},
         )
-        self.mcp.tool(
-            run_write_query,
-            annotations={**_dest, "title": "Run a write SQL query (with guardrails)"},
-        )
+        if CONFIG.enable_write_query:
+            self.mcp.tool(
+                run_write_query,
+                annotations={**_dest, "title": "Run a write SQL query (with guardrails)"},
+            )
+            logger.info("run_write_query tool enabled")
+        else:
+            logger.info("run_write_query tool disabled (use --enable-write-query or YB_MCP_ENABLE_WRITE_QUERY=true to enable)")
 
     def run(self, host="0.0.0.0", port=8000):
         if CONFIG.transport == "http":
