@@ -1,0 +1,80 @@
+{
+  "realm": "yb-mcp",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": false,
+  "accessTokenLifespan": 3600,
+  "clients": [
+    {
+      "clientId": "yb-mcp-server",
+      "name": "YugabyteDB MCP Server",
+      "description": "Confidential OAuth client used by the MCP server's OIDCProxy",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "tutorial-secret-not-for-prod",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:8000/auth/callback",
+        "http://localhost:8000/*",
+        "http://localhost:9876/callback"
+      ],
+      "webOrigins": [
+        "http://localhost:8000"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "defaultClientScopes": [
+        "openid",
+        "email",
+        "profile"
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "writer",
+      "email": "writer@yugabyte.com",
+      "firstName": "Write",
+      "lastName": "User",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Writer123",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "default-roles-yb-mcp"
+      ]
+    },
+    {
+      "username": "reader",
+      "email": "reader@yugabyte.com",
+      "firstName": "Read",
+      "lastName": "Only",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Reader123",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "default-roles-yb-mcp"
+      ]
+    }
+  ]
+}

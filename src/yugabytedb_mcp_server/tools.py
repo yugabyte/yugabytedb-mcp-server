@@ -4,27 +4,103 @@ All three tools acquire a connection from the lifespan-owned ConnectionPool,
 run their query, and return JSON. Read tools wrap the query in
 `BEGIN READ ONLY ... ROLLBACK` for transaction-level enforcement. Write tool
 runs through the guardrail blocklist before executing.
+
+When OIDC auth is active, each tool call wraps its SQL execution in
+SET ROLE / RESET ROLE so the query runs under the database role corresponding
+to the authenticated user's identity.
 """
 
 import json
 import logging
+from contextlib import contextmanager
 from typing import Any, Dict, List
 
 from fastmcp import Context
+from fastmcp.server.dependencies import get_access_token
+from psycopg.sql import SQL, Identifier
 
 from .guardrails import GuardrailConfig, QueryBlockedError, validate_write_query
 
 logger = logging.getLogger("yugabytedb-mcp.tools")
 
 
-def _execute(cur, query: str, params: tuple | None = None) -> None:
-    """Thin execute wrapper that logs at DEBUG before running."""
+def _execute(cur, query, params: tuple | None = None) -> None:
+    """Thin execute wrapper that logs at DEBUG before running.
+
+    `query` may be a plain string or a psycopg.sql.Composed/SQL object.
+    """
     if params is not None:
-        logger.debug("SQL: %s | params=%r", query.strip(), params)
+        logger.debug("SQL: %s | params=%r", query, params)
         cur.execute(query, params)
     else:
-        logger.debug("SQL: %s", query.strip())
+        logger.debug("SQL: %s", query)
         cur.execute(query)
+
+
+def _apply_transform(value: str, transform: str) -> str:
+    """Apply a named transform to a claim value to derive a DB role name."""
+    if transform == "strip_domain":
+        return value.split("@", 1)[0]
+    return value
+
+
+class IdentityError(Exception):
+    """Raised when an authenticated token lacks the required identity claim."""
+
+
+def _get_db_role(ctx: Context) -> str | None:
+    """Extract the database role from the authenticated user's OIDC token.
+
+    Returns None when auth is disabled or no token is present (the pool's
+    default credentials will be used).
+
+    Raises IdentityError when a token IS present but the required claim is
+    missing — falling back to pool credentials in this case would be a
+    privilege escalation.
+    """
+    try:
+        token = get_access_token()
+    except RuntimeError:
+        return None
+
+    if token is None:
+        return None
+
+    lifespan = ctx.request_context.lifespan_context
+    claim_name = lifespan.get("identity_claim", "email")
+    transform = lifespan.get("identity_transform", "none")
+
+    claim_value = token.claims.get(claim_name)
+    if not claim_value:
+        raise IdentityError(
+            f"Token present but required claim {claim_name!r} is missing or empty. "
+            f"Cannot determine database role for authenticated user."
+        )
+
+    role = _apply_transform(str(claim_value), transform)
+    logger.debug("Resolved DB role %r from claim %r=%r", role, claim_name, claim_value)
+    return role
+
+
+@contextmanager
+def _conn_as_role(pool, role: str | None):
+    """Acquire a connection and optionally SET ROLE for the duration.
+
+    If `role` is not None, executes SET ROLE before yielding and RESET ROLE
+    in the finally block so the connection is returned to the pool clean.
+    """
+    with pool.connection() as conn:
+        if role is not None:
+            with conn.cursor() as cur:
+                cur.execute(SQL("SET ROLE {}").format(Identifier(role)))
+            logger.debug("SET ROLE %s", role)
+        try:
+            yield conn
+        finally:
+            if role is not None:
+                with conn.cursor() as cur:
+                    cur.execute("RESET ROLE")
+                logger.debug("RESET ROLE")
 
 
 def summarize_database(ctx: Context, schema: str = "public") -> List[Dict[str, Any]]:
@@ -44,7 +120,13 @@ def summarize_database(ctx: Context, schema: str = "public") -> List[Dict[str, A
     summary: List[Dict[str, Any]] = []
     pool = ctx.request_context.lifespan_context["pool"]
 
-    with pool.connection() as conn:
+    try:
+        role = _get_db_role(ctx)
+    except IdentityError as e:
+        logger.error("Identity resolution failed: %s", e)
+        return [{"error": str(e)}]
+
+    with _conn_as_role(pool, role) as conn:
         logger.debug("Acquired connection from pool for summarize_database")
         with conn.cursor() as cur:
             try:
@@ -120,7 +202,13 @@ def run_read_only_query(ctx: Context, query: str) -> str:
     logger.debug("Query: %s", query)
     pool = ctx.request_context.lifespan_context["pool"]
 
-    with pool.connection() as conn:
+    try:
+        role = _get_db_role(ctx)
+    except IdentityError as e:
+        logger.error("Identity resolution failed: %s", e)
+        return json.dumps({"error": str(e)})
+
+    with _conn_as_role(pool, role) as conn:
         logger.debug("Acquired connection from pool for run_read_only_query")
         with conn.cursor() as cur:
             try:
@@ -173,7 +261,13 @@ def run_write_query(ctx: Context, query: str) -> str:
         logger.warning("Query blocked by guardrail: %s", e)
         return json.dumps({"error": str(e), "blocked_by_guardrail": True})
 
-    with pool.connection() as conn:
+    try:
+        role = _get_db_role(ctx)
+    except IdentityError as e:
+        logger.error("Identity resolution failed: %s", e)
+        return json.dumps({"error": str(e)})
+
+    with _conn_as_role(pool, role) as conn:
         logger.debug("Acquired connection from pool for run_write_query")
         with conn.cursor() as cur:
             try:
