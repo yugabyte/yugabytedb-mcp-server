@@ -7,7 +7,7 @@ import pytest
 from yugabytedb_mcp_server.guardrails import (
     GuardrailConfig,
     QueryBlockedError,
-    validate_write_query,
+    validate_query,
     _count_values_rows,
     _has_top_level_where,
     _strip_comments,
@@ -51,7 +51,7 @@ def strict_cfg():
     "INSERT INTO t SELECT * FROM s",      # INSERT ... SELECT has no row-count enforcement
 ])
 def test_allows(sql, cfg):
-    validate_write_query(sql, cfg)  # raises if blocked
+    validate_query(sql, cfg, read_only=False)  # raises if blocked
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +67,7 @@ def test_allows(sql, cfg):
 ])
 def test_blocks_db_destruction(sql, fragment, cfg):
     with pytest.raises(QueryBlockedError) as exc:
-        validate_write_query(sql, cfg)
+        validate_query(sql, cfg, read_only=False)
     assert fragment in str(exc.value)
 
 
@@ -87,7 +87,7 @@ def test_blocks_db_destruction(sql, fragment, cfg):
 ])
 def test_blocks_role_manipulation(sql, cfg):
     with pytest.raises(QueryBlockedError):
-        validate_write_query(sql, cfg)
+        validate_query(sql, cfg, read_only=False)
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +104,7 @@ def test_blocks_role_manipulation(sql, cfg):
 ])
 def test_blocks_filesystem_and_code(sql, cfg):
     with pytest.raises(QueryBlockedError):
-        validate_write_query(sql, cfg)
+        validate_query(sql, cfg, read_only=False)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +117,7 @@ def test_blocks_filesystem_and_code(sql, cfg):
 ])
 def test_blocks_server_config(sql, cfg):
     with pytest.raises(QueryBlockedError):
-        validate_write_query(sql, cfg)
+        validate_query(sql, cfg, read_only=False)
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ def test_blocks_server_config(sql, cfg):
 ])
 def test_blocks_dangerous_functions(sql, cfg):
     with pytest.raises(QueryBlockedError):
-        validate_write_query(sql, cfg)
+        validate_query(sql, cfg, read_only=False)
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +147,7 @@ def test_blocks_dangerous_functions(sql, cfg):
 ])
 def test_blocks_schema_isolation(sql, cfg):
     with pytest.raises(QueryBlockedError):
-        validate_write_query(sql, cfg)
+        validate_query(sql, cfg, read_only=False)
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +161,7 @@ def test_blocks_schema_isolation(sql, cfg):
 ])
 def test_blocks_multistatement(sql, cfg):
     with pytest.raises(QueryBlockedError) as exc:
-        validate_write_query(sql, cfg)
+        validate_query(sql, cfg, read_only=False)
     assert "Multi-statement" in str(exc.value)
 
 
@@ -177,7 +177,7 @@ def test_blocks_multistatement(sql, cfg):
 ])
 def test_strips_comments_before_check(sql, cfg):
     with pytest.raises(QueryBlockedError):
-        validate_write_query(sql, cfg)
+        validate_query(sql, cfg, read_only=False)
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +191,7 @@ def test_strips_comments_before_check(sql, cfg):
 ])
 def test_blocks_psql_meta(sql, cfg):
     with pytest.raises(QueryBlockedError) as exc:
-        validate_write_query(sql, cfg)
+        validate_query(sql, cfg, read_only=False)
     assert "meta-command" in str(exc.value)
 
 
@@ -207,7 +207,7 @@ def test_blocks_psql_meta(sql, cfg):
 ])
 def test_blocks_empty(sql, cfg):
     with pytest.raises(QueryBlockedError):
-        validate_write_query(sql, cfg)
+        validate_query(sql, cfg, read_only=False)
 
 
 # ---------------------------------------------------------------------------
@@ -216,19 +216,19 @@ def test_blocks_empty(sql, cfg):
 
 def test_bulk_insert_under_limit(cfg):
     rows = ", ".join(["(1)"] * cfg.max_insert_rows)
-    validate_write_query(f"INSERT INTO t VALUES {rows}", cfg)
+    validate_query(f"INSERT INTO t VALUES {rows}", cfg, read_only=False)
 
 
 def test_bulk_insert_over_limit(cfg):
     rows = ", ".join(["(1)"] * (cfg.max_insert_rows + 1))
     with pytest.raises(QueryBlockedError) as exc:
-        validate_write_query(f"INSERT INTO t VALUES {rows}", cfg)
+        validate_query(f"INSERT INTO t VALUES {rows}", cfg, read_only=False)
     assert "exceeds the maximum" in str(exc.value)
 
 
 def test_bulk_insert_select_no_limit(cfg):
     # INSERT ... SELECT has no VALUES, so row-count limit does not apply
-    validate_write_query("INSERT INTO t SELECT * FROM huge_table", cfg)
+    validate_query("INSERT INTO t SELECT * FROM huge_table", cfg, read_only=False)
 
 
 # ---------------------------------------------------------------------------
@@ -237,22 +237,22 @@ def test_bulk_insert_select_no_limit(cfg):
 
 def test_update_without_where_blocked_when_strict(strict_cfg):
     with pytest.raises(QueryBlockedError) as exc:
-        validate_write_query("UPDATE t SET c = 1", strict_cfg)
+        validate_query("UPDATE t SET c = 1", strict_cfg, read_only=False)
     assert "UPDATE without a WHERE" in str(exc.value)
 
 
 def test_update_with_where_allowed_when_strict(strict_cfg):
-    validate_write_query("UPDATE t SET c = 1 WHERE id = 1", strict_cfg)
+    validate_query("UPDATE t SET c = 1 WHERE id = 1", strict_cfg, read_only=False)
 
 
 def test_delete_without_where_blocked_when_strict(strict_cfg):
     with pytest.raises(QueryBlockedError) as exc:
-        validate_write_query("DELETE FROM t", strict_cfg)
+        validate_query("DELETE FROM t", strict_cfg, read_only=False)
     assert "DELETE without a WHERE" in str(exc.value)
 
 
 def test_delete_with_where_allowed_when_strict(strict_cfg):
-    validate_write_query("DELETE FROM t WHERE id = 1", strict_cfg)
+    validate_query("DELETE FROM t WHERE id = 1", strict_cfg, read_only=False)
 
 
 # ---------------------------------------------------------------------------
@@ -287,3 +287,131 @@ def test_has_top_level_where_in_subquery_doesnt_count():
 def test_strip_comments_removes_both_styles():
     assert "DROP" in _strip_comments("/* hide */ DROP TABLE t -- end")
     assert "hide" not in _strip_comments("/* hide */ DROP TABLE t")
+
+
+# ---------------------------------------------------------------------------
+# DB-22131: keyword-in-string-literal must not trip the guardrail
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("sql", [
+    # (A) legitimate writes whose data happens to contain a blocked keyword
+    "INSERT INTO audit(action) VALUES ('grant access to vault')",
+    "UPDATE tickets SET note = 'please revoke the old token'",
+    "INSERT INTO runbook(step) VALUES ('never run DROP DATABASE x')",
+    "INSERT INTO logs(msg) VALUES ('user called pg_read_file to debug')",
+    "INSERT INTO logs(msg) VALUES ('COPY the file TO the vault')",
+    "INSERT INTO logs(msg) VALUES ('DO NOT touch this')",
+    "UPDATE t SET note = 'ALTER SYSTEM was rejected' WHERE id = 1",
+])
+def test_string_literal_keywords_do_not_false_positive(sql, cfg):
+    validate_query(sql, cfg, read_only=False)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# DB-22131: advertised protections must not be bypassable by equivalent syntax
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("sql", [
+    # set_config('search_path', …) is equivalent to SET search_path — block both
+    "SELECT set_config('search_path', 'evil', false)",
+    "SELECT set_config( 'search_path' , 'evil' , false )",
+    'SELECT set_config("search_path", \'evil\', false)',
+])
+def test_blocks_set_config_search_path_bypass(sql, cfg):
+    with pytest.raises(QueryBlockedError):
+        validate_query(sql, cfg, read_only=False)
+
+
+@pytest.mark.parametrize("sql", [
+    "DO $$ BEGIN PERFORM 1; END $$",
+    "DO LANGUAGE plpgsql $$ BEGIN PERFORM 1; END $$",
+    "do language plpgsql $$ begin perform 1; end $$",
+])
+def test_blocks_do_block_regardless_of_language_clause(sql, cfg):
+    with pytest.raises(QueryBlockedError):
+        validate_query(sql, cfg, read_only=False)
+
+
+def test_where_in_string_literal_does_not_satisfy_strict_where(strict_cfg):
+    # DB-22131 class C: 'reset where needed' inside a string must not
+    # count as a real WHERE clause.
+    with pytest.raises(QueryBlockedError) as exc:
+        validate_query(
+            "UPDATE accounts SET memo='reset where needed'",
+            strict_cfg, read_only=False,
+        )
+    assert "WHERE" in str(exc.value)
+
+
+def test_parens_in_string_literal_do_not_inflate_insert_row_count(cfg):
+    # DB-22131 class C: ')(' inside a string was previously counted as a
+    # new row tuple. Verify a 1-row INSERT with such a value passes.
+    validate_query(
+        "INSERT INTO t (msg) VALUES ('has )( parens')",
+        cfg, read_only=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# DB-22129: read-only path still blocks side-effecting SQL
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("sql", [
+    "COPY (SELECT 1) TO PROGRAM 'id > /tmp/poc'",
+    "SELECT pg_read_file('/etc/hostname')",
+    "SELECT pg_read_binary_file('/etc/hostname')",
+    "SELECT * FROM dblink('host=evil', 'SELECT secret')",
+    "SELECT pg_sleep(60)",
+    "SELECT lo_import('/etc/passwd')",
+    "SELECT set_config('search_path', 'evil', false)",
+])
+def test_read_only_blocks_dangerous_reads(sql, cfg):
+    with pytest.raises(QueryBlockedError):
+        validate_query(sql, cfg, read_only=True)
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT 1",
+    "SELECT * FROM t WHERE id = 1",
+    "SELECT count(*) FROM information_schema.tables",
+    "WITH x AS (SELECT 1) SELECT * FROM x",
+])
+def test_read_only_allows_normal_selects(sql, cfg):
+    validate_query(sql, cfg, read_only=True)  # must not raise
+
+
+def test_read_only_skips_insert_row_count(cfg):
+    # A SELECT is never an INSERT, so the row-count check should no-op even
+    # if the query mentions VALUES.
+    validate_query("SELECT * FROM (VALUES (1), (2), (3)) AS v(x)", cfg, read_only=True)
+
+
+def test_read_only_skips_require_where(strict_cfg):
+    # SELECTs don't start with UPDATE/DELETE, so the WHERE-required check
+    # should not fire on the read path.
+    validate_query("SELECT * FROM t", strict_cfg, read_only=True)
+
+
+# ---------------------------------------------------------------------------
+# _strip_strings helper
+# ---------------------------------------------------------------------------
+
+def test_strip_strings_replaces_single_quoted():
+    from yugabytedb_mcp_server.guardrails import _strip_strings
+    assert _strip_strings("SELECT 'GRANT'") == "SELECT ''"
+
+
+def test_strip_strings_replaces_dollar_quoted():
+    from yugabytedb_mcp_server.guardrails import _strip_strings
+    # Dollar-quoted strings should also be replaced so DO $$ ... GRANT ... $$
+    # can't hide GRANT inside a code block.
+    stripped = _strip_strings("DO $$ GRANT ALL ON t TO evil $$")
+    assert "GRANT" not in stripped
+
+
+def test_strip_strings_preserves_identifiers():
+    from yugabytedb_mcp_server.guardrails import _strip_strings
+    # Double-quoted identifiers must NOT be treated as strings — otherwise
+    # `UPDATE "GRANT"` would look like `UPDATE ''` and no longer be a valid
+    # keyword to match. sqlparse tokenizes them as Token.Name, not String.
+    assert '"my_table"' in _strip_strings('SELECT * FROM "my_table"')

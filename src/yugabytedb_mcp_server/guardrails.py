@@ -8,7 +8,7 @@ logger = logging.getLogger("yugabytedb-mcp.guardrails")
 
 
 class QueryBlockedError(Exception):
-    """Raised when a write query is rejected by a guardrail check."""
+    """Raised when a query is rejected by a guardrail check."""
     pass
 
 
@@ -39,7 +39,12 @@ _BLOCKED_PATTERNS: list[tuple[re.Pattern, str]] = [
     # Filesystem access / arbitrary code execution
     (re.compile(r"\bCOPY\b.+\b(TO|FROM)\b", re.I | re.S), "COPY TO/FROM is not allowed"),
     (re.compile(r"\bLOAD\s+", re.I), "LOAD is not allowed"),
-    (re.compile(r"\bDO\s+\$", re.I), "Anonymous code blocks (DO $$) are not allowed"),
+    # Match anonymous code blocks: bare `DO $$…$$` AND `DO LANGUAGE plpgsql $$…$$`.
+    # The pre-match _strip_strings pass replaces dollar-quoted bodies with `''`,
+    # so the bare `DO $$…$$` case becomes `DO ''` here — include that shape
+    # explicitly. The LANGUAGE form still parses as `DO LANGUAGE plpgsql ''`.
+    (re.compile(r"\bDO\s+(?:\$|LANGUAGE\b|'')", re.I),
+     "Anonymous code blocks (DO) are not allowed"),
     (re.compile(r"\bCREATE\s+EXTENSION\b", re.I), "CREATE EXTENSION is not allowed"),
 
     # Server configuration
@@ -49,13 +54,20 @@ _BLOCKED_PATTERNS: list[tuple[re.Pattern, str]] = [
     # Dangerous built-in functions
     (re.compile(r"\bpg_sleep\b", re.I), "pg_sleep is not allowed"),
     (re.compile(r"\bpg_read_file\b", re.I), "pg_read_file is not allowed"),
+    (re.compile(r"\bpg_read_binary_file\b", re.I), "pg_read_binary_file is not allowed"),
     (re.compile(r"\bpg_write_file\b", re.I), "pg_write_file is not allowed"),
+    (re.compile(r"\bpg_ls_dir\b", re.I), "pg_ls_dir is not allowed"),
     (re.compile(r"\blo_import\b", re.I), "lo_import is not allowed"),
     (re.compile(r"\blo_export\b", re.I), "lo_export is not allowed"),
     (re.compile(r"\bdblink\b", re.I), "dblink is not allowed"),
 
-    # Schema isolation
+    # Schema isolation. `SET search_path` was blocked; the semantically
+    # equivalent `set_config('search_path', …)` and `pg_catalog.set_config(…)`
+    # bypassed it, so block `set_config` unconditionally (a GUC setter has no
+    # legitimate use case via this tool — search_path is the security-relevant
+    # one, but any GUC change is out of scope).
     (re.compile(r"\bSET\s+search_path\b", re.I), "SET search_path is not allowed"),
+    (re.compile(r"\bset_config\b", re.I), "set_config is not allowed"),
     (re.compile(r"\bCREATE\s+SCHEMA\b", re.I), "CREATE SCHEMA is not allowed"),
 ]
 
@@ -65,11 +77,53 @@ def _strip_comments(sql: str) -> str:
     return sqlparse.format(sql, strip_comments=True).strip()
 
 
+def _strip_strings(sql: str) -> str:
+    """Replace every string literal in `sql` with `''`.
+
+    This prevents pattern-based checks from firing on keywords or text that
+    appear inside string values — e.g. `INSERT ... VALUES ('grant access')`
+    must not trip the GRANT block, and `UPDATE t SET memo='reset where needed'`
+    must not satisfy `require_where_on_update`.
+
+    Handles three sqlparse tokenizations:
+
+    - `Token.Literal.String.Single` — `'…'`, `E'…'`, `N'…'`. Strip.
+    - `Token.Literal` (bare) — dollar-quoted bodies `$$…$$` and `$tag$…$tag$`.
+      Strip so `DO $$ GRANT … $$` can't hide the GRANT.
+    - `Token.Literal.String.Symbol` — double-quoted identifiers `"my_table"`.
+      Preserve — these are names, not string data, and stripping them would
+      erase identifier information the caller may legitimately be using.
+    """
+    try:
+        parsed = sqlparse.parse(sql)
+    except Exception:
+        return sql
+    if not parsed:
+        return sql
+
+    parts: list[str] = []
+    for stmt in parsed:
+        for tok in stmt.flatten():
+            ttype = tok.ttype
+            if ttype is None:
+                parts.append(str(tok))
+                continue
+            ttype_str = str(ttype)
+            if ttype_str == "Token.Literal.String.Single" or ttype_str == "Token.Literal":
+                parts.append("''")
+            else:
+                parts.append(str(tok))
+    return "".join(parts)
+
+
 def _count_values_rows(sql: str) -> int | None:
     """Count top-level row tuples in a VALUES clause.
 
     Returns None when no VALUES keyword is found (e.g. INSERT ... SELECT),
     in which case no row-count limit applies.
+
+    Caller is expected to pass string-stripped SQL (see `_strip_strings`) so
+    that `)(` inside a string literal does not falsely inflate the count.
     """
     match = re.search(r"\bVALUES\b", sql, re.I)
     if not match:
@@ -89,7 +143,12 @@ def _count_values_rows(sql: str) -> int | None:
 
 
 def _has_top_level_where(sql: str) -> bool:
-    """Check if a WHERE keyword exists outside of any parenthesized subexpression."""
+    """Check if a WHERE keyword exists outside of any parenthesized subexpression.
+
+    Caller is expected to pass string-stripped SQL (see `_strip_strings`) so
+    that a WHERE appearing inside a string literal does not falsely satisfy
+    `require_where_on_update` / `require_where_on_delete`.
+    """
     depth = 0
     upper = sql.upper()
     i = 0
@@ -107,13 +166,18 @@ def _has_top_level_where(sql: str) -> bool:
     return False
 
 
-def validate_write_query(sql: str, config: GuardrailConfig) -> None:
-    """Validate a write query against all guardrail checks.
+def validate_query(sql: str, config: GuardrailConfig, read_only: bool) -> None:
+    """Validate a SQL query against the guardrail blocklist.
 
-    Raises QueryBlockedError with a human-readable reason if the query is
-    rejected. Does nothing (returns None) when the query passes all checks.
+    Called by both `run_read_only_query` (with `read_only=True`) and
+    `run_write_query` (with `read_only=False`). The dangerous-function
+    blocklist runs in both modes; the write-shape checks (INSERT row limit,
+    require-WHERE) only run when `read_only=False`.
+
+    Raises `QueryBlockedError` with a human-readable reason if the query is
+    rejected. Returns None when the query passes.
     """
-    logger.debug("Validating write query (%d chars)", len(sql))
+    logger.debug("Validating query (%d chars, read_only=%s)", len(sql), read_only)
     stripped = sql.strip()
     if not stripped:
         raise QueryBlockedError("Empty query")
@@ -135,14 +199,26 @@ def validate_write_query(sql: str, config: GuardrailConfig) -> None:
             "Please submit one statement at a time."
         )
 
+    # Strip string literals BEFORE running the pattern-based checks so that
+    # keywords/text inside string values don't cause false positives.
+    for_matching = _strip_strings(cleaned)
+
     for pattern, reason in _BLOCKED_PATTERNS:
-        if pattern.search(cleaned):
-            logger.warning("Write query blocked: %s", reason)
+        if pattern.search(for_matching):
+            logger.warning("Query blocked: %s", reason)
             raise QueryBlockedError(reason)
 
-    upper_cleaned = cleaned.upper().lstrip()
+    if read_only:
+        # Read path: the DB-level BEGIN READ ONLY transaction already blocks
+        # writes at the DB layer; the blocklist above handles read-tool-
+        # specific abuses (pg_read_file, COPY ... TO PROGRAM, dblink, etc.).
+        # No further checks needed.
+        logger.debug("Read-only query passed guardrail checks")
+        return
+
+    upper_cleaned = for_matching.upper().lstrip()
     if upper_cleaned.startswith("INSERT"):
-        row_count = _count_values_rows(cleaned)
+        row_count = _count_values_rows(for_matching)
         if row_count is not None and row_count > config.max_insert_rows:
             raise QueryBlockedError(
                 f"INSERT contains {row_count} rows, which exceeds the "
@@ -151,14 +227,14 @@ def validate_write_query(sql: str, config: GuardrailConfig) -> None:
             )
 
     if config.require_where_on_update and upper_cleaned.startswith("UPDATE"):
-        if not _has_top_level_where(cleaned):
+        if not _has_top_level_where(for_matching):
             raise QueryBlockedError(
                 "UPDATE without a WHERE clause is not allowed "
                 "(YB_MCP_REQUIRE_WHERE_ON_UPDATE is enabled)."
             )
 
     if config.require_where_on_delete and upper_cleaned.startswith("DELETE"):
-        if not _has_top_level_where(cleaned):
+        if not _has_top_level_where(for_matching):
             raise QueryBlockedError(
                 "DELETE without a WHERE clause is not allowed "
                 "(YB_MCP_REQUIRE_WHERE_ON_DELETE is enabled)."
