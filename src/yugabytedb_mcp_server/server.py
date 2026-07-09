@@ -18,7 +18,12 @@ import boto3
 
 from .guardrails import GuardrailConfig
 from .auth import create_auth_provider, cognito_password_login, CognitoLoginError
-from .tools import summarize_database, run_read_only_query, run_write_query
+from .tools import (
+    summarize_database,
+    run_read_only_query,
+    run_write_query,
+    _load_identity_map,
+)
 
 logger = logging.getLogger("yugabytedb-mcp.server")
 
@@ -39,6 +44,8 @@ class ServerConfig:
     enable_write_query: bool
     identity_claim: str
     identity_transform: str
+    identity_map_path: str | None
+    identity_map_name: str
 
 
 def normalize_pem(pem: str) -> str:
@@ -135,12 +142,42 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
         guardrail_config.require_where_on_update,
         guardrail_config.require_where_on_delete,
     )
+    # Load the identity map file (pg_ident.conf-style) if configured. Parsed
+    # once at startup; a malformed file raises ValueError which we let
+    # propagate — the server refuses to start rather than silently accepting
+    # a typo'd map that could widen access.
+    identity_map = None
+    if CONFIG.identity_map_path:
+        logger.info(
+            "Loading identity map from %s (map_name=%s)",
+            CONFIG.identity_map_path, CONFIG.identity_map_name,
+        )
+        identity_map = _load_identity_map(CONFIG.identity_map_path)
+        logger.info(
+            "Identity map loaded: %d entries (%d under map_name=%s)",
+            len(identity_map),
+            sum(1 for e in identity_map if e.name == CONFIG.identity_map_name),
+            CONFIG.identity_map_name,
+        )
+
     if CONFIG.auth_provider:
         logger.info(
-            "Per-user SET ROLE enabled (claim=%s, transform=%s). "
-            "The pool user must be a superuser or have membership in target roles.",
-            CONFIG.identity_claim, CONFIG.identity_transform,
+            "Per-user SET ROLE enabled (claim=%s, transform=%s, map=%s). "
+            "The pool user must have GRANT to the target roles it needs to "
+            "SET ROLE to; superuser works but is not required if an identity "
+            "map is set.",
+            CONFIG.identity_claim,
+            CONFIG.identity_transform,
+            CONFIG.identity_map_path or "<none>",
         )
+        if identity_map is None:
+            logger.warning(
+                "OIDC identity mapping has no map file configured "
+                "(YB_MCP_IDENTITY_MAP unset). The claim value is used as the "
+                "DB role name directly, which requires the pool user to be a "
+                "superuser or have GRANT on every possible role. Configure "
+                "YB_MCP_IDENTITY_MAP to constrain the set of reachable roles."
+            )
 
     try:
         yield {
@@ -148,6 +185,8 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
             "guardrail_config": guardrail_config,
             "identity_claim": CONFIG.identity_claim,
             "identity_transform": CONFIG.identity_transform,
+            "identity_map": identity_map,
+            "identity_map_name": CONFIG.identity_map_name,
         }
     finally:
         logger.info("Closing database connections")
@@ -232,8 +271,24 @@ def parse_config() -> ServerConfig:
         default=os.environ.get("YB_MCP_IDENTITY_TRANSFORM", "none"),
         choices=["none", "strip_domain"],
         help="Transform applied to the identity claim before using as DB role: "
-             "'none' (use as-is) or 'strip_domain' (strip @... from email) "
-             "(env: YB_MCP_IDENTITY_TRANSFORM, default: none)",
+             "'none' (use as-is) or 'strip_domain' (strip @... from email). "
+             "Only applies when no identity map file is configured; the map "
+             "path replaces this. (env: YB_MCP_IDENTITY_TRANSFORM, default: none)",
+    )
+    parser.add_argument(
+        "--identity-map",
+        default=os.environ.get("YB_MCP_IDENTITY_MAP"),
+        help="Path to a pg_ident.conf-style identity map file. Each line is "
+             "'<map_name> <system_value> <db_role>' — system_value may be a "
+             "literal string or /regex/ (leading slash triggers regex; role "
+             "may reference capture groups via \\1). When set, replaces the "
+             "identity-transform path. (env: YB_MCP_IDENTITY_MAP)",
+    )
+    parser.add_argument(
+        "--identity-map-name",
+        default=os.environ.get("YB_MCP_IDENTITY_MAP_NAME", "default"),
+        help="Which named map inside the identity map file to apply. "
+             "(env: YB_MCP_IDENTITY_MAP_NAME, default: default)",
     )
 
     args = parser.parse_args()
@@ -252,6 +307,8 @@ def parse_config() -> ServerConfig:
         enable_write_query=args.enable_write_query,
         identity_claim=args.identity_claim,
         identity_transform=args.identity_transform,
+        identity_map_path=args.identity_map,
+        identity_map_name=args.identity_map_name,
     )
 
 
