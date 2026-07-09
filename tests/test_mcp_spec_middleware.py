@@ -278,6 +278,102 @@ class TestValidateOrigin:
 
 
 # ===================================================================
+# 2b. DB-22176 — Origin allowlist is case-insensitive
+# ===================================================================
+#
+# RFC 6454 declares scheme + host to be case-insensitive; browsers
+# lowercase them before sending. Pre-fix the allowlist compared
+# case-sensitively, so an admin typing `MCP_ALLOWED_ORIGINS=
+# https://MyApp.Example.com` silently rejected every real browser
+# request (which sends `https://myapp.example.com`).
+
+class TestOriginCaseInsensitivity:
+
+    @pytest.fixture()
+    def client_lowercase_allowlist(self):
+        """The allowlist as `_parse_allowed_origins` would produce it —
+        already lowercased. Middleware receives that + must compare the
+        Origin header case-insensitively."""
+        allowed = {"https://good.example.com"}
+        return TestClient(_app_with_origin_validator(allowed))
+
+    def test_uppercase_scheme_and_host_pass(self, client_lowercase_allowlist):
+        """Case-variant of a listed origin still passes."""
+        resp = client_lowercase_allowlist.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "method": "ping", "id": 1},
+            headers={"Origin": "HTTPS://GOOD.EXAMPLE.COM"},
+        )
+        assert resp.status_code == 200
+
+    def test_mixed_case_host_passes(self, client_lowercase_allowlist):
+        resp = client_lowercase_allowlist.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "method": "ping", "id": 1},
+            headers={"Origin": "https://Good.Example.com"},
+        )
+        assert resp.status_code == 200
+
+    def test_uppercase_scheme_only_passes(self, client_lowercase_allowlist):
+        resp = client_lowercase_allowlist.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "method": "ping", "id": 1},
+            headers={"Origin": "HTTPS://good.example.com"},
+        )
+        assert resp.status_code == 200
+
+    def test_completely_different_origin_still_rejected(
+        self, client_lowercase_allowlist,
+    ):
+        """Regression: the case-insensitivity fix must not accidentally
+        make disallowed origins pass. A different host still returns 403."""
+        resp = client_lowercase_allowlist.post(
+            "/mcp",
+            json={},
+            headers={"Origin": "https://evil.example.com"},
+        )
+        assert resp.status_code == 403
+
+
+class TestParseAllowedOriginsCasing:
+    """`_parse_allowed_origins` should lowercase config entries so that
+    an admin's `MCP_ALLOWED_ORIGINS=https://MyApp.Example.com` isn't
+    silently broken by a browser lowercasing the same origin."""
+
+    def test_env_value_lowercased(self):
+        from yugabytedb_mcp_server.server import _parse_allowed_origins
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv("MCP_ALLOWED_ORIGINS", "https://MyApp.Example.com")
+            mp.delenv("MCP_BASE_URL", raising=False)
+            allowed = _parse_allowed_origins()
+        assert allowed == {"https://myapp.example.com"}
+
+    def test_multiple_entries_lowercased(self):
+        from yugabytedb_mcp_server.server import _parse_allowed_origins
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv(
+                "MCP_ALLOWED_ORIGINS",
+                "https://A.example.com, HTTPS://B.EXAMPLE.COM/",
+            )
+            mp.delenv("MCP_BASE_URL", raising=False)
+            allowed = _parse_allowed_origins()
+        assert allowed == {
+            "https://a.example.com",
+            "https://b.example.com",
+        }
+
+    def test_mcp_base_url_lowercased(self):
+        """When MCP_ALLOWED_ORIGINS isn't set, MCP_BASE_URL fallback
+        must be lowercased too."""
+        from yugabytedb_mcp_server.server import _parse_allowed_origins
+        with pytest.MonkeyPatch.context() as mp:
+            mp.delenv("MCP_ALLOWED_ORIGINS", raising=False)
+            mp.setenv("MCP_BASE_URL", "https://MCP.Example.com")
+            allowed = _parse_allowed_origins()
+        assert allowed == {"https://mcp.example.com"}
+
+
+# ===================================================================
 # 3. WWWAuthenticateScopeMiddleware
 # ===================================================================
 

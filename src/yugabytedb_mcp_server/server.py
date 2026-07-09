@@ -46,6 +46,7 @@ def _positive_int(s: str) -> int:
 class ServerConfig:
     yugabytedb_url: str
     transport: str
+    host: str
     stateless_http: bool
     ssl_root_cert_secret_arn: str | None
     ssl_root_cert_key: str | None
@@ -264,6 +265,14 @@ def parse_config() -> ServerConfig:
         help="stdio | http (env: YB_MCP_TRANSPORT)",
     )
     parser.add_argument(
+        "--host",
+        default=os.environ.get("MCP_HOST", "127.0.0.1"),
+        help="Bind host for HTTP transport. Default 127.0.0.1 (loopback). "
+             "Set to 0.0.0.0 to expose on all interfaces; auth is required "
+             "in that case (see MCP_AUTH_PROVIDER). "
+             "(env: MCP_HOST, default: 127.0.0.1)",
+    )
+    parser.add_argument(
         "--stateless-http",
         action="store_true",
         default=os.environ.get("YB_MCP_STATELESS_HTTP", "").lower() == "true",
@@ -407,6 +416,7 @@ def parse_config() -> ServerConfig:
     return ServerConfig(
         yugabytedb_url=args.yugabytedb_url,
         transport=args.transport,
+        host=args.host,
         stateless_http=args.stateless_http,
         ssl_root_cert_secret_arn=args.yb_aws_ssl_root_cert_secret_arn,
         ssl_root_cert_key=args.yb_aws_ssl_root_cert_key,
@@ -461,13 +471,23 @@ class YugabyteDBMCPServer:
         else:
             logger.info("run_write_query tool disabled (use --enable-write-query or YB_MCP_ENABLE_WRITE_QUERY=true to enable)")
 
-    def run(self, host="0.0.0.0", port=8000):
+    def run(self, port=8000):
         if CONFIG.transport == "http":
-            self._run_http(host, port)
+            self._run_http(CONFIG.host, port)
         else:
             self.mcp.run(transport="stdio")
 
     def _run_http(self, host, port):
+        # DB-22139: refuse to start when the operator has combined a
+        # public bind host with no auth. Pre-fix: server defaulted to
+        # `0.0.0.0:8000` and accepted anonymous /mcp requests — an
+        # unauthenticated MCP→DB proxy on any IP that could reach the
+        # port. Fail-closed check runs BEFORE opening the socket, so a
+        # misconfigured deployment surfaces the error at startup, not
+        # after the first request lands.
+        _check_http_startup(host)
+
+
         # Note: json_response is intentionally NOT set here. The MCP spec
         # (Streamable HTTP §2.1 #5) requires the server to be able to return
         # text/event-stream as well as application/json. Forcing json_response
@@ -593,6 +613,87 @@ def _resolve_auth_scope() -> str | None:
     return None
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _is_loopback(host: str) -> bool:
+    """True if `host` is a loopback address / name. Used by the DB-22139
+    refuse-to-start guard to decide whether an unauth deployment is
+    acceptable (loopback-only = OK; any other bind = require auth)."""
+    return host.strip().lower() in _LOOPBACK_HOSTS
+
+
+def _env_bool(name: str) -> bool:
+    """Read an env var as a boolean. Accepts case-insensitive `true`;
+    anything else is False. Matches the parse_config idiom."""
+    return os.environ.get(name, "").lower() == "true"
+
+
+def _check_http_startup(host: str) -> None:
+    """DB-22139 fail-closed guard: refuse to start when HTTP mode is
+    exposed on a non-loopback host without an auth provider.
+
+    Pre-fix: the server bound `0.0.0.0:8000` by default and accepted
+    unauthenticated /mcp requests — a full MCP→DB proxy on any interface
+    that could reach the port.
+
+    Escape hatch: `MCP_ALLOW_UNAUTHENTICATED=true` runs the server as
+    unauthenticated even on a public host, with a prominent WARNING.
+    Documented as dev-only in OIDC.md / README.
+
+    Also warns when running HTTP mode without an Origin allowlist —
+    DNS-rebinding attacks from a browser can reach a loopback bind if
+    Origin isn't checked (`OriginValidationMiddleware` no-ops on an
+    empty allowlist per its docstring).
+    """
+    if CONFIG.transport != "http":
+        return
+
+    on_loopback = _is_loopback(host)
+    has_auth = CONFIG.auth_provider is not None
+    allow_unauth = _env_bool("MCP_ALLOW_UNAUTHENTICATED")
+
+    if not has_auth and not on_loopback and not allow_unauth:
+        logger.critical(
+            "HTTP transport on a non-loopback host (%s) requires an auth "
+            "provider. Set MCP_AUTH_PROVIDER=cognito|oidc, or set "
+            "MCP_ALLOW_UNAUTHENTICATED=true if you're intentionally "
+            "running a dev-only unauthenticated instance, or bind to "
+            "127.0.0.1 (unset MCP_HOST or set MCP_HOST=127.0.0.1).",
+            host,
+        )
+        sys.exit(1)
+
+    if not has_auth and allow_unauth and not on_loopback:
+        # Loud, prominent warning — the operator opted in with the
+        # escape hatch; make sure the choice is visible in prod logs.
+        logger.warning(
+            "=" * 78
+        )
+        logger.warning(
+            "MCP_ALLOW_UNAUTHENTICATED=true — HTTP transport is running "
+            "UNAUTHENTICATED on %s. Any client that can reach this port "
+            "has full MCP→DB access. This should only be used for "
+            "dev/testing.",
+            host,
+        )
+        logger.warning(
+            "=" * 78
+        )
+
+    # Independent of auth: an empty Origin allowlist means the
+    # DNS-rebinding defense is off (OriginValidationMiddleware no-ops
+    # when allowed_origins is empty). Warn — non-fatal — so operators
+    # who run browser clients see the gap in logs.
+    if not _parse_allowed_origins():
+        logger.warning(
+            "HTTP transport is running with no Origin allowlist "
+            "configured — DNS-rebinding defense is OFF. Set "
+            "MCP_ALLOWED_ORIGINS (comma-separated) or MCP_BASE_URL to "
+            "enable it."
+        )
+
+
 def _parse_allowed_origins() -> set[str]:
     """Allowed Origin values for the HTTP transport.
 
@@ -601,12 +702,19 @@ def _parse_allowed_origins() -> set[str]:
     enforcement). When the set is empty, requests with any Origin pass; when
     non-empty, requests with an Origin not in the set are rejected.
     Requests without an Origin header (non-browser clients) always pass.
+
+    DB-22176: RFC 6454 declares scheme + host to be case-insensitive.
+    Browsers lowercase them before sending the Origin header, so an
+    admin who types `MCP_ALLOWED_ORIGINS=https://MyApp.Example.com`
+    would silently reject every real browser request (which sends
+    `https://myapp.example.com`). Lowercase the allowlist entries here
+    and lowercase the incoming Origin at compare time to match spec.
     """
     raw = os.environ.get("MCP_ALLOWED_ORIGINS", "")
-    parts = {o.strip().rstrip("/") for o in raw.split(",") if o.strip()}
+    parts = {o.strip().rstrip("/").lower() for o in raw.split(",") if o.strip()}
     if parts:
         return parts
-    base = os.environ.get("MCP_BASE_URL", "").rstrip("/")
+    base = os.environ.get("MCP_BASE_URL", "").rstrip("/").lower()
     return {base} if base else set()
 
 
@@ -636,7 +744,12 @@ class OriginValidationMiddleware:
 
         headers = Headers(scope=scope)
         origin = headers.get("origin")
-        if origin is None or origin.rstrip("/") in self.allowed_origins:
+        # DB-22176: RFC 6454 says scheme + host are case-insensitive.
+        # `_parse_allowed_origins` lowercases the config; match on the
+        # lowercased incoming Origin so `HTTPS://GOOD.EXAMPLE.COM` from
+        # a legitimate browser still passes when the allowlist has
+        # `https://good.example.com`.
+        if origin is None or origin.rstrip("/").lower() in self.allowed_origins:
             await self.app(scope, receive, send)
             return
 
