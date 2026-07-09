@@ -611,7 +611,33 @@ def run_read_only_query(
     lifespan = ctx.request_context.lifespan_context
     pool = lifespan["pool"]
     guardrail_config: GuardrailConfig = lifespan["guardrail_config"]
+    # DB-22159 resource caps
+    max_query_len = lifespan["max_query_len"]
+    statement_timeout_ms = lifespan["statement_timeout_ms"]
+    max_result_rows = lifespan["max_result_rows"]
 
+    # Reject oversized queries BEFORE parsing or opening a connection.
+    # Vishal observed a ~1MB write query burning ~6s of CPU in the
+    # guardrail parser alone; keep the pre-parse surface flat. Byte
+    # length (UTF-8) matches the DoS rationale and the env-var
+    # documentation.
+    query_bytes = len(query.encode("utf-8"))
+    if query_bytes > max_query_len:
+        logger.warning(
+            "run_read_only_query rejected: query %d bytes exceeds "
+            "max_query_len=%d",
+            query_bytes, max_query_len,
+        )
+        return json.dumps({
+            "error": (
+                f"Query length {query_bytes} bytes exceeds "
+                f"YB_MCP_MAX_QUERY_LEN ({max_query_len} bytes)."
+            ),
+            "blocked_by_guardrail": True,
+        })
+
+    # Read-side guardrail (PR #9): blocks pg_read_file, COPY … TO
+    # PROGRAM, pg_sleep, and other dangerous SELECT-shaped surfaces.
     try:
         validate_query(query, guardrail_config, read_only=True)
     except QueryBlockedError as e:
@@ -629,16 +655,41 @@ def run_read_only_query(
         with conn.cursor() as cur:
             try:
                 _execute(cur, "BEGIN READ ONLY")
+                # DB-22159: SET LOCAL statement_timeout scopes the cap to
+                # this transaction only — the timeout dies with the ROLLBACK
+                # below, so it doesn't leak across pool checkouts.
+                _execute(
+                    cur,
+                    f"SET LOCAL statement_timeout = '{statement_timeout_ms}ms'",
+                )
                 _execute(cur, query)
-                rows = cur.fetchall()
+                # fetchmany(max+1) lets us detect truncation without paging
+                # the whole result set into memory first. `SELECT repeat('x',
+                # 100000000)` no longer OOMs the process.
+                rows = cur.fetchmany(max_result_rows + 1)
+                truncated = len(rows) > max_result_rows
+                if truncated:
+                    rows = rows[:max_result_rows]
                 column_names = [desc[0] for desc in cur.description]
-                result = {
+                # Use the parallel-arrays shape (PR #9 / DB-22203) so
+                # duplicate column names don't collapse; still robust to a
+                # `SELECT a.id, b.id FROM ...` after a join.
+                result: dict = {
                     "columns": column_names,
                     "rows": [list(row) for row in rows],
                 }
+                if truncated:
+                    result["truncated"] = True
+                    result["returned_rows"] = max_result_rows
+                    result["note"] = (
+                        f"Result set exceeded YB_MCP_MAX_RESULT_ROWS "
+                        f"({max_result_rows}). Add a LIMIT clause or "
+                        f"narrow the query to see the full result."
+                    )
                 logger.info(
-                    "run_read_only_query returned %d rows × %d columns",
-                    len(rows), len(column_names),
+                    "run_read_only_query returned %d rows × %d columns "
+                    "(truncated=%s)",
+                    len(rows), len(column_names), truncated,
                 )
                 sanitized = _sanitize_for_json(result)
                 return json.dumps(sanitized, indent=2, default=str, allow_nan=False)
@@ -682,6 +733,26 @@ def run_write_query(
     lifespan = ctx.request_context.lifespan_context
     pool = lifespan["pool"]
     guardrail_config: GuardrailConfig = lifespan["guardrail_config"]
+    # DB-22159 resource caps
+    max_query_len = lifespan["max_query_len"]
+    statement_timeout_ms = lifespan["statement_timeout_ms"]
+
+    # Reject oversized queries BEFORE parsing — the guardrail's sqlparse
+    # walker spikes CPU on very large inputs (Vishal measured ~6.4s on a
+    # ~1MB query). Cheap first-line defense.
+    if len(query) > max_query_len:
+        logger.warning(
+            "run_write_query rejected: query length %d exceeds "
+            "max_query_len=%d",
+            len(query), max_query_len,
+        )
+        return json.dumps({
+            "error": (
+                f"Query length {len(query)} exceeds YB_MCP_MAX_QUERY_LEN "
+                f"({max_query_len} bytes)."
+            ),
+            "blocked_by_guardrail": True,
+        })
 
     try:
         validate_query(query, guardrail_config, read_only=False)
@@ -699,6 +770,14 @@ def run_write_query(
         logger.debug("Acquired connection from pool for run_write_query")
         with conn.cursor() as cur:
             try:
+                # DB-22159: SET LOCAL statement_timeout — the SET LOCAL
+                # opens the implicit transaction that psycopg's default
+                # (autocommit=False) uses, and the timeout dies on commit
+                # so it doesn't leak across pool checkouts.
+                _execute(
+                    cur,
+                    f"SET LOCAL statement_timeout = '{statement_timeout_ms}ms'",
+                )
                 _execute(cur, query)
                 conn.commit()
                 logger.info("run_write_query committed: %d rows affected", cur.rowcount)

@@ -28,6 +28,20 @@ from .tools import (
 logger = logging.getLogger("yugabytedb-mcp.server")
 
 
+def _positive_int(s: str) -> int:
+    """argparse `type=` helper: parse `s` as int; raise ArgumentTypeError
+    on non-int or `< 1`. Used for the DB-22159 resource-limit env vars so
+    a typo (`YB_MCP_POOL_MAX_SIZE=abc` or `=0`) fails startup with a
+    clear message instead of a raw ValueError traceback."""
+    try:
+        v = int(s)
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {s!r}")
+    if v < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {v}")
+    return v
+
+
 @dataclass
 class ServerConfig:
     yugabytedb_url: str
@@ -44,8 +58,16 @@ class ServerConfig:
     enable_write_query: bool
     identity_claim: str
     identity_transform: str
+    # PR #10 (OIDC v2) identity mapping
     identity_map_path: str | None
     identity_map_name: str
+    # DB-22159 resource limits — all defaults documented alongside the
+    # argparse definitions in parse_config().
+    pool_min_size: int
+    pool_max_size: int
+    statement_timeout_ms: int
+    max_result_rows: int
+    max_query_len: int
 
 
 def normalize_pem(pem: str) -> str:
@@ -118,13 +140,14 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
 
     # Connection string can contain a password — log only structural info.
     logger.debug(
-        "Opening psycopg ConnectionPool (min_size=1, max_size=5, "
-        "check=ConnectionPool.check_connection)"
+        "Opening psycopg ConnectionPool (min_size=%d, max_size=%d, "
+        "check=ConnectionPool.check_connection)",
+        CONFIG.pool_min_size, CONFIG.pool_max_size,
     )
     pool = ConnectionPool(
         conninfo=database_url,
-        min_size=1,
-        max_size=5,
+        min_size=CONFIG.pool_min_size,
+        max_size=CONFIG.pool_max_size,
         open=True,
         check=ConnectionPool.check_connection,
     )
@@ -163,6 +186,13 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
             _total, _under_name, CONFIG.identity_map_name,
         )
 
+    logger.info(
+        "Resource limits: pool=%d-%d, statement_timeout=%dms, "
+        "max_result_rows=%d, max_query_len=%d bytes",
+        CONFIG.pool_min_size, CONFIG.pool_max_size,
+        CONFIG.statement_timeout_ms, CONFIG.max_result_rows,
+        CONFIG.max_query_len,
+    )
     if CONFIG.auth_provider:
         logger.info(
             "Per-user SET ROLE enabled (claim=%s, transform=%s, map=%s). "
@@ -215,6 +245,10 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
             "identity_transform": CONFIG.identity_transform,
             "identity_map": identity_map,
             "identity_map_name": CONFIG.identity_map_name,
+            # DB-22159 resource limits — read by tools.py at each call.
+            "statement_timeout_ms": CONFIG.statement_timeout_ms,
+            "max_result_rows": CONFIG.max_result_rows,
+            "max_query_len": CONFIG.max_query_len,
         }
     finally:
         logger.info("Closing database connections")
@@ -318,6 +352,56 @@ def parse_config() -> ServerConfig:
         help="Which named map inside the identity map file to apply. "
              "(env: YB_MCP_IDENTITY_MAP_NAME, default: default)",
     )
+    # DB-22159 resource limits — bound the blast radius of a slow query
+    # or a huge result set. All parsed with _positive_int so a typo in
+    # the env fails startup with a clean argparse error.
+    parser.add_argument(
+        "--pool-min-size",
+        type=_positive_int,
+        default=os.environ.get("YB_MCP_POOL_MIN_SIZE", "1"),
+        help="Minimum connections held by the pool "
+             "(env: YB_MCP_POOL_MIN_SIZE, default: 1).",
+    )
+    parser.add_argument(
+        "--pool-max-size",
+        type=_positive_int,
+        default=os.environ.get("YB_MCP_POOL_MAX_SIZE", "5"),
+        help="Maximum connections held by the pool. Raise this if you "
+             "expect concurrent tool calls; a low value is the DoS surface "
+             "described in DB-22159 (five long-running queries block "
+             "everyone else) "
+             "(env: YB_MCP_POOL_MAX_SIZE, default: 5).",
+    )
+    parser.add_argument(
+        "--statement-timeout-ms",
+        type=_positive_int,
+        default=os.environ.get("YB_MCP_STATEMENT_TIMEOUT_MS", "30000"),
+        help="Per-tool-call statement_timeout in milliseconds. Set "
+             "via `SET LOCAL statement_timeout` inside each transaction "
+             "so a runaway query (pg_sleep, cartesian, heavy scan) can't "
+             "hold a pool connection indefinitely "
+             "(env: YB_MCP_STATEMENT_TIMEOUT_MS, default: 30000).",
+    )
+    parser.add_argument(
+        "--max-result-rows",
+        type=_positive_int,
+        default=os.environ.get("YB_MCP_MAX_RESULT_ROWS", "10000"),
+        help="Cap the number of rows returned by run_read_only_query. "
+             "Prevents an OOM crash from `SELECT repeat('x', N) FROM "
+             "generate_series(1, N)`-style queries. Truncated responses "
+             "carry a `truncated: true` marker "
+             "(env: YB_MCP_MAX_RESULT_ROWS, default: 10000).",
+    )
+    parser.add_argument(
+        "--max-query-len",
+        type=_positive_int,
+        default=os.environ.get("YB_MCP_MAX_QUERY_LEN", "100000"),
+        help="Reject queries whose text length exceeds this byte count. "
+             "Rejection happens before parsing / execution — avoids the "
+             "~6s CPU spike Vishal measured when the guardrail parses a "
+             "1MB query "
+             "(env: YB_MCP_MAX_QUERY_LEN, default: 100000).",
+    )
 
     args = parser.parse_args()
     return ServerConfig(
@@ -337,6 +421,11 @@ def parse_config() -> ServerConfig:
         identity_transform=args.identity_transform,
         identity_map_path=args.identity_map,
         identity_map_name=args.identity_map_name,
+        pool_min_size=args.pool_min_size,
+        pool_max_size=args.pool_max_size,
+        statement_timeout_ms=args.statement_timeout_ms,
+        max_result_rows=args.max_result_rows,
+        max_query_len=args.max_query_len,
     )
 
 

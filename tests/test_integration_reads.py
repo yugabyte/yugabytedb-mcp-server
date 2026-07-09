@@ -233,3 +233,98 @@ async def test_summarize_empty_schema_returns_empty_list(
     result = await mcp_session.call_tool("summarize_database", {"schema": test_schema})
     parsed = parse_json(result)
     assert parsed == []
+
+
+# ---------------------------------------------------------------------------
+# DB-22159 resource limits: statement timeout, result row cap, query length
+# ---------------------------------------------------------------------------
+
+async def test_statement_timeout_kills_pg_sleep(mcp_session_capped):
+    """DB-22159 primary repro. pg_sleep(60) with a 1s statement_timeout
+    must fail within ~1s instead of holding the connection for 60s.
+    Prevents the "5 trivial queries downs the service" attack.
+    """
+    import time
+    start = time.monotonic()
+    result = await mcp_session_capped.call_tool(
+        "run_read_only_query", {"query": "SELECT pg_sleep(60)"},
+    )
+    elapsed = time.monotonic() - start
+    text = raw_text(result)
+    assert elapsed < 5, (
+        f"statement_timeout should fire fast; took {elapsed:.1f}s. Result: {text!r}"
+    )
+    # PG raises "canceling statement due to statement timeout" — the tool
+    # returns it as an "Error executing query: ..." string.
+    assert "timeout" in text.lower() or "canceling" in text.lower(), (
+        f"expected a timeout error, got: {text!r}"
+    )
+
+
+async def test_result_row_cap_truncates(mcp_session_capped, test_schema, db_conn):
+    """DB-22159 second repro. A query returning MORE than
+    YB_MCP_MAX_RESULT_ROWS (3 in the capped fixture) truncates with a
+    `truncated: true` marker instead of buffering the whole result set
+    into memory and risking OOM.
+    """
+    # Seed 10 rows; the capped session's max_result_rows=3 so we truncate.
+    with db_conn.cursor() as cur:
+        cur.execute(f'CREATE TABLE "{test_schema}".big (id INT)')
+        cur.execute(
+            f'INSERT INTO "{test_schema}".big '
+            f'SELECT generate_series(1, 10)'
+        )
+
+    result = await mcp_session_capped.call_tool(
+        "run_read_only_query",
+        {"query": f'SELECT id FROM "{test_schema}".big ORDER BY id'},
+    )
+    parsed = parse_json(result)
+    # Truncation changes the shape: dict with rows + truncated marker.
+    assert isinstance(parsed, dict), f"expected truncation marker, got list: {parsed!r}"
+    assert parsed.get("truncated") is True
+    assert parsed.get("returned_rows") == 3
+    assert len(parsed["rows"]) == 3
+    # First 3 ids returned, remaining 7 dropped.
+    ids = [r["id"] for r in parsed["rows"]]
+    assert ids == [1, 2, 3]
+
+
+async def test_result_row_cap_not_triggered(mcp_session_capped):
+    """Regression: a query returning fewer rows than the cap keeps the
+    v1 shape (list of dicts), no truncation marker."""
+    result = await mcp_session_capped.call_tool(
+        "run_read_only_query",
+        {"query": "SELECT generate_series(1, 2) AS n"},
+    )
+    parsed = parse_json(result)
+    assert isinstance(parsed, list), f"expected list shape, got: {parsed!r}"
+    assert len(parsed) == 2
+
+
+async def test_max_query_len_rejects_oversized_query(mcp_session_capped):
+    """DB-22159 third repro. Queries whose text length exceeds
+    YB_MCP_MAX_QUERY_LEN (200 bytes in the capped fixture) are rejected
+    BEFORE reaching the DB — no connection acquisition, no parser CPU
+    spike."""
+    # Pad the query well past 200 bytes with meaningless-but-valid SQL.
+    padding = "-- " + ("x" * 300)
+    long_query = f"SELECT 1 AS n\n{padding}"
+    assert len(long_query) > 200
+
+    result = await mcp_session_capped.call_tool(
+        "run_read_only_query", {"query": long_query},
+    )
+    parsed = parse_json(result)
+    # Rejected pre-execute → structured error, not a DB-side failure.
+    assert parsed.get("blocked_by_guardrail") is True
+    assert "MAX_QUERY_LEN" in parsed.get("error", "")
+
+
+async def test_max_query_len_allows_normal_query(mcp_session_capped):
+    """Regression: queries under the length cap pass through normally."""
+    result = await mcp_session_capped.call_tool(
+        "run_read_only_query", {"query": "SELECT 1 AS n"},
+    )
+    parsed = parse_json_list(result)
+    assert parsed == [{"n": 1}]
