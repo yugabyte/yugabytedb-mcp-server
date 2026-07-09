@@ -68,9 +68,7 @@ For development from source, see [Development](#development) below.
 | `YB_MCP_REQUIRE_WHERE_ON_UPDATE` | `--require-where-on-update` | No | Reject UPDATE without a WHERE clause. Default `false`. |
 | `YB_MCP_REQUIRE_WHERE_ON_DELETE` | `--require-where-on-delete` | No | Reject DELETE without a WHERE clause. Default `false`. |
 | `YB_MCP_ENABLE_WRITE_QUERY` | `--enable-write-query` | No | Enable the `run_write_query` tool. Default `false` (write tool disabled). |
-| `MCP_AUTH_PROVIDER` | `--mcp-auth-provider` | No | `cognito` (tested) or `oidc` (untested). Leave unset to disable auth. |
-| `YB_MCP_IDENTITY_CLAIM` | `--identity-claim` | No | JWT claim to use as the DB role identifier for per-user `SET ROLE`. Default `email`. |
-| `YB_MCP_IDENTITY_TRANSFORM` | `--identity-transform` | No | Transform applied to the claim before using as a DB role: `none` (default) or `strip_domain` (strips `@…` from emails). |
+| `MCP_AUTH_PROVIDER` | `--mcp-auth-provider` | No | `cognito` or `oidc`. Leave unset to disable auth. Full OIDC/Cognito setup + per-user identity mapping is documented in [`OIDC.md`](OIDC.md). |
 | `MCP_BASE_URL` | — | When auth enabled | Public base URL the server is reachable at (e.g. `https://mcp.example.com`). |
 | `MCP_ALLOWED_ORIGINS` | — | No | Comma-separated allowlist of Origin values for DNS-rebinding defense. Defaults to `MCP_BASE_URL`. |
 | `YB_LOG_LEVEL` | — | No | Log level for the `yugabytedb-mcp` logger family (default `INFO`). |
@@ -79,14 +77,8 @@ For development from source, see [Development](#development) below.
 | `YB_AWS_SSL_ROOT_CERT_SECRET_REGION` | `--yb-aws-ssl-root-cert-secret-region` | No | AWS region of the secret. |
 | `YB_SSL_ROOT_CERT_PATH` | `--yb-ssl-root-cert-path` | No | Where to write the fetched cert. Default `/tmp/yb-root.crt`. |
 
-Cognito-specific env vars (only required when `MCP_AUTH_PROVIDER=cognito`):
-
-| Variable | Description |
-|---|---|
-| `COGNITO_USER_POOL_ID` | Cognito user-pool ID (e.g. `us-west-2_XXXXXXXX`) |
-| `COGNITO_AWS_REGION` | AWS region |
-| `COGNITO_CLIENT_ID` | App client ID |
-| `COGNITO_CLIENT_SECRET` | App client secret |
+For OIDC/Cognito authentication, per-user `SET ROLE` mapping, the identity map
+file format, and the `/auth/login` shortcut — see [`OIDC.md`](OIDC.md).
 
 A starter template is in `.env.example`.
 
@@ -180,7 +172,9 @@ This list is best-effort, not exhaustive. `destructiveHint: true` is the second 
 
 ## Self-hosted remote mode
 
-For multi-user or shared deployments, run the server as Streamable HTTP behind a reverse proxy with TLS, with Cognito OAuth gating access:
+For multi-user or shared deployments, run the server as Streamable HTTP behind a reverse proxy with TLS, with Cognito OAuth (or generic OIDC) gating access. The full setup — provider config, per-user `SET ROLE` mapping, the identity map file format, the `/auth/login` shortcut, and security guidance — is in [`OIDC.md`](OIDC.md).
+
+Minimum config for Cognito:
 
 ```bash
 export MCP_AUTH_PROVIDER=cognito
@@ -200,72 +194,8 @@ Behavior:
 - Requests to `/mcp` without a valid Bearer token return 401.
 - Requests with a disallowed `Origin` header return 403 (DNS-rebinding defense).
 - `/ping` is unauthenticated and is suitable for liveness probes.
-- `/auth/login` exposes a Cognito email+password → token shortcut (see below).
+- `/auth/login` exposes a Cognito email+password → token shortcut (details in [`OIDC.md`](OIDC.md)).
 - `--stateless-http` is required for multi-replica deployments — without it, MCP session state lives in process memory and round-robin load balancing breaks sessions.
-
-### Getting a token without a browser
-
-The browser-based OAuth flow is what Claude Desktop / mcp-remote / claude.ai use, but for curl-based smoke tests, CI, or any scripted client, the HTTP transport also exposes a direct password endpoint when `MCP_AUTH_PROVIDER=cognito`:
-
-```bash
-curl -X POST http://localhost:8000/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email":"user@example.com","password":"…"}'
-# →
-# {"access_token":"…","id_token":"…","refresh_token":"…","expires_in":86400,"token_type":"Bearer"}
-```
-
-Then:
-
-```bash
-curl -H "Authorization: Bearer $ACCESS_TOKEN" \
-     -H "Accept: application/json,text/event-stream" \
-     -X POST http://localhost:8000/mcp \
-     -H "Content-Type: application/json" \
-     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
-```
-
-The endpoint uses Cognito's `USER_PASSWORD_AUTH` flow under the hood — the Cognito **app client must have `ALLOW_USER_PASSWORD_AUTH` enabled** (Cognito Console → User pools → App integration → App client settings). MFA, password-reset, and other challenge flows are **not** handled by this endpoint — they require the browser flow.
-
-OIDC (`MCP_AUTH_PROVIDER=oidc`) wiring exists but is untested; please share findings if you exercise it.
-
-### Per-user database roles (SET ROLE)
-
-When OIDC auth is enabled, the server can map each authenticated user to a YugabyteDB database role using `SET ROLE`. This enforces row-level security, schema-level grants, and per-user privilege boundaries — the same connection pool is used, but each tool call runs under the caller's database role.
-
-```bash
-export YB_MCP_IDENTITY_CLAIM=email             # JWT claim to extract (default)
-export YB_MCP_IDENTITY_TRANSFORM=strip_domain  # alice@example.com → alice
-```
-
-**How it works:**
-
-1. The server extracts the configured claim from the OIDC access token.
-2. An optional transform derives the DB role name (e.g., stripping `@domain`).
-3. Before executing tool SQL, the server issues `SET ROLE <role>` on the pooled connection.
-4. After execution, `RESET ROLE` restores the connection to the pool user.
-
-**Requirements:**
-
-- The pool user (from `YUGABYTEDB_URL`) must be a superuser **or** have `GRANT <target_role> TO <pool_user>` for every role that can authenticate.
-- Target roles must already exist in the database — the server does not create them.
-- When auth is disabled (no `MCP_AUTH_PROVIDER`), SET ROLE is not used and the pool operates with its configured credentials as before.
-
-**Example setup:**
-
-```sql
--- Create per-user roles matching the identity claim
-CREATE ROLE alice LOGIN;
-CREATE ROLE bob LOGIN;
-
--- Grant them to the pool user so SET ROLE works
-GRANT alice TO mcp_admin;
-GRANT bob TO mcp_admin;
-
--- Apply per-role permissions as needed
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO alice;
-GRANT ALL ON ALL TABLES IN SCHEMA public TO bob;
-```
 
 ## AWS Secrets Manager for TLS certificates
 
