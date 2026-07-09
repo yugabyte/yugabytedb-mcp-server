@@ -480,51 +480,94 @@ def summarize_database(
         with conn.cursor() as cur:
             try:
                 _execute(cur, "BEGIN READ ONLY")
-                _execute(
-                    cur,
-                    """
-                    SELECT table_name
-                    FROM information_schema.tables
-                    WHERE table_schema = %s
-                    ORDER BY table_name
-                    """,
-                    (schema,),
-                )
-                tables = [row[0] for row in cur.fetchall()]
-                logger.debug("Schema %s has %d tables: %s", schema, len(tables), tables)
 
-                for table in tables:
+                # Initial tables lookup — if this fails there's nothing to
+                # iterate; report the error and unwind.
+                try:
                     _execute(
                         cur,
                         """
-                        SELECT column_name, data_type
-                        FROM information_schema.columns
-                        WHERE table_schema = %s AND table_name = %s
-                        ORDER BY ordinal_position
+                        SELECT table_name
+                        FROM information_schema.tables
+                        WHERE table_schema = %s
+                        ORDER BY table_name
                         """,
-                        (schema, table),
+                        (schema,),
                     )
-                    schema_info = [
-                        {"column_name": col, "data_type": dtype}
-                        for col, dtype in cur.fetchall()
-                    ]
-
-                    _execute(cur, f'SELECT COUNT(*) FROM {schema}."{table}"')
-                    row_count = cur.fetchone()[0]
-                    logger.debug(
-                        "Table %s.%s: %d columns, %d rows",
-                        schema, table, len(schema_info), row_count,
+                    tables = [row[0] for row in cur.fetchall()]
+                except Exception as e:
+                    logger.error(
+                        "Error listing tables in schema %s: %s",
+                        schema, e, exc_info=True,
                     )
+                    summary.append({"error": str(e)})
+                    tables = []
+                logger.debug("Schema %s has %d tables: %s", schema, len(tables), tables)
 
-                    summary.append({
-                        "table": table,
-                        "row_count": row_count,
-                        "schema": schema_info,
-                    })
+                # DB-22138: per-table error handling. A single problematic
+                # object (view over a since-dropped table, permission-denied
+                # table, division-by-zero in a view, foreign-table connection
+                # error…) previously aborted the whole loop and discarded
+                # every other table's row count. Wrap each iteration in a
+                # SAVEPOINT so the failed COUNT rolls back and iteration
+                # continues; record the error against the offending table.
+                for i, table in enumerate(tables):
+                    sp = f"tbl_{i}"
+                    try:
+                        _execute(cur, SQL("SAVEPOINT {}").format(Identifier(sp)))
+                        _execute(
+                            cur,
+                            """
+                            SELECT column_name, data_type
+                            FROM information_schema.columns
+                            WHERE table_schema = %s AND table_name = %s
+                            ORDER BY ordinal_position
+                            """,
+                            (schema, table),
+                        )
+                        schema_info = [
+                            {"column_name": col, "data_type": dtype}
+                            for col, dtype in cur.fetchall()
+                        ]
 
-            except Exception as e:
-                logger.error("Error summarizing schema %s: %s", schema, e, exc_info=True)
-                summary.append({"error": str(e)})
+                        # DB-22158: `schema` is interpolated unquoted here
+                        # — pre-existing gap, deferred. The per-table
+                        # SAVEPOINT above does not narrow or widen that
+                        # surface; it only prevents one bad object from
+                        # aborting the loop.
+                        _execute(cur, f'SELECT COUNT(*) FROM {schema}."{table}"')
+                        row_count = cur.fetchone()[0]
+                        _execute(cur, SQL("RELEASE SAVEPOINT {}").format(Identifier(sp)))
+                        logger.debug(
+                            "Table %s.%s: %d columns, %d rows",
+                            schema, table, len(schema_info), row_count,
+                        )
+                        summary.append({
+                            "table": table,
+                            "row_count": row_count,
+                            "schema": schema_info,
+                        })
+                    except Exception as e:
+                        logger.warning(
+                            "Error summarizing %s.%s (recording per-table error "
+                            "and continuing): %s",
+                            schema, table, e,
+                        )
+                        # Roll back to the pre-COUNT state and release the
+                        # savepoint so the next iteration's SAVEPOINT is
+                        # clean. Cleanup failures are logged but don't stop
+                        # iteration — the outer ROLLBACK will unwind the
+                        # whole transaction if the connection is truly
+                        # unrecoverable.
+                        try:
+                            _execute(cur, SQL("ROLLBACK TO SAVEPOINT {}").format(Identifier(sp)))
+                            _execute(cur, SQL("RELEASE SAVEPOINT {}").format(Identifier(sp)))
+                        except Exception as cleanup_err:
+                            logger.error(
+                                "Failed to roll back savepoint %s for %s.%s: %s",
+                                sp, schema, table, cleanup_err,
+                            )
+                        summary.append({"table": table, "error": str(e)})
             finally:
                 try:
                     _execute(cur, "ROLLBACK")

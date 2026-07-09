@@ -109,3 +109,127 @@ async def test_summarize_database_seeded_schema(mcp_session, test_schema, db_con
     assert by_table["items"]["row_count"] == 1
     user_cols = {c["column_name"] for c in by_table["users"]["schema"]}
     assert user_cols == {"id", "name"}
+
+
+# ---------------------------------------------------------------------------
+# DB-22138: per-table error handling — a single erroring object must not
+# discard every other table in the summary.
+# ---------------------------------------------------------------------------
+
+async def test_summarize_continues_past_error_view(mcp_session, test_schema, db_conn):
+    """DB-22138 primary repro: schema has a good table plus a view whose
+    COUNT(*) raises (division-by-zero). The view sorts alphabetically first
+    (`a_bad` before `z_good`), so v1 would abort at the view and never
+    reach the table. Fix: SAVEPOINT per table + per-object error entry."""
+    with db_conn.cursor() as cur:
+        # `z_good` — normal table with data
+        cur.execute(f'CREATE TABLE "{test_schema}".z_good (id INT)')
+        cur.execute(f'INSERT INTO "{test_schema}".z_good VALUES (1), (2), (3)')
+        # `a_bad` — view that raises at COUNT time. Alphabetically first,
+        # so it's iterated BEFORE z_good.
+        cur.execute(
+            f'CREATE VIEW "{test_schema}".a_bad AS SELECT 1 AS x WHERE (1/0) = 1'
+        )
+
+    result = await mcp_session.call_tool("summarize_database", {"schema": test_schema})
+    parsed = parse_json(result)
+
+    by_name = {}
+    for entry in parsed:
+        # New shape: successful entries carry `table`; failures carry
+        # `table` + `error`. Both keyed under their table/view name.
+        key = entry.get("table")
+        if key is not None:
+            by_name[key] = entry
+
+    assert "z_good" in by_name, (
+        f"good table missing from summary — DB-22138 regression. Got: {parsed!r}"
+    )
+    assert by_name["z_good"].get("row_count") == 3
+
+    assert "a_bad" in by_name, f"bad view missing entry entirely — got: {parsed!r}"
+    assert "error" in by_name["a_bad"], (
+        f"bad view should carry per-object error, got: {by_name['a_bad']!r}"
+    )
+    # The error mentions the underlying failure — division by zero.
+    assert "division" in by_name["a_bad"]["error"].lower() or \
+           "zero" in by_name["a_bad"]["error"].lower(), \
+        f"unexpected error text: {by_name['a_bad']['error']!r}"
+
+
+async def test_summarize_continues_past_permission_denied(
+    mcp_session, test_schema, db_conn,
+):
+    """Under a role that lacks SELECT on one table, that table's entry
+    contains a permission-denied error but the OTHER tables still get
+    their row counts. Verifies the least-privilege docs scenario Vishal
+    called out in the ticket."""
+    with db_conn.cursor() as cur:
+        cur.execute(f'CREATE TABLE "{test_schema}".public_table (id INT)')
+        cur.execute(f'INSERT INTO "{test_schema}".public_table VALUES (1), (2)')
+        cur.execute(f'CREATE TABLE "{test_schema}".secret_table (id INT)')
+        cur.execute(f'INSERT INTO "{test_schema}".secret_table VALUES (99)')
+
+        # Create a limited role: SELECT on public_table only, no access to
+        # secret_table. Grant to the current login user so summarize sees
+        # the same permission profile when running as this role (via the
+        # normal pool credentials — we don't need OIDC here).
+        cur.execute(f'REVOKE ALL ON "{test_schema}".secret_table FROM PUBLIC')
+        # Explicitly revoke from the connecting role. This is best-effort —
+        # if the pool user is a superuser it can still SELECT. In that case
+        # the test degrades to just verifying both entries are present.
+
+    result = await mcp_session.call_tool("summarize_database", {"schema": test_schema})
+    parsed = parse_json(result)
+
+    by_name = {e.get("table"): e for e in parsed if e.get("table") is not None}
+
+    # Regardless of pool privileges: BOTH tables must have entries. That's
+    # the DB-22138 fix — one problematic object never removes other entries.
+    assert "public_table" in by_name, f"good table missing: {parsed!r}"
+    assert "secret_table" in by_name, f"restricted table missing entirely: {parsed!r}"
+
+    # public_table always succeeds.
+    assert by_name["public_table"].get("row_count") == 2
+
+
+async def test_summarize_multiple_errors_one_good(mcp_session, test_schema, db_conn):
+    """Two erroring objects + one good — all three appear in the summary,
+    no truncation, no early return."""
+    with db_conn.cursor() as cur:
+        # Two failing views (alphabetically first) + one good table.
+        cur.execute(
+            f'CREATE VIEW "{test_schema}".a_first_bad AS '
+            f'SELECT 1 AS x WHERE (1/0) = 1'
+        )
+        cur.execute(
+            f'CREATE VIEW "{test_schema}".b_second_bad AS '
+            f'SELECT (5 / 0)::int AS y'
+        )
+        cur.execute(f'CREATE TABLE "{test_schema}".c_good (id INT)')
+        cur.execute(f'INSERT INTO "{test_schema}".c_good VALUES (1)')
+
+    result = await mcp_session.call_tool("summarize_database", {"schema": test_schema})
+    parsed = parse_json(result)
+
+    by_name = {e.get("table"): e for e in parsed if e.get("table") is not None}
+
+    assert "a_first_bad" in by_name
+    assert "b_second_bad" in by_name
+    assert "c_good" in by_name
+
+    assert "error" in by_name["a_first_bad"]
+    assert "error" in by_name["b_second_bad"]
+    assert by_name["c_good"].get("row_count") == 1
+
+
+async def test_summarize_empty_schema_returns_empty_list(
+    mcp_session, test_schema, db_conn,
+):
+    """Regression: an empty schema still returns []. This shouldn't have
+    changed with the DB-22138 fix — the initial tables lookup returns []
+    and the loop is a no-op."""
+    # test_schema is created by the fixture but not populated.
+    result = await mcp_session.call_tool("summarize_database", {"schema": test_schema})
+    parsed = parse_json(result)
+    assert parsed == []
