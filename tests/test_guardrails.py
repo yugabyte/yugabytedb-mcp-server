@@ -393,25 +393,131 @@ def test_read_only_skips_require_where(strict_cfg):
 
 
 # ---------------------------------------------------------------------------
-# _strip_strings helper
+# AST-based detection edge cases — new behaviors from the parser rewrite
 # ---------------------------------------------------------------------------
 
-def test_strip_strings_replaces_single_quoted():
-    from yugabytedb_mcp_server.guardrails import _strip_strings
-    assert _strip_strings("SELECT 'GRANT'") == "SELECT ''"
+def test_blocks_schema_qualified_dangerous_function(cfg):
+    # pg_catalog.pg_read_file(…) — sqlparse flattens the dotted name into
+    # separate Name tokens, so the unqualified `pg_read_file` still matches
+    # the function blocklist.
+    with pytest.raises(QueryBlockedError) as exc:
+        validate_query("SELECT pg_catalog.pg_read_file('/etc')", cfg, read_only=True)
+    assert "pg_read_file" in str(exc.value)
 
 
-def test_strip_strings_replaces_dollar_quoted():
-    from yugabytedb_mcp_server.guardrails import _strip_strings
-    # Dollar-quoted strings should also be replaced so DO $$ ... GRANT ... $$
-    # can't hide GRANT inside a code block.
-    stripped = _strip_strings("DO $$ GRANT ALL ON t TO evil $$")
-    assert "GRANT" not in stripped
+def test_allows_pg_read_file_as_string_literal(cfg):
+    # The literal 'pg_read_file' inside a WHERE clause must not match the
+    # function blocklist — it's not a Name token, it's inside a String.Single.
+    validate_query(
+        "SELECT * FROM my_table WHERE name = 'pg_read_file'",
+        cfg, read_only=True,
+    )
 
 
-def test_strip_strings_preserves_identifiers():
-    from yugabytedb_mcp_server.guardrails import _strip_strings
-    # Double-quoted identifiers must NOT be treated as strings — otherwise
-    # `UPDATE "GRANT"` would look like `UPDATE ''` and no longer be a valid
-    # keyword to match. sqlparse tokenizes them as Token.Name, not String.
-    assert '"my_table"' in _strip_strings('SELECT * FROM "my_table"')
+def test_allows_pg_read_file_as_quoted_identifier(cfg):
+    # A double-quoted identifier "pg_read_file" is tokenized as
+    # String.Symbol (a Name, not a String literal). It's an identifier ref,
+    # not a call — no following `(` — so it must not be blocked.
+    validate_query(
+        'SELECT "pg_read_file" FROM my_table',
+        cfg, read_only=True,
+    )
+
+
+def test_allows_set_local_statement_timeout(cfg):
+    # `SET LOCAL statement_timeout = '5s'` is a legitimate performance knob
+    # that PR #5 will use internally — must not be blocked by the
+    # SET-search_path rule.
+    validate_query(
+        "SET LOCAL statement_timeout = '5s'",
+        cfg, read_only=False,
+    )
+
+
+def test_blocks_set_search_path_all_variants(cfg):
+    for sql in [
+        "SET search_path TO evil",
+        "SET search_path = evil",
+        "SET LOCAL search_path TO evil",
+        "SET SESSION search_path TO evil",
+    ]:
+        with pytest.raises(QueryBlockedError) as exc:
+            validate_query(sql, cfg, read_only=False)
+        assert "search_path" in str(exc.value)
+
+
+def test_blocks_grant_inside_dollar_quoted_do_block(cfg):
+    # DO $$ … $$ is blocked outright (any DO block is rejected), so even
+    # if it contained an attempted GRANT the outer DO block catches it first.
+    with pytest.raises(QueryBlockedError) as exc:
+        validate_query("DO $$ GRANT ALL ON t TO evil $$", cfg, read_only=False)
+    assert "DO" in str(exc.value) or "Anonymous" in str(exc.value)
+
+
+def test_top_level_where_detected_after_cte(strict_cfg):
+    # WITH x AS (…) UPDATE t SET c = 1 — stmt.get_type() returns 'UPDATE'
+    # and the top-level Where check should fire. Without a top-level WHERE,
+    # this should be rejected under strict config.
+    with pytest.raises(QueryBlockedError):
+        validate_query(
+            "WITH x AS (SELECT 1) UPDATE t SET c = 1",
+            strict_cfg, read_only=False,
+        )
+    # But with a real top-level WHERE, it should pass.
+    validate_query(
+        "WITH x AS (SELECT 1) UPDATE t SET c = 1 WHERE id = 1",
+        strict_cfg, read_only=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# DB-22172: read-tool multi-statement escape via COMMIT/END prefix
+# ---------------------------------------------------------------------------
+# The read tool wraps queries in `BEGIN READ ONLY ... ROLLBACK`, but a caller
+# whose input starts with COMMIT/END closes the read-only transaction before
+# subsequent statements run — those then auto-commit outside the wrapper. The
+# multi-statement rejection in validate_query() catches this on both read and
+# write paths.
+
+@pytest.mark.parametrize("sql", [
+    "COMMIT; INSERT INTO t VALUES (1)",
+    "END; DROP TABLE t",
+    "COMMIT; UPDATE t SET c = 1",
+    "END; CREATE TABLE t (id int)",
+    "COMMIT; DELETE FROM t",
+    "COMMIT ; INSERT INTO t VALUES (1)",       # extra whitespace before ;
+    "commit; insert into t values (1)",         # lowercase
+    "COMMIT;\nINSERT INTO t VALUES (1)",       # newline separator
+    "COMMIT; SELECT 1",                          # even a second SELECT is blocked
+])
+def test_multi_statement_escape_blocked_read_only(sql, cfg):
+    """DB-22172: read tool must reject multi-statement input so a COMMIT/END
+    prefix cannot end the BEGIN READ ONLY transaction and let downstream
+    statements auto-commit outside the read-only wrapper."""
+    with pytest.raises(QueryBlockedError) as exc:
+        validate_query(sql, cfg, read_only=True)
+    assert "Multi-statement" in str(exc.value)
+
+
+@pytest.mark.parametrize("sql", [
+    "COMMIT; INSERT INTO t VALUES (1)",
+    "END; DROP TABLE t",
+])
+def test_multi_statement_escape_blocked_write(sql, cfg):
+    """DB-22172: same multi-statement rejection on the write path (regression
+    check — was already covered by DB-22131 multi-statement tests, but explicit
+    for the DB-22172 scenario)."""
+    with pytest.raises(QueryBlockedError) as exc:
+        validate_query(sql, cfg, read_only=False)
+    assert "Multi-statement" in str(exc.value)
+
+
+def test_bare_commit_alone_not_multi_statement(cfg):
+    """A lone COMMIT is one statement — not blocked by the multi-statement
+    check. (It's still harmless via the read tool: ends an empty read-only
+    txn.) Documents current behavior; if we want to also block bare
+    transaction control statements, that's a follow-up ticket."""
+    # No raise expected: single statement, not on the blocklist.
+    validate_query("COMMIT", cfg, read_only=True)
+    validate_query("END", cfg, read_only=True)
+    validate_query("ROLLBACK", cfg, read_only=True)
