@@ -224,3 +224,258 @@ async def test_jwt_verifier_rejects_tampered_signature(rsa_keypair):
 
     result = await verifier.verify_token(tampered)
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# DB-22136: audience validation
+# ---------------------------------------------------------------------------
+# The pre-fix code passed no `audience=` to JWTVerifier, so a token minted
+# for a different app client in the same Cognito user pool was accepted at
+# /mcp. Fix: pass the expected audience (Cognito's app-client_id) to
+# JWTVerifier. These tests exercise the raw JWTVerifier with `audience=`
+# because that's the guarantee we rely on in _create_cognito.
+
+@pytest.mark.asyncio
+async def test_jwt_verifier_rejects_wrong_audience(rsa_keypair):
+    """DB-22136: token minted for another client (different `aud`) must be
+    rejected once audience validation is enabled."""
+    from fastmcp.server.auth.providers.jwt import JWTVerifier
+
+    verifier = JWTVerifier(
+        public_key=rsa_keypair["public_pem"].decode(),
+        issuer=FAKE_ISSUER,
+        audience="expected-client-id",
+        algorithm="RS256",
+    )
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    claims = {
+        "iss": FAKE_ISSUER,
+        "sub": "some-user",
+        "aud": "OTHER-app-client",       # different client in same pool
+        "exp": now + datetime.timedelta(minutes=5),
+        "iat": now,
+    }
+    token = _sign_jwt(claims, rsa_keypair["private_pem"])
+    result = await verifier.verify_token(token)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_jwt_verifier_accepts_matching_audience(rsa_keypair):
+    """Regression: correct audience continues to pass."""
+    from fastmcp.server.auth.providers.jwt import JWTVerifier
+
+    verifier = JWTVerifier(
+        public_key=rsa_keypair["public_pem"].decode(),
+        issuer=FAKE_ISSUER,
+        audience="expected-client-id",
+        algorithm="RS256",
+    )
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    claims = {
+        "iss": FAKE_ISSUER,
+        "sub": "some-user",
+        "aud": "expected-client-id",
+        "exp": now + datetime.timedelta(minutes=5),
+        "iat": now,
+    }
+    token = _sign_jwt(claims, rsa_keypair["private_pem"])
+    result = await verifier.verify_token(token)
+    assert result is not None
+
+
+def test_cognito_provider_wires_client_id_as_audience():
+    """DB-22136: _create_cognito must pass COGNITO_CLIENT_ID as the
+    JWTVerifier's audience so tokens for other same-pool clients are
+    rejected. Reads the verifier's audience via the MultiAuth wiring."""
+    with patch.dict("os.environ", COGNITO_ENV, clear=False), \
+         patch("httpx.get", side_effect=_mock_httpx_get):
+        provider = _create_cognito()
+    # MultiAuth exposes verifiers as a list; our custom subclass sits there.
+    verifier = provider.verifiers[0]
+    # JWTVerifier stores audience in a public attribute — mypy may need
+    # `# type: ignore` since it's not in the type stubs.
+    assert getattr(verifier, "audience", None) == COGNITO_ENV["COGNITO_CLIENT_ID"]
+
+
+# ---------------------------------------------------------------------------
+# DB-22136: token_use=access enforcement (Cognito, opt-in)
+# ---------------------------------------------------------------------------
+# _CognitoJWTVerifier rejects tokens where `token_use != "access"` when
+# YB_MCP_REQUIRE_ACCESS_TOKEN=true. Default off for backward compat with
+# email-in-ID-token deployments (see DB-22192).
+
+@pytest.mark.asyncio
+async def test_id_token_accepted_when_require_access_off(rsa_keypair, caplog):
+    """Default config: ID tokens are accepted; a WARNING is logged so
+    operators see they should migrate."""
+    with patch.dict("os.environ", {**COGNITO_ENV}, clear=False), \
+         patch("httpx.get", side_effect=_mock_httpx_get):
+        # Ensure the toggle is off (default)
+        with patch.dict("os.environ", {"YB_MCP_REQUIRE_ACCESS_TOKEN": "false"}):
+            provider = _create_cognito()
+
+    verifier = provider.verifiers[0]
+    # Swap the verifier's JWKS-based key path for our test RSA key so we can
+    # sign tokens locally. JWTVerifier accepts `public_key` at construction;
+    # since we're testing the subclass logic, patch its key resolution.
+    verifier._public_key = rsa_keypair["public_pem"].decode()
+    verifier.public_key = rsa_keypair["public_pem"].decode()
+    verifier.algorithm = "RS256"
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    id_token_claims = {
+        "iss": FAKE_ISSUER,
+        "sub": "user",
+        "aud": COGNITO_ENV["COGNITO_CLIENT_ID"],
+        "token_use": "id",                  # ID token, not access
+        "email": "alice@example.com",
+        "exp": now + datetime.timedelta(minutes=5),
+        "iat": now,
+    }
+    token = _sign_jwt(id_token_claims, rsa_keypair["private_pem"])
+
+    with caplog.at_level("WARNING"):
+        result = await verifier.verify_token(token)
+
+    assert result is not None, "ID token accepted when require_access is off"
+    assert any("ID token" in r.message for r in caplog.records), \
+        "expected a WARNING about accepted ID token"
+
+
+@pytest.mark.asyncio
+async def test_id_token_rejected_when_require_access_on(rsa_keypair, caplog):
+    """`YB_MCP_REQUIRE_ACCESS_TOKEN=true` rejects ID tokens outright."""
+    with patch.dict("os.environ", {**COGNITO_ENV, "YB_MCP_REQUIRE_ACCESS_TOKEN": "true"}), \
+         patch("httpx.get", side_effect=_mock_httpx_get):
+        provider = _create_cognito()
+
+    verifier = provider.verifiers[0]
+    verifier._public_key = rsa_keypair["public_pem"].decode()
+    verifier.public_key = rsa_keypair["public_pem"].decode()
+    verifier.algorithm = "RS256"
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    id_token_claims = {
+        "iss": FAKE_ISSUER,
+        "sub": "user",
+        "aud": COGNITO_ENV["COGNITO_CLIENT_ID"],
+        "token_use": "id",
+        "email": "alice@example.com",
+        "exp": now + datetime.timedelta(minutes=5),
+        "iat": now,
+    }
+    token = _sign_jwt(id_token_claims, rsa_keypair["private_pem"])
+
+    with caplog.at_level("WARNING"):
+        result = await verifier.verify_token(token)
+
+    assert result is None, "ID token should be rejected when require_access is on"
+    assert any(
+        "token_use" in r.message and "id" in r.message.lower()
+        for r in caplog.records
+    ), "expected a WARNING mentioning token_use=id"
+
+
+@pytest.mark.asyncio
+async def test_access_token_accepted_when_require_access_on(rsa_keypair):
+    """Regression: access tokens still pass with require_access=true."""
+    with patch.dict("os.environ", {**COGNITO_ENV, "YB_MCP_REQUIRE_ACCESS_TOKEN": "true"}), \
+         patch("httpx.get", side_effect=_mock_httpx_get):
+        provider = _create_cognito()
+
+    verifier = provider.verifiers[0]
+    verifier._public_key = rsa_keypair["public_pem"].decode()
+    verifier.public_key = rsa_keypair["public_pem"].decode()
+    verifier.algorithm = "RS256"
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    access_token_claims = {
+        "iss": FAKE_ISSUER,
+        "sub": "user",
+        "aud": COGNITO_ENV["COGNITO_CLIENT_ID"],
+        "token_use": "access",
+        "cognito:groups": ["writer", "reader"],
+        "exp": now + datetime.timedelta(minutes=5),
+        "iat": now,
+    }
+    token = _sign_jwt(access_token_claims, rsa_keypair["private_pem"])
+
+    result = await verifier.verify_token(token)
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_rejected_when_require_access_on(rsa_keypair):
+    """token_use=refresh presented as a bearer is also rejected."""
+    with patch.dict("os.environ", {**COGNITO_ENV, "YB_MCP_REQUIRE_ACCESS_TOKEN": "true"}), \
+         patch("httpx.get", side_effect=_mock_httpx_get):
+        provider = _create_cognito()
+
+    verifier = provider.verifiers[0]
+    verifier._public_key = rsa_keypair["public_pem"].decode()
+    verifier.public_key = rsa_keypair["public_pem"].decode()
+    verifier.algorithm = "RS256"
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    refresh_claims = {
+        "iss": FAKE_ISSUER,
+        "sub": "user",
+        "aud": COGNITO_ENV["COGNITO_CLIENT_ID"],
+        "token_use": "refresh",
+        "exp": now + datetime.timedelta(minutes=5),
+        "iat": now,
+    }
+    token = _sign_jwt(refresh_claims, rsa_keypair["private_pem"])
+    result = await verifier.verify_token(token)
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# DB-22136: OIDC path forwards OIDC_AUDIENCE to the verifier
+# ---------------------------------------------------------------------------
+
+def test_oidc_provider_wires_audience_env_to_verifier():
+    """_create_oidc must pass OIDC_AUDIENCE (already read for OIDCProxy)
+    to JWTVerifier as well, so signature+issuer isn't the only check."""
+    from yugabytedb_mcp_server.auth import _create_oidc
+
+    oidc_env = {
+        "OIDC_CONFIG_URL": f"{FAKE_ISSUER}/.well-known/openid-configuration",
+        "OIDC_CLIENT_ID": "oidc-client",
+        "OIDC_CLIENT_SECRET": "oidc-secret",
+        "OIDC_AUDIENCE": "expected-oidc-audience",
+        "MCP_BASE_URL": "http://localhost:8000",
+    }
+    with patch.dict("os.environ", oidc_env, clear=False), \
+         patch("httpx.get", side_effect=_mock_httpx_get):
+        provider = _create_oidc()
+
+    verifier = provider.verifiers[0]
+    assert getattr(verifier, "audience", None) == "expected-oidc-audience"
+
+
+def test_oidc_provider_warns_when_audience_missing(caplog):
+    """No OIDC_AUDIENCE → a startup WARNING logs that only signature +
+    issuer are checked; provider still constructs (backward compat)."""
+    from yugabytedb_mcp_server.auth import _create_oidc
+
+    oidc_env = {
+        "OIDC_CONFIG_URL": f"{FAKE_ISSUER}/.well-known/openid-configuration",
+        "OIDC_CLIENT_ID": "oidc-client",
+        "OIDC_CLIENT_SECRET": "oidc-secret",
+        # OIDC_AUDIENCE deliberately absent
+        "MCP_BASE_URL": "http://localhost:8000",
+    }
+    with patch.dict("os.environ", oidc_env, clear=True), \
+         patch("httpx.get", side_effect=_mock_httpx_get), \
+         caplog.at_level("WARNING"):
+        provider = _create_oidc()
+
+    verifier = provider.verifiers[0]
+    assert getattr(verifier, "audience", None) is None
+    assert any(
+        "OIDC_AUDIENCE" in r.message for r in caplog.records
+    ), "expected a WARNING mentioning OIDC_AUDIENCE"
