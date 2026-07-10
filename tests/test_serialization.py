@@ -203,3 +203,53 @@ class TestEdgeCases:
             {"a": {"b": [{"c": [float("nan")]}]}}
         )
         assert result == {"a": {"b": [{"c": [None]}]}}
+
+
+# ---------------------------------------------------------------------------
+# DB-22203: run_read_only_query response shape must not use dict(zip(cols, row))
+# ---------------------------------------------------------------------------
+
+class TestReadResultShape:
+    """DB-22203: previously `run_read_only_query` returned
+    `[dict(zip(cols, row)) for row in rows]`, which silently dropped
+    duplicate column names (e.g. `SELECT * FROM a, b` where both tables
+    have `id`, or `SELECT 1 AS id, 2 AS id`). The new shape is
+    `{"columns": [...], "rows": [[...], ...]}` — parallel arrays that
+    cannot collide.
+
+    These unit tests build the shape directly (no DB required) and verify:
+    - it round-trips through the sanitizer + json.dumps pipeline,
+    - duplicate column names survive,
+    - non-JSON-safe values in rows still get sanitized (NaN → None,
+      bytes → $hex).
+    """
+
+    def test_duplicate_column_names_preserved(self):
+        result = {"columns": ["id", "id", "other"], "rows": [[1, 2, 3]]}
+        sanitized = _sanitize_for_json(result)
+        assert sanitized == {"columns": ["id", "id", "other"], "rows": [[1, 2, 3]]}
+        # And valid JSON — three distinct positions, no dict-key collapse.
+        rendered = json.dumps(sanitized, allow_nan=False)
+        parsed = json.loads(rendered)
+        assert len(parsed["columns"]) == 3
+        assert len(parsed["rows"][0]) == 3
+
+    def test_empty_result_set(self):
+        result = {"columns": ["a", "b"], "rows": []}
+        assert _sanitize_for_json(result) == {"columns": ["a", "b"], "rows": []}
+
+    def test_rows_sanitized_recursively(self):
+        # NaN in one column, bytea in another — both must be normalized
+        # inside the row arrays.
+        result = {
+            "columns": ["score", "blob"],
+            "rows": [[float("nan"), b"\xde\xad"]],
+        }
+        sanitized = _sanitize_for_json(result)
+        assert sanitized == {
+            "columns": ["score", "blob"],
+            "rows": [[None, {"$hex": "dead"}]],
+        }
+        # Strict JSON survives.
+        rendered = json.dumps(sanitized, allow_nan=False)
+        assert json.loads(rendered) == sanitized

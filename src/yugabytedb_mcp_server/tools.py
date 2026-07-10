@@ -219,8 +219,14 @@ def summarize_database(ctx: Context, schema: str = "public") -> List[Dict[str, A
 
 def run_read_only_query(ctx: Context, query: str) -> str:
     """
-    Run a read-only SQL query under BEGIN READ ONLY and return the rows as
-    JSON.
+    Run a read-only SQL query under BEGIN READ ONLY and return the result
+    as JSON: `{"columns": [<name>, ...], "rows": [[<val>, ...], ...]}`.
+
+    Columns and rows are returned as parallel arrays rather than a
+    list-of-dicts so duplicate output-column names (e.g. `SELECT 1 AS id,
+    2 AS id` or `SELECT *` over a join) are preserved losslessly. In the
+    previous list-of-dicts shape, dict-key collision silently dropped all
+    but the last duplicate.
 
     The query is validated against the same dangerous-function blocklist
     used by run_write_query before it reaches the database: side-effecting
@@ -257,7 +263,10 @@ def run_read_only_query(ctx: Context, query: str) -> str:
                 _execute(cur, query)
                 rows = cur.fetchall()
                 column_names = [desc[0] for desc in cur.description]
-                result = [dict(zip(column_names, row)) for row in rows]
+                result = {
+                    "columns": column_names,
+                    "rows": [list(row) for row in rows],
+                }
                 logger.info(
                     "run_read_only_query returned %d rows × %d columns",
                     len(rows), len(column_names),

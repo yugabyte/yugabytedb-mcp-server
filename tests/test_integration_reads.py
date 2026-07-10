@@ -16,8 +16,38 @@ pytestmark = [requires_yugabytedb, pytest.mark.asyncio]
 
 async def test_run_read_only_query_simple(mcp_session):
     result = await mcp_session.call_tool("run_read_only_query", {"query": "SELECT 1 AS x"})
-    rows = parse_json_list(result)
-    assert rows == [{"x": 1}]
+    parsed = parse_json_list(result)
+    assert parsed == {"columns": ["x"], "rows": [[1]]}
+
+
+async def test_run_read_only_query_duplicate_column_names(mcp_session):
+    """DB-22203: duplicate output column names must not collapse. Previously
+    `dict(zip(cols, row))` silently dropped the first `id`. Now columns and
+    rows are parallel arrays so all values survive."""
+    result = await mcp_session.call_tool(
+        "run_read_only_query",
+        {"query": "SELECT 1 AS id, 2 AS id, 3 AS other"},
+    )
+    parsed = parse_json_list(result)
+    assert parsed == {"columns": ["id", "id", "other"], "rows": [[1, 2, 3]]}
+
+
+async def test_run_read_only_query_join_star_no_column_loss(mcp_session, test_schema, db_conn):
+    """DB-22203 real-world repro: SELECT * over a join where both tables have
+    an `id` column. Both `id` values must be present, not collapsed."""
+    with db_conn.cursor() as cur:
+        cur.execute(f'CREATE TABLE "{test_schema}".a (id INT, tag TEXT)')
+        cur.execute(f'CREATE TABLE "{test_schema}".b (id INT, note TEXT)')
+        cur.execute(f'INSERT INTO "{test_schema}".a VALUES (1, \'left\')')
+        cur.execute(f'INSERT INTO "{test_schema}".b VALUES (2, \'right\')')
+
+    result = await mcp_session.call_tool(
+        "run_read_only_query",
+        {"query": f'SELECT * FROM "{test_schema}".a, "{test_schema}".b'},
+    )
+    parsed = parse_json_list(result)
+    assert parsed["columns"] == ["id", "tag", "id", "note"]
+    assert parsed["rows"] == [[1, "left", 2, "right"]]
 
 
 async def test_run_read_only_query_error_path(mcp_session):
