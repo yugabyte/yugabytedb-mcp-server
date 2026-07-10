@@ -202,9 +202,13 @@ async def test_summarize_multiple_errors_one_good(mcp_session, test_schema, db_c
             f'CREATE VIEW "{test_schema}".a_first_bad AS '
             f'SELECT 1 AS x WHERE (1/0) = 1'
         )
+        # Postgres's COUNT(*) skips the projection, so `SELECT (5/0)::int AS y`
+        # never actually evaluates the division and COUNT succeeds with 1.
+        # Put the failure in WHERE, same shape as a_first_bad, so the DB has
+        # to evaluate the expression to know which rows count.
         cur.execute(
             f'CREATE VIEW "{test_schema}".b_second_bad AS '
-            f'SELECT (5 / 0)::int AS y'
+            f'SELECT 1 AS y WHERE (5 / 0) = 0'
         )
         cur.execute(f'CREATE TABLE "{test_schema}".c_good (id INT)')
         cur.execute(f'INSERT INTO "{test_schema}".c_good VALUES (1)')
