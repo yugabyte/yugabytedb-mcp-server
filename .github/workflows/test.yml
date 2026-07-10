@@ -29,7 +29,13 @@ jobs:
         run: uv sync
 
       - name: Run unit tests
-        run: uv run pytest tests/test_guardrails.py tests/test_auth.py -v
+        # Every test file except the DB-backed integration ones. Uses a
+        # glob-based exclude so newly-added unit test files are picked
+        # up automatically.
+        run: >
+          uv run pytest tests/
+          --ignore-glob='tests/test_integration_*.py'
+          -v
 
   integration:
     name: integration (py${{ matrix.python }})
@@ -70,8 +76,8 @@ jobs:
       - name: Run integration tests against Postgres
         env:
           YUGABYTEDB_URL: "host=localhost port=5432 dbname=test user=test password=test"
-        run: |
-          uv run pytest tests/test_integration_reads.py \
-                        tests/test_integration_writes.py \
-                        tests/test_integration_guardrails.py \
-                        -v
+        # Glob picks up every tests/test_integration_*.py file so a new
+        # integration file (e.g. test_integration_pool_reset.py) doesn't
+        # silently sit outside CI.
+        run: >
+          uv run pytest tests/test_integration_*.py -v

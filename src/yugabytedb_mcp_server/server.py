@@ -28,6 +28,35 @@ from .tools import (
 logger = logging.getLogger("yugabytedb-mcp.server")
 
 
+def _pool_reset(conn) -> None:
+    """Reset a connection's session state before it returns to the pool.
+
+    `DISCARD ALL` is Postgres's canonical "scrub session" statement. It
+    clears:
+      - the current role (superset of RESET ROLE — closes DB-22133)
+      - advisory locks (closes the cross-user DoS in DB-22202)
+      - prepared statements + cached plans (closes the pool-slot
+        poisoning in DB-22202)
+      - session GUCs, temp tables, sequences
+
+    Runs on every `with pool.connection() as conn:` exit, so any state
+    the tool body accidentally leaves behind is scrubbed before the next
+    checkout. Failures are logged but not raised — a failing reset is
+    caught by ConnectionPool's health check (`check_connection`) on the
+    next checkout, so the connection either passes DISCARD next time or
+    gets replaced.
+    """
+    try:
+        conn.execute("DISCARD ALL")
+    except Exception as e:
+        logger.warning(
+            "Pool reset (DISCARD ALL) failed on connection return: %s. "
+            "The health check on next checkout will replace the connection "
+            "if it's still broken.",
+            e,
+        )
+
+
 def _positive_int(s: str) -> int:
     """argparse `type=` helper: parse `s` as int; raise ArgumentTypeError
     on non-int or `< 1`. Used for the DB-22159 resource-limit env vars so
@@ -142,7 +171,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
     # Connection string can contain a password — log only structural info.
     logger.debug(
         "Opening psycopg ConnectionPool (min_size=%d, max_size=%d, "
-        "check=ConnectionPool.check_connection)",
+        "check=ConnectionPool.check_connection, reset=DISCARD ALL)",
         CONFIG.pool_min_size, CONFIG.pool_max_size,
     )
     pool = ConnectionPool(
@@ -151,6 +180,15 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
         max_size=CONFIG.pool_max_size,
         open=True,
         check=ConnectionPool.check_connection,
+        # DB-22133 / DB-22202: reset connections on return to the pool so
+        # session-level state from one user's tool call doesn't bleed to
+        # the next. DISCARD ALL is a superset of RESET ROLE — it also
+        # clears advisory locks (advisory-lock cross-user DoS in DB-22202),
+        # prepared-statement plans (pool-slot poisoning in DB-22202),
+        # session GUCs, temp tables, and cached plans. Runs after every
+        # `with pool.connection() as conn:` block, so any state the tool
+        # accidentally leaves behind is scrubbed before the next checkout.
+        reset=_pool_reset,
     )
     logger.debug("ConnectionPool opened successfully")
 
