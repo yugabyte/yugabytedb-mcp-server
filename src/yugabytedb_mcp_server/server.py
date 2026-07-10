@@ -39,15 +39,24 @@ def _pool_reset(conn) -> None:
         poisoning in DB-22202)
       - session GUCs, temp tables, sequences
 
-    Runs on every `with pool.connection() as conn:` exit, so any state
-    the tool body accidentally leaves behind is scrubbed before the next
-    checkout. Failures are logged but not raised — a failing reset is
-    caught by ConnectionPool's health check (`check_connection`) on the
-    next checkout, so the connection either passes DISCARD next time or
-    gets replaced.
+    DISCARD ALL cannot run inside a transaction block. psycopg's default
+    is `autocommit=False`, so a bare `conn.execute("DISCARD ALL")` would
+    open an implicit transaction and immediately fail. Flip the
+    connection to autocommit for the DISCARD, then restore. Safe here
+    because psycopg-pool already rolls back any pending transaction
+    before calling the reset callback.
+
+    Failures are logged but not raised — a failing reset is caught by
+    ConnectionPool's health check (`check_connection`) on the next
+    checkout, so the connection either passes DISCARD next time or gets
+    replaced.
     """
     try:
-        conn.execute("DISCARD ALL")
+        conn.set_autocommit(True)
+        try:
+            conn.execute("DISCARD ALL")
+        finally:
+            conn.set_autocommit(False)
     except Exception as e:
         logger.warning(
             "Pool reset (DISCARD ALL) failed on connection return: %s. "

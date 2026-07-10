@@ -24,6 +24,41 @@ class TestPoolReset:
         _pool_reset(conn)
         conn.execute.assert_called_once_with("DISCARD ALL")
 
+    def test_flips_autocommit_around_discard(self):
+        """DISCARD ALL cannot run inside a transaction block. The
+        callback must set autocommit True before the DISCARD and restore
+        False after, so subsequent pool checkouts still open implicit
+        transactions the way psycopg's default expects."""
+        conn = MagicMock()
+        _pool_reset(conn)
+
+        # The order of method calls on the connection must be:
+        # set_autocommit(True), execute("DISCARD ALL"), set_autocommit(False).
+        # Any other order would either fail (DISCARD inside a txn) or
+        # leave the connection in autocommit mode.
+        calls = [(c[0], c[1]) for c in conn.method_calls]
+        assert calls == [
+            ("set_autocommit", (True,)),
+            ("execute", ("DISCARD ALL",)),
+            ("set_autocommit", (False,)),
+        ], f"unexpected call order: {calls!r}"
+
+    def test_restores_autocommit_even_when_discard_fails(self):
+        """If DISCARD raises, the callback must still put the connection
+        back into autocommit=False before returning. Otherwise the
+        connection sits in autocommit mode until the next checkout,
+        breaking psycopg's implicit-transaction contract."""
+        conn = MagicMock()
+        conn.execute.side_effect = RuntimeError("simulated DISCARD failure")
+
+        _pool_reset(conn)  # must not raise
+
+        calls = [(c[0], c[1]) for c in conn.method_calls]
+        # set_autocommit(False) must still fire even after the execute raised.
+        assert ("set_autocommit", (False,)) in calls, (
+            f"autocommit not restored after DISCARD failure; calls={calls!r}"
+        )
+
     def test_swallows_execute_failure(self, caplog):
         """If the connection is bad, DISCARD ALL may raise. The callback
         must log-and-continue so the pool's health check on the next
@@ -40,15 +75,15 @@ class TestPoolReset:
         assert "DISCARD ALL" in combined
         assert "connection closed" in combined
 
-    def test_no_side_effects_beyond_execute(self):
-        """Sanity: only DISCARD ALL is issued — no cursor management,
-        no commit, no rollback. Psycopg's autocommit semantics for the
-        pool's post-return path handle transaction state."""
+    def test_swallows_set_autocommit_failure(self, caplog):
+        """If `set_autocommit(True)` raises (e.g. connection already
+        dropped), the callback must still log-and-continue rather than
+        letting the exception leak into psycopg-pool."""
         conn = MagicMock()
-        _pool_reset(conn)
-        # Only one method call on the conn — .execute("DISCARD ALL").
-        # Verifies we're not accidentally doing extra work that could
-        # itself fail or leak state.
-        assert len(conn.method_calls) == 1
-        method_name = conn.method_calls[0][0]
-        assert method_name == "execute"
+        conn.set_autocommit.side_effect = RuntimeError("cannot flip autocommit")
+
+        with caplog.at_level("WARNING"):
+            _pool_reset(conn)  # must not raise
+
+        # WARNING logged, describes the failure.
+        assert any("cannot flip autocommit" in r.message for r in caplog.records)

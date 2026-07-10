@@ -61,8 +61,13 @@ def test_discard_all_clears_set_role():
             baseline = conn.execute("SELECT current_role").fetchone()[0]
 
         # Create a temp role, use it, return the conn.
+        # Postgres CREATE ROLE has no IF NOT EXISTS syntax — swallow the
+        # duplicate-object error if a prior run left the role behind.
         with pool.connection() as conn:
-            conn.execute("CREATE ROLE IF NOT EXISTS mcp_test_reset")
+            try:
+                conn.execute("CREATE ROLE mcp_test_reset")
+            except psycopg.errors.DuplicateObject:
+                pass
             conn.execute("GRANT mcp_test_reset TO CURRENT_USER")
             conn.execute("SET ROLE mcp_test_reset")
             role_inside = conn.execute("SELECT current_role").fetchone()[0]
