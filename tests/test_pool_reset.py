@@ -1,13 +1,19 @@
 """Unit tests for `_pool_reset` (DB-22133 + DB-22202).
 
 `_pool_reset` is the `reset=` callback wired into the psycopg
-ConnectionPool. It runs `DISCARD ALL` on every connection return so
+ConnectionPool. It runs two statements on every connection return so
 session state (role, advisory locks, prepared statements, GUCs, temp
-tables) doesn't bleed across pool checkouts.
+tables) doesn't bleed across pool checkouts:
 
-Unit tests here mock the connection to verify the callback issues
-`DISCARD ALL` and handles failures gracefully. End-to-end integration
-tests against a real Postgres live in `test_integration_pool_reset.py`.
+1. ``DISCARD ALL``
+2. ``SELECT pg_advisory_unlock_all()`` — YugabyteDB's DISCARD ALL does
+   not release advisory locks (deviation from Postgres 15), so we
+   explicitly release them.
+
+Unit tests here mock the connection to verify the callback issues both
+statements in the right order and handles failures gracefully.
+End-to-end integration tests against a real database live in
+`test_integration_pool_reset.py`.
 """
 from unittest.mock import MagicMock
 
@@ -18,28 +24,33 @@ from yugabytedb_mcp_server.server import _pool_reset
 
 class TestPoolReset:
 
-    def test_issues_discard_all(self):
-        """Callback runs `DISCARD ALL` on the connection."""
+    def test_issues_discard_and_advisory_unlock(self):
+        """Callback runs `DISCARD ALL` then `SELECT pg_advisory_unlock_all()`
+        on the connection. The unlock is required because YugabyteDB's
+        DISCARD ALL does not release advisory locks (deviation from PG 15)."""
         conn = MagicMock()
         _pool_reset(conn)
-        conn.execute.assert_called_once_with("DISCARD ALL")
+        assert conn.execute.call_count == 2
+        assert conn.execute.call_args_list[0].args == ("DISCARD ALL",)
+        assert conn.execute.call_args_list[1].args == ("SELECT pg_advisory_unlock_all()",)
 
-    def test_flips_autocommit_around_discard(self):
-        """DISCARD ALL cannot run inside a transaction block. The
-        callback must set autocommit True before the DISCARD and restore
-        False after, so subsequent pool checkouts still open implicit
-        transactions the way psycopg's default expects."""
+    def test_flips_autocommit_around_reset(self):
+        """DISCARD ALL and pg_advisory_unlock_all() cannot run inside a
+        transaction block. The callback must set autocommit True before the
+        reset statements and restore False after, so subsequent pool
+        checkouts still open implicit transactions the way psycopg's default
+        expects."""
         conn = MagicMock()
         _pool_reset(conn)
 
         # The order of method calls on the connection must be:
-        # set_autocommit(True), execute("DISCARD ALL"), set_autocommit(False).
-        # Any other order would either fail (DISCARD inside a txn) or
-        # leave the connection in autocommit mode.
+        # set_autocommit(True), execute("DISCARD ALL"),
+        # execute("SELECT pg_advisory_unlock_all()"), set_autocommit(False).
         calls = [(c[0], c[1]) for c in conn.method_calls]
         assert calls == [
             ("set_autocommit", (True,)),
             ("execute", ("DISCARD ALL",)),
+            ("execute", ("SELECT pg_advisory_unlock_all()",)),
             ("set_autocommit", (False,)),
         ], f"unexpected call order: {calls!r}"
 

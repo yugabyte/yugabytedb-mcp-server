@@ -31,30 +31,38 @@ logger = logging.getLogger("yugabytedb-mcp.server")
 def _pool_reset(conn) -> None:
     """Reset a connection's session state before it returns to the pool.
 
-    `DISCARD ALL` is Postgres's canonical "scrub session" statement. It
-    clears:
-      - the current role (superset of RESET ROLE — closes DB-22133)
-      - advisory locks (closes the cross-user DoS in DB-22202)
-      - prepared statements + cached plans (closes the pool-slot
-        poisoning in DB-22202)
-      - session GUCs, temp tables, sequences
+    Two statements run in sequence:
 
-    DISCARD ALL cannot run inside a transaction block. psycopg's default
-    is `autocommit=False`, so a bare `conn.execute("DISCARD ALL")` would
-    open an implicit transaction and immediately fail. Flip the
-    connection to autocommit for the DISCARD, then restore. Safe here
+    1. ``DISCARD ALL`` — Postgres's canonical "scrub session" statement.
+       Clears the current role (superset of RESET ROLE — closes DB-22133),
+       prepared statements + cached plans (closes the pool-slot poisoning
+       half of DB-22202), session GUCs, temp tables, and sequences.
+
+    2. ``SELECT pg_advisory_unlock_all()`` — YugabyteDB's ``DISCARD ALL``
+       does NOT release advisory locks, which is a deviation from vanilla
+       Postgres 15 semantics. Empirically verified against local YB
+       (2025.2.0): a lock taken on one checkout survives ``DISCARD ALL``
+       and is visible to other sessions via ``pg_locks``. Explicitly
+       releasing here closes the advisory-lock half of DB-22202 (the
+       cross-user DoS repro Vishal filed).
+
+    Neither statement can run inside a transaction block. psycopg's
+    default is ``autocommit=False``, so a bare ``conn.execute(...)``
+    would open an implicit transaction and immediately fail. Flip the
+    connection to autocommit for the reset, then restore. Safe here
     because psycopg-pool already rolls back any pending transaction
     before calling the reset callback.
 
     Failures are logged but not raised — a failing reset is caught by
-    ConnectionPool's health check (`check_connection`) on the next
-    checkout, so the connection either passes DISCARD next time or gets
-    replaced.
+    ConnectionPool's health check (``check_connection``) on the next
+    checkout, so the connection either passes the reset next time or
+    gets replaced.
     """
     try:
         conn.set_autocommit(True)
         try:
             conn.execute("DISCARD ALL")
+            conn.execute("SELECT pg_advisory_unlock_all()")
         finally:
             conn.set_autocommit(False)
     except Exception as e:
