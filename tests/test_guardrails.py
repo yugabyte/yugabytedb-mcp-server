@@ -521,3 +521,66 @@ def test_bare_commit_alone_not_multi_statement(cfg):
     validate_query("COMMIT", cfg, read_only=True)
     validate_query("END", cfg, read_only=True)
     validate_query("ROLLBACK", cfg, read_only=True)
+
+
+# ---------------------------------------------------------------------------
+# DB-22129: privileged catalog tables (credential / statistics disclosure)
+# ---------------------------------------------------------------------------
+# `SELECT rolname, rolpassword FROM pg_authid` was called out in the DB-22129
+# repro list. The function blocklist doesn't catch it (pg_authid is a table,
+# not a function), so we cover it via a table-name blocklist walked in the
+# same AST pass. Applies to both read and write paths.
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT rolname, rolpassword FROM pg_authid",
+    "SELECT * FROM pg_authid",
+    "SELECT rolname FROM pg_catalog.pg_authid",
+    "SELECT * FROM pg_shadow",
+    "SELECT * FROM pg_catalog.pg_shadow",
+    "SELECT * FROM pg_user_mappings",
+    "SELECT * FROM pg_statistic",
+    "SELECT * FROM pg_catalog.pg_statistic",
+    # JOIN target
+    "SELECT a.oid FROM pg_class a JOIN pg_authid b ON a.relowner = b.oid",
+    # Subquery reference
+    "SELECT (SELECT rolpassword FROM pg_authid LIMIT 1) AS x",
+    # CTE reference
+    "WITH c AS (SELECT * FROM pg_authid) SELECT * FROM c",
+])
+def test_blocks_privileged_catalog_reads_read_path(sql, cfg):
+    """DB-22129: reads of credential/statistics catalogs are guardrail-blocked
+    on the read path regardless of whether Postgres RBAC would also reject."""
+    with pytest.raises(QueryBlockedError, match="not allowed"):
+        validate_query(sql, cfg, read_only=True)
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE pg_authid SET rolpassword = 'x'",
+    "DELETE FROM pg_shadow",
+    "INSERT INTO pg_user_mappings VALUES (1, 2, ARRAY['x'])",
+])
+def test_blocks_privileged_catalog_writes(sql, cfg):
+    """DB-22129: same tables are also blocked on the write path — an operator
+    running the server as a role with catalog-modification privileges must not
+    be able to mutate them via run_write_query."""
+    with pytest.raises(QueryBlockedError, match="not allowed"):
+        validate_query(sql, cfg, read_only=False)
+
+
+@pytest.mark.parametrize("sql", [
+    # String literal — sqlparse tokenizes as String.Single, not Name.
+    "SELECT 'pg_authid' AS x",
+    # Double-quoted identifier — tokenized as Symbol, not Name.
+    'SELECT 1 AS "pg_authid"',
+    # Different, unprivileged tables must not be flagged.
+    "SELECT * FROM pg_roles",
+    "SELECT * FROM pg_stat_activity",
+    "SELECT * FROM pg_catalog.pg_class",
+    "SELECT * FROM information_schema.tables",
+])
+def test_privileged_catalog_blocklist_no_false_positives(sql, cfg):
+    """String literals, double-quoted identifiers, and unprivileged catalogs
+    that only share a prefix with blocked names must pass through."""
+    # No raise expected.
+    validate_query(sql, cfg, read_only=True)

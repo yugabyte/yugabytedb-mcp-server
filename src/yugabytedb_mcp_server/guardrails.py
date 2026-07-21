@@ -129,6 +129,22 @@ _BLOCKED_FUNCTIONS: frozenset[str] = frozenset({
 })
 
 
+# Privileged catalog tables/views blocked in any context. Reading these
+# discloses credentials (pg_authid.rolpassword, pg_shadow.passwd,
+# pg_user_mappings.umoptions) or raw statistics that can leak data
+# distributions (pg_statistic). Matched against bare Name tokens; string
+# literals and double-quoted identifiers are not Name tokens, so
+# `SELECT 'pg_authid' AS x` and `SELECT "pg_authid" AS c` do NOT match.
+# Schema-qualified references (`pg_catalog.pg_authid`) match because sqlparse
+# emits `pg_authid` as its own Name token.
+_BLOCKED_TABLES: frozenset[str] = frozenset({
+    "pg_authid",
+    "pg_shadow",
+    "pg_user_mappings",
+    "pg_statistic",
+})
+
+
 def _is_keyword_token(tok) -> bool:
     """True if the token's ttype is Token.Keyword or any subtype
     (Keyword.DDL, Keyword.DML, Keyword.DCL, Keyword.CTE)."""
@@ -215,6 +231,13 @@ def _check_blocked_ast(stmt: Statement) -> None:
                     nxt = tokens[i + 1]
                     if _is_punctuation(nxt) and nxt.value == "(":
                         raise QueryBlockedError(f"{name} is not allowed")
+            # Privileged-catalog detection: bare Name match against
+            # _BLOCKED_TABLES. No `(` gate — the reference isn't a function
+            # call. False-positive risk (a user column named `pg_authid` etc.)
+            # is theoretical and acceptable for a security guard against
+            # credential/statistics disclosure.
+            elif name in _BLOCKED_TABLES:
+                raise QueryBlockedError(f"Access to {name} is not allowed")
 
 
 def _count_values_rows(sql: str) -> int | None:
