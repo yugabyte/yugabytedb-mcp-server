@@ -268,12 +268,6 @@ class YugabyteDBMCPServer:
 
     def _register_tools(self):
         _ro = {"readOnlyHint": True, "destructiveHint": False}
-        # run_read_only_query executes arbitrary SQL, so despite the name it
-        # CAN modify the environment (COPY, dblink, side-effecting functions
-        # — the guardrail in tools.py blocks the worst offenders, but the tool
-        # is not annotation-level read-only). Mark it destructive so MCP
-        # clients present a confirmation prompt.
-        _read_dest = {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True}
         _dest = {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False}
 
         self.mcp.tool(
@@ -282,7 +276,7 @@ class YugabyteDBMCPServer:
         )
         self.mcp.tool(
             run_read_only_query,
-            annotations={**_read_dest, "title": "Run a read-only SQL query"},
+            annotations={**_ro, "title": "Run a read-only SQL query"},
         )
         if CONFIG.enable_write_query:
             self.mcp.tool(

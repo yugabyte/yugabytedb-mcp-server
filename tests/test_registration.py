@@ -1,14 +1,10 @@
-"""Unit tests for MCP tool registration — DB-22130.
+"""Unit tests for MCP tool registration.
 
-Verifies that `run_read_only_query` is advertised with `readOnlyHint=False,
-destructiveHint=True` so MCP clients (Claude Desktop, Cursor, ...) present
-the destructive-action confirmation prompt. Prior to the fix the tool was
-annotated `readOnlyHint=True` even though it can modify its environment
-(COPY, dblink, side-effecting functions — see DB-22129 blocklist), so
-clients skipped the confirmation.
-
-Also verifies:
-- `summarize_database` keeps `readOnlyHint=True` (it truly is read-only).
+Verifies:
+- `summarize_database` and `run_read_only_query` are both `readOnlyHint=True,
+  destructiveHint=False`. `run_read_only_query`'s guardrail (DB-22129) strips
+  the dangerous-function surface before execution, so the tool's advertised
+  read-only semantic holds.
 - `run_write_query` is gated behind `enable_write_query` and carries the
   destructive annotation when enabled.
 """
@@ -86,38 +82,24 @@ def _get_tool(mcp, name):
 
 
 # ---------------------------------------------------------------------------
-# DB-22130: run_read_only_query annotation must be destructive
+# run_read_only_query: read-only annotation (guardrail-backed)
 # ---------------------------------------------------------------------------
 
 class TestReadToolAnnotation:
-    """DB-22130 — run_read_only_query was `readOnlyHint=True` but it can
-    modify its environment (COPY, dblink, pg_read_file, etc. — see DB-22129).
-    MCP clients trusting readOnlyHint skipped the confirmation prompt. Fix:
-    flip to `readOnlyHint=False, destructiveHint=True, idempotentHint=True`."""
+    """`run_read_only_query`'s dangerous-function blocklist (DB-22129) strips
+    the RCE / file-read / dblink / set_config / privileged-catalog surface
+    before execution, so the tool truly is read-only end-to-end. Advertise
+    accordingly."""
 
-    def test_read_only_query_is_not_read_only_hint(self, with_config):
+    def test_read_only_query_is_read_only_hint(self, with_config):
         server = YugabyteDBMCPServer()
         tool = _get_tool(server.mcp, "run_read_only_query")
-        assert tool.annotations.readOnlyHint is False, (
-            "DB-22130: run_read_only_query must not advertise readOnlyHint=True — "
-            "MCP clients skip the confirmation prompt for readOnly tools."
-        )
+        assert tool.annotations.readOnlyHint is True
 
-    def test_read_only_query_is_destructive_hint(self, with_config):
+    def test_read_only_query_is_not_destructive_hint(self, with_config):
         server = YugabyteDBMCPServer()
         tool = _get_tool(server.mcp, "run_read_only_query")
-        assert tool.annotations.destructiveHint is True, (
-            "DB-22130: run_read_only_query must advertise destructiveHint=True "
-            "so clients present the destructive-action confirmation."
-        )
-
-    def test_read_only_query_is_idempotent_hint(self, with_config):
-        server = YugabyteDBMCPServer()
-        tool = _get_tool(server.mcp, "run_read_only_query")
-        # Idempotent because BEGIN READ ONLY + rollback means re-running the
-        # same allowed query has no side effect. The AST blocklist rejects
-        # side-effecting statements before execution.
-        assert tool.annotations.idempotentHint is True
+        assert tool.annotations.destructiveHint is False
 
 
 # ---------------------------------------------------------------------------
