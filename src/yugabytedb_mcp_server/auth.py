@@ -96,19 +96,74 @@ def _create_cognito():
             return []
 
     class _CognitoJWTVerifier(JWTVerifier):
-        """JWTVerifier that additionally enforces ``token_use=access`` on
-        Cognito claims when configured. Off by default (backward compat);
-        opt-in via ``YB_MCP_REQUIRE_ACCESS_TOKEN=true``. See DB-22136."""
+        """JWTVerifier with two Cognito-specific overrides:
 
-        def __init__(self, *, require_access_token: bool, **kwargs):
-            super().__init__(**kwargs)
+        1. **Audience matches ``aud`` OR ``client_id``.** Cognito ID tokens
+           carry the app client identifier in the standard ``aud`` claim,
+           but **access tokens omit ``aud`` entirely** and put the identifier
+           in ``client_id`` instead
+           (https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-using-tokens-with-identity-providers.html).
+           FastMCP's stock ``JWTVerifier`` only checks ``aud``, so a
+           straight ``audience=client_id`` argument rejects every Cognito
+           access token with "audience mismatch (got None, expected …)".
+           We disable the parent's audience check (pass ``audience=None``)
+           and run our own check here that accepts either claim.
+
+        2. **``token_use=access`` enforcement** (opt-in via
+           ``YB_MCP_REQUIRE_ACCESS_TOKEN=true``, off by default for
+           backward compat). See DB-22136.
+        """
+
+        def __init__(
+            self,
+            *,
+            require_access_token: bool,
+            expected_audience: str,
+            **kwargs,
+        ):
+            # Disable the parent's aud check — see class docstring for why.
+            super().__init__(audience=None, **kwargs)
             self._require_access_token = require_access_token
+            self._expected_audience = expected_audience
+
+        def _audience_matches(self, claims: dict) -> bool:
+            """Accept a token if either ``aud`` or ``client_id`` names our
+            expected audience. Handles ``aud`` being a list per RFC 7519."""
+            expected = self._expected_audience
+            aud = claims.get("aud")
+            if aud is not None:
+                if isinstance(aud, list):
+                    if expected in aud:
+                        return True
+                elif aud == expected:
+                    return True
+            # Cognito access-token fallback.
+            if claims.get("client_id") == expected:
+                return True
+            return False
 
         async def verify_token(self, token: str):
             result = await super().verify_token(token)
             if result is None:
                 return None
-            token_use = (result.claims or {}).get("token_use")
+            claims = result.claims or {}
+
+            # Audience check (aud OR client_id) — before token_use so a
+            # wrong-audience token is rejected even in the default (non-strict)
+            # mode.
+            if not self._audience_matches(claims):
+                logger.warning(
+                    "Rejected Cognito token: audience mismatch. "
+                    "expected=%r, aud=%r, client_id=%r. "
+                    "Token was minted for a different app client than the one "
+                    "this MCP server is configured to accept (COGNITO_CLIENT_ID).",
+                    self._expected_audience,
+                    claims.get("aud"),
+                    claims.get("client_id"),
+                )
+                return None
+
+            token_use = claims.get("token_use")
             if self._require_access_token and token_use != "access":
                 logger.warning(
                     "Rejected Cognito token with token_use=%r "
@@ -163,11 +218,13 @@ def _create_cognito():
     require_access_token = _env_bool("YB_MCP_REQUIRE_ACCESS_TOKEN", default=False)
     raw_jwt_verifier = _CognitoJWTVerifier(
         require_access_token=require_access_token,
+        # DB-22136: block tokens minted for other app clients in the same
+        # user pool. Cognito ID tokens set `aud=client_id`; Cognito access
+        # tokens set `client_id` and omit `aud`. `_CognitoJWTVerifier`
+        # accepts either — see class docstring.
+        expected_audience=client_id,
         jwks_uri=str(proxy.oidc_config.jwks_uri),
         issuer=str(proxy.oidc_config.issuer),
-        # DB-22136: audience-check blocks tokens minted for other app clients
-        # in the same user pool. Cognito uses the app client_id as `aud`.
-        audience=client_id,
     )
 
     logger.info(

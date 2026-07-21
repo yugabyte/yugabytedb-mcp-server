@@ -286,18 +286,20 @@ async def test_jwt_verifier_accepts_matching_audience(rsa_keypair):
     assert result is not None
 
 
-def test_cognito_provider_wires_client_id_as_audience():
+def test_cognito_provider_wires_client_id_as_expected_audience():
     """DB-22136: _create_cognito must pass COGNITO_CLIENT_ID as the
-    JWTVerifier's audience so tokens for other same-pool clients are
-    rejected. Reads the verifier's audience via the MultiAuth wiring."""
+    verifier's expected audience so tokens for other same-pool clients are
+    rejected. The custom `_CognitoJWTVerifier` stores this on
+    `_expected_audience` (the parent JWTVerifier's `audience` attribute is
+    intentionally None because Cognito access tokens omit the `aud` claim
+    and put the identifier in `client_id`; the subclass handles both)."""
     with patch.dict("os.environ", COGNITO_ENV, clear=False), \
          patch("httpx.get", side_effect=_mock_httpx_get):
         provider = _create_cognito()
-    # MultiAuth exposes verifiers as a list; our custom subclass sits there.
     verifier = provider.verifiers[0]
-    # JWTVerifier stores audience in a public attribute — mypy may need
-    # `# type: ignore` since it's not in the type stubs.
-    assert getattr(verifier, "audience", None) == COGNITO_ENV["COGNITO_CLIENT_ID"]
+    assert verifier._expected_audience == COGNITO_ENV["COGNITO_CLIENT_ID"]
+    # Parent's audience is disabled — our subclass handles it.
+    assert getattr(verifier, "audience", None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +383,10 @@ async def test_id_token_rejected_when_require_access_on(rsa_keypair, caplog):
 
 @pytest.mark.asyncio
 async def test_access_token_accepted_when_require_access_on(rsa_keypair):
-    """Regression: access tokens still pass with require_access=true."""
+    """Access tokens with the Cognito-native shape (no `aud`; identity in
+    `client_id`) must pass with require_access=true. This is the real
+    shape Cognito mints — see the module docstring on
+    _CognitoJWTVerifier for why."""
     with patch.dict("os.environ", {**COGNITO_ENV, "YB_MCP_REQUIRE_ACCESS_TOKEN": "true"}), \
          patch("httpx.get", side_effect=_mock_httpx_get):
         provider = _create_cognito()
@@ -392,10 +397,11 @@ async def test_access_token_accepted_when_require_access_on(rsa_keypair):
     verifier.algorithm = "RS256"
 
     now = datetime.datetime.now(datetime.timezone.utc)
+    # Real-Cognito access token: no `aud`, identity in `client_id`.
     access_token_claims = {
         "iss": FAKE_ISSUER,
         "sub": "user",
-        "aud": COGNITO_ENV["COGNITO_CLIENT_ID"],
+        "client_id": COGNITO_ENV["COGNITO_CLIENT_ID"],
         "token_use": "access",
         "cognito:groups": ["writer", "reader"],
         "exp": now + datetime.timedelta(minutes=5),
@@ -404,7 +410,40 @@ async def test_access_token_accepted_when_require_access_on(rsa_keypair):
     token = _sign_jwt(access_token_claims, rsa_keypair["private_pem"])
 
     result = await verifier.verify_token(token)
-    assert result is not None
+    assert result is not None, "Cognito-shape access token (no aud, has client_id) was rejected"
+
+
+@pytest.mark.asyncio
+async def test_access_token_wrong_client_id_rejected(rsa_keypair, caplog):
+    """DB-22136: an access token minted for a different app client in the
+    same pool must be rejected. Real Cognito tokens carry the identifier
+    in `client_id`, not `aud`, so the check must inspect both."""
+    with patch.dict("os.environ", COGNITO_ENV, clear=False), \
+         patch("httpx.get", side_effect=_mock_httpx_get):
+        provider = _create_cognito()
+    verifier = provider.verifiers[0]
+    verifier._public_key = rsa_keypair["public_pem"].decode()
+    verifier.public_key = rsa_keypair["public_pem"].decode()
+    verifier.algorithm = "RS256"
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    # Wrong client_id — pretends to be another app client in the pool.
+    access_token_claims = {
+        "iss": FAKE_ISSUER,
+        "sub": "user",
+        "client_id": "another-client-in-same-pool",
+        "token_use": "access",
+        "exp": now + datetime.timedelta(minutes=5),
+        "iat": now,
+    }
+    token = _sign_jwt(access_token_claims, rsa_keypair["private_pem"])
+
+    with caplog.at_level("WARNING"):
+        result = await verifier.verify_token(token)
+
+    assert result is None, "wrong-client_id access token should be rejected"
+    assert any("audience mismatch" in r.message for r in caplog.records), \
+        "expected an audience-mismatch WARNING"
 
 
 @pytest.mark.asyncio
