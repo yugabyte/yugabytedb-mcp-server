@@ -12,6 +12,7 @@ to the authenticated user's identity.
 
 import json
 import logging
+import math
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -21,9 +22,39 @@ from fastmcp import Context
 from fastmcp.server.dependencies import get_access_token
 from psycopg.sql import SQL, Identifier
 
-from .guardrails import GuardrailConfig, QueryBlockedError, validate_write_query
+from .guardrails import GuardrailConfig, QueryBlockedError, validate_query
 
 logger = logging.getLogger("yugabytedb-mcp.tools")
+
+
+def _sanitize_for_json(value: Any) -> Any:
+    """Convert values into JSON-safe forms before serialization.
+
+    Handles two classes of bugs in the previous `json.dumps(..., default=str)`
+    path:
+
+    - Float `NaN`, `Infinity`, `-Infinity` — Python's `json.dumps` emits them
+      as bare tokens, which are invalid JSON per RFC 8259 (JS `JSON.parse`
+      rejects them). Map non-finite floats to `None`.
+    - `bytes` / `memoryview` — the previous `default=str` produced the lossy
+      Python bytes-repr (`"b'\\xde\\xad\\xbe\\xef'"`). Encode as
+      `{"$hex": "deadbeef"}` for a lossless, well-defined round-trip.
+
+    Recursive so nested `list` / `dict` / array-column values are covered.
+    Any type not matched here falls through to `json.dumps`'s `default=str`
+    for datetime / Decimal / UUID / IPv4Address etc. (existing coverage).
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"$hex": bytes(value).hex()}
+    if isinstance(value, list):
+        return [_sanitize_for_json(v) for v in value]
+    if isinstance(value, tuple):
+        return [_sanitize_for_json(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _sanitize_for_json(v) for k, v in value.items()}
+    return value
 
 
 def _execute(cur, query, params: tuple | None = None) -> None:
@@ -441,11 +472,19 @@ def run_read_only_query(
     requested_role: Optional[str] = None,
 ) -> str:
     """
-    Run a read-only SQL query under BEGIN READ ONLY and return the rows as
-    JSON.
+    Run a read-only SQL query under BEGIN READ ONLY and return the result
+    as JSON: `{"columns": [<name>, ...], "rows": [[<val>, ...], ...]}`.
 
-    Any data-mutating statement is rejected by the database itself because
-    of the read-only transaction.
+    Columns and rows are returned as parallel arrays rather than a
+    list-of-dicts so duplicate output-column names (e.g. `SELECT 1 AS id,
+    2 AS id` or `SELECT *` over a join) are preserved losslessly. In the
+    previous list-of-dicts shape, dict-key collision silently dropped all
+    but the last duplicate.
+
+    The query is validated against the same dangerous-function blocklist
+    used by run_write_query before it reaches the database: side-effecting
+    built-ins (COPY … TO PROGRAM, pg_read_file, dblink, pg_sleep, …) are
+    rejected even though BEGIN READ ONLY would let some of them run.
 
     Args:
         ctx: MCP context (injected automatically).
@@ -457,7 +496,15 @@ def run_read_only_query(
     """
     logger.info("run_read_only_query called")
     logger.debug("Query: %s", query)
-    pool = ctx.request_context.lifespan_context["pool"]
+    lifespan = ctx.request_context.lifespan_context
+    pool = lifespan["pool"]
+    guardrail_config: GuardrailConfig = lifespan["guardrail_config"]
+
+    try:
+        validate_query(query, guardrail_config, read_only=True)
+    except QueryBlockedError as e:
+        logger.warning("Read query blocked by guardrail: %s", e)
+        return json.dumps({"error": str(e), "blocked_by_guardrail": True})
 
     try:
         role = _get_db_role(ctx, requested_role=requested_role)
@@ -473,12 +520,16 @@ def run_read_only_query(
                 _execute(cur, query)
                 rows = cur.fetchall()
                 column_names = [desc[0] for desc in cur.description]
-                result = [dict(zip(column_names, row)) for row in rows]
+                result = {
+                    "columns": column_names,
+                    "rows": [list(row) for row in rows],
+                }
                 logger.info(
                     "run_read_only_query returned %d rows × %d columns",
                     len(rows), len(column_names),
                 )
-                return json.dumps(result, indent=2, default=str)
+                sanitized = _sanitize_for_json(result)
+                return json.dumps(sanitized, indent=2, default=str, allow_nan=False)
             except Exception as e:
                 logger.error("Error executing read-only query: %s", e, exc_info=True)
                 return f"Error executing query: {e}"
@@ -521,7 +572,7 @@ def run_write_query(
     guardrail_config: GuardrailConfig = lifespan["guardrail_config"]
 
     try:
-        validate_write_query(query, guardrail_config)
+        validate_query(query, guardrail_config, read_only=False)
     except QueryBlockedError as e:
         logger.warning("Query blocked by guardrail: %s", e)
         return json.dumps({"error": str(e), "blocked_by_guardrail": True})
