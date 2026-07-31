@@ -92,7 +92,10 @@ map file, jump to the [Worked examples](#worked-examples).
 ## Provider setup
 
 Two providers are supported: `cognito` (tested end-to-end) and `oidc`
-(generic OIDC; wiring is in place, exercise at your own risk).
+(generic OIDC; exercised via Keycloak by the tutorials under
+[`examples/oidc-auth/`](examples/oidc-auth/) and
+[`examples/oidc-auth-mapping/`](examples/oidc-auth-mapping/)). Any RFC 6749 /
+OIDC 1.0 compliant provider should work — only the connection details change.
 
 ### AWS Cognito
 

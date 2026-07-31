@@ -153,11 +153,14 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
             CONFIG.identity_map_path, CONFIG.identity_map_name,
         )
         identity_map = _load_identity_map(CONFIG.identity_map_path)
+        # identity_map is now Dict[map_name, List[MapEntry]]; total = sum of
+        # the inner lists, and the count under the configured name is a
+        # cheap dict lookup.
+        _total = sum(len(v) for v in identity_map.values())
+        _under_name = len(identity_map.get(CONFIG.identity_map_name, []))
         logger.info(
             "Identity map loaded: %d entries (%d under map_name=%s)",
-            len(identity_map),
-            sum(1 for e in identity_map if e.name == CONFIG.identity_map_name),
-            CONFIG.identity_map_name,
+            _total, _under_name, CONFIG.identity_map_name,
         )
 
     if CONFIG.auth_provider:
@@ -170,6 +173,31 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
             CONFIG.identity_transform,
             CONFIG.identity_map_path or "<none>",
         )
+        # Fail-closed at startup for the "list-valued claim + no map" combo.
+        # A list claim (e.g. `cognito:groups`, `realm_access.roles`) yields
+        # raw role names from the IdP; without a map file to translate them
+        # into a controlled PG role set, every group name would be used
+        # verbatim as a SET ROLE target — no allowlist. The PR's own
+        # framing says "the map file IS the allowlist," so refuse to start
+        # in this configuration rather than silently granting whatever the
+        # IdP happens to emit.
+        _list_claim_paths = ("cognito:groups", "realm_access.roles", "groups")
+        looks_list_valued = (
+            CONFIG.identity_claim in _list_claim_paths
+            or "." in CONFIG.identity_claim   # dotted paths usually target lists
+        )
+        if identity_map is None and looks_list_valued:
+            raise RuntimeError(
+                f"YB_MCP_IDENTITY_CLAIM={CONFIG.identity_claim!r} typically "
+                f"resolves to a LIST of roles from the IdP, but "
+                f"YB_MCP_IDENTITY_MAP is unset. Without a map, every raw role "
+                f"name from the token would be a candidate SET ROLE target "
+                f"— that removes the allowlist boundary the map is designed "
+                f"to enforce. Configure YB_MCP_IDENTITY_MAP to translate the "
+                f"IdP's role names to a fixed PG role set, or switch "
+                f"YB_MCP_IDENTITY_CLAIM to a scalar claim like `email` or "
+                f"`sub`."
+            )
         if identity_map is None:
             logger.warning(
                 "OIDC identity mapping has no map file configured "

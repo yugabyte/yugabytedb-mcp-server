@@ -52,10 +52,27 @@ def create_auth_provider(name: str | None):
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    """Parse a boolean env var. Accepts case-insensitive `true` as True;
-    anything else (including unset) is False. Matches the existing
-    `.lower() == "true"` idiom used elsewhere in server.py."""
-    return os.environ.get(name, "").lower() == "true"
+    """Parse a boolean env var.
+
+    - Unset → ``default``.
+    - Case-insensitive ``true`` / ``1`` / ``yes`` / ``on`` → ``True``.
+    - Case-insensitive ``false`` / ``0`` / ``no`` / ``off`` / ``""`` → ``False``.
+    - Anything else → ``default`` (with a WARNING so an operator-visible
+      typo doesn't silently flip a security flag).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in ("true", "1", "yes", "on"):
+        return True
+    if v in ("false", "0", "no", "off", ""):
+        return False
+    logger.warning(
+        "%s=%r is not a recognized boolean; falling back to default=%s",
+        name, raw, default,
+    )
+    return default
 
 
 def _create_cognito():

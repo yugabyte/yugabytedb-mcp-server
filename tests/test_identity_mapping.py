@@ -206,7 +206,7 @@ def map_file_factory(tmp_path):
 class TestMapFileParser:
     def test_literal_entry(self, map_file_factory):
         path = map_file_factory("map1  user@yugabyte.com  user\n")
-        entries = _load_identity_map(path)
+        entries = _flatten(_load_identity_map(path))
         assert len(entries) == 1
         assert entries[0] == MapEntry(
             name="map1", pattern="user@yugabyte.com", role="user",
@@ -218,7 +218,7 @@ class TestMapFileParser:
         path = map_file_factory(
             "map2  /^(.*)@devadmincloudyugabyte\\.onmicrosoft\\.com$  \\1\n"
         )
-        entries = _load_identity_map(path)
+        entries = _flatten(_load_identity_map(path))
         assert entries[0].is_regex is True
         assert entries[0].compiled is not None
         assert entries[0].role == r"\1"
@@ -226,7 +226,7 @@ class TestMapFileParser:
     def test_role_to_role_entry(self, map_file_factory):
         """From the YSQL docs, verbatim: OIDC group name → PG role name."""
         path = map_file_factory("map1  OIDC.Test.Read  read_only_user\n")
-        entries = _load_identity_map(path)
+        entries = _flatten(_load_identity_map(path))
         assert entries[0].pattern == "OIDC.Test.Read"
         assert entries[0].role == "read_only_user"
         assert entries[0].is_regex is False
@@ -236,7 +236,7 @@ class TestMapFileParser:
         docs convention: leading `/` marks the pattern as regex; NO closing
         `/` (the rest of the field is the regex body verbatim)."""
         path = map_file_factory("azure  /^a12d04b1-.+  reader\n")
-        entries = _load_identity_map(path)
+        entries = _flatten(_load_identity_map(path))
         assert entries[0].compiled.fullmatch("a12d04b1-7463-8e23-94d2-8d71f17ab99b")
 
     def test_comments_and_blank_lines_ignored(self, map_file_factory):
@@ -248,19 +248,25 @@ class TestMapFileParser:
             "\n"
             "map1  bob    b_role  # trailing comment\n"
         )
-        entries = _load_identity_map(path)
+        entries = _flatten(_load_identity_map(path))
         assert len(entries) == 2
         assert entries[0].pattern == "alice"
         assert entries[1].pattern == "bob"
 
     def test_multiple_named_maps(self, map_file_factory):
+        """Entries are grouped by map_name at load time. Within a map, file
+        order is preserved (matters for match precedence in ``_apply_map``).
+        Across map names, order is not meaningful — a request only ever
+        consults one map at a time."""
         path = map_file_factory(
             "default  alice  a_role\n"
             "azure    bob    b_role\n"
             "default  carol  c_role\n"
         )
-        entries = _load_identity_map(path)
-        assert [e.name for e in entries] == ["default", "azure", "default"]
+        loaded = _load_identity_map(path)
+        assert set(loaded.keys()) == {"default", "azure"}
+        assert [e.pattern for e in loaded["default"]] == ["alice", "carol"]
+        assert [e.pattern for e in loaded["azure"]] == ["bob"]
 
     def test_malformed_regex_line_raises(self, map_file_factory):
         path = map_file_factory("map1  /[unterminated  reader\n")
@@ -278,12 +284,66 @@ class TestMapFileParser:
         embedded whitespace. Documents current behavior."""
         # split(None, 2) collapses trailing whitespace into field 3
         path = map_file_factory("map1 alice role_with_spaces\n")
-        entries = _load_identity_map(path)
+        entries = _flatten(_load_identity_map(path))
         assert entries[0].role == "role_with_spaces"
 
     def test_nonexistent_file_raises(self, tmp_path):
         with pytest.raises((FileNotFoundError, OSError)):
             _load_identity_map(str(tmp_path / "does-not-exist.conf"))
+
+    # ---- Negative-case fail-closed guarantees ----
+
+    def test_backreference_out_of_range_raises(self, map_file_factory):
+        """A ``\\N`` in db_role that references a capture group the pattern
+        doesn't have would raise ``re.error`` at request time under the old
+        code — bypassing the tool's ``except IdentityError`` and surfacing
+        as an unhandled 500. Validate the group count at LOAD time so the
+        server refuses to start."""
+        # Pattern has one group; role references \2.
+        path = map_file_factory(r"map1  /(.+)@corp\.com  \2" "\n")
+        with pytest.raises(ValueError, match=r"capture group \\2"):
+            _load_identity_map(path)
+
+    def test_hash_inside_pattern_is_not_a_comment(self, map_file_factory):
+        """A ``#`` mid-token (no preceding whitespace) is a literal ``#``,
+        not the start of a comment. Guards against silent truncation of a
+        pattern or role that legitimately contains ``#``."""
+        path = map_file_factory(r"map1  /user#\d+  reader" "\n")
+        entries = _flatten(_load_identity_map(path))
+        # Pattern preserved verbatim (leading `/` marks it as regex).
+        assert entries[0].pattern == r"/user#\d+"
+        # And it matches strings containing the literal `#`.
+        assert entries[0].compiled.fullmatch("user#42") is not None
+
+    def test_leading_hash_is_still_a_comment(self, map_file_factory):
+        """Sanity check: a line starting with ``#`` remains a comment."""
+        path = map_file_factory("# map1 alice role\nmap1 alice role\n")
+        entries = _flatten(_load_identity_map(path))
+        assert len(entries) == 1
+
+    def test_whitespace_preceded_hash_is_a_comment(self, map_file_factory):
+        """Sanity check: a ``#`` after whitespace still starts a comment
+        (matches pg_ident.conf convention)."""
+        path = map_file_factory("map1 alice role  # trailing comment\n")
+        entries = _flatten(_load_identity_map(path))
+        assert entries[0].role == "role"
+
+
+class TestApplyMapEmptyCapture:
+    """Empty-capture-group expansions must not surface as SET ROLE targets.
+    An empty role name would fail at the DB with a confusing error; treat
+    it as unmapped instead so the caller gets a clean IdentityError."""
+
+    def test_empty_capture_treated_as_unmapped(self):
+        # Pattern captures "" (the empty prefix before the fixed suffix).
+        entries = [_regex("default", r"(.*)@stub\.com", r"\1")]
+        # An input where the capture matches empty string:
+        assert _apply_map("@stub.com", _as_map(entries), "default") is None
+
+    def test_non_empty_capture_still_returns_role(self):
+        """Regression guard: non-empty captures still work."""
+        entries = [_regex("default", r"(.*)@stub\.com", r"\1")]
+        assert _apply_map("alice@stub.com", _as_map(entries), "default") == "alice"
 
 
 # ---------------------------------------------------------------------------
@@ -301,28 +361,47 @@ def _regex(name: str, pattern: str, role: str) -> MapEntry:
     )
 
 
+def _as_map(entries: list[MapEntry]) -> dict[str, list[MapEntry]]:
+    """Group a list of MapEntry into the Dict[map_name, entries] shape
+    _apply_map expects since the map is pre-indexed by name at load time."""
+    out: dict[str, list[MapEntry]] = {}
+    for e in entries:
+        out.setdefault(e.name, []).append(e)
+    return out
+
+
+def _flatten(loaded: dict[str, list[MapEntry]]) -> list[MapEntry]:
+    """Flatten the Dict[map_name, entries] shape returned by
+    _load_identity_map back into a list, preserving insertion order —
+    lets legacy loader tests keep asserting on a flat sequence."""
+    out: list[MapEntry] = []
+    for lst in loaded.values():
+        out.extend(lst)
+    return out
+
+
 class TestApplyMap:
     def test_literal_match(self):
         entries = [_literal("default", "bob@yugabyte.com", "writer")]
-        assert _apply_map("bob@yugabyte.com", entries, "default") == "writer"
+        assert _apply_map("bob@yugabyte.com", _as_map(entries), "default") == "writer"
 
     def test_regex_capture(self):
         entries = [_regex("default", r"^([a-z]+)@yugabyte\.com$", r"\1")]
-        assert _apply_map("carol@yugabyte.com", entries, "default") == "carol"
+        assert _apply_map("carol@yugabyte.com", _as_map(entries), "default") == "carol"
 
     def test_role_to_role_literal(self):
         entries = [_literal("default", "OIDC.Test.Read", "read_only_user")]
-        assert _apply_map("OIDC.Test.Read", entries, "default") == "read_only_user"
+        assert _apply_map("OIDC.Test.Read", _as_map(entries), "default") == "read_only_user"
 
     def test_azure_guid_regex(self):
         entries = [_regex("azure", r"^a12d04b1-.+", "reader")]
         assert _apply_map(
-            "a12d04b1-7463-8e23-94d2-8d71f17ab99b", entries, "azure",
+            "a12d04b1-7463-8e23-94d2-8d71f17ab99b", _as_map(entries), "azure",
         ) == "reader"
 
     def test_unmapped_returns_none(self):
         entries = [_literal("default", "alice", "a")]
-        assert _apply_map("someone-else", entries, "default") is None
+        assert _apply_map("someone-else", _as_map(entries), "default") is None
 
     def test_map_name_filter(self):
         """Entries under a different map_name must not match."""
@@ -330,19 +409,19 @@ class TestApplyMap:
             _literal("default", "alice", "wrong"),
             _literal("azure", "alice", "right"),
         ]
-        assert _apply_map("alice", entries, "azure") == "right"
+        assert _apply_map("alice", _as_map(entries), "azure") == "right"
 
     def test_map_name_isolation_no_leak(self):
         """A `default` entry must not match under `map_name="azure"`."""
         entries = [_literal("default", "alice", "a")]
-        assert _apply_map("alice", entries, "azure") is None
+        assert _apply_map("alice", _as_map(entries), "azure") is None
 
     def test_regex_is_anchored(self):
         """Regex uses fullmatch — a pattern without explicit anchors still
         requires the whole value to match, mirroring pg_ident.conf."""
         entries = [_regex("default", r"foo", "matched")]
-        assert _apply_map("foo", entries, "default") == "matched"
-        assert _apply_map("foobar", entries, "default") is None  # not anchored via search
+        assert _apply_map("foo", _as_map(entries), "default") == "matched"
+        assert _apply_map("foobar", _as_map(entries), "default") is None  # not anchored via search
 
     def test_first_match_wins(self):
         """When multiple entries under the same map_name could match, the
@@ -351,7 +430,7 @@ class TestApplyMap:
             _literal("default", "alice", "first"),
             _literal("default", "alice", "second"),
         ]
-        assert _apply_map("alice", entries, "default") == "first"
+        assert _apply_map("alice", _as_map(entries), "default") == "first"
 
 
 # ---------------------------------------------------------------------------
@@ -365,11 +444,17 @@ class TestPickRole:
     def test_single_candidate_auto_pick(self):
         assert _pick_role(["writer"], None) == "writer"
 
-    def test_single_candidate_ignores_requested_role(self):
-        """One candidate is always picked, even if requested_role is different
-        (we could raise here — but the ergonomic choice is auto-pick since
-        the caller had exactly one option)."""
-        assert _pick_role(["writer"], "reader") == "writer"
+    def test_single_candidate_mismatch_raises(self):
+        """A requested_role that doesn't match the sole candidate is a
+        misconfiguration, not a hint to silently promote the caller. The
+        agent's declared intent must be honored or refused — never
+        silently overridden."""
+        with pytest.raises(IdentityError, match="not in the caller's identity-claim"):
+            _pick_role(["writer"], "reader")
+
+    def test_single_candidate_matching_request_returns_it(self):
+        """When requested_role matches the sole candidate, return it."""
+        assert _pick_role(["writer"], "writer") == "writer"
 
     def test_multi_candidate_requested_role_in_list(self):
         assert _pick_role(["writer", "reader"], "reader") == "reader"
@@ -378,10 +463,12 @@ class TestPickRole:
         with pytest.raises(IdentityError, match="not in the caller's identity-claim"):
             _pick_role(["writer", "reader"], "admin")
 
-    def test_multi_candidate_no_request_defaults_to_first(self, caplog):
-        with caplog.at_level("WARNING"):
-            assert _pick_role(["writer", "reader"], None) == "writer"
-        assert any("multiple roles" in r.message for r in caplog.records)
+    def test_multi_candidate_no_request_raises(self):
+        """Ambiguity is never silently resolved. The server refuses to pick
+        arbitrarily to avoid accidentally granting the more-privileged
+        role. The agent must pass requested_role to disambiguate."""
+        with pytest.raises(IdentityError, match="multiple roles"):
+            _pick_role(["writer", "reader"], None)
 
     def test_empty_candidates_raises(self):
         with pytest.raises(IdentityError, match="None of the identity-claim values"):
@@ -412,12 +499,17 @@ class TestGetDbRoleV2:
         assert _get_db_role(ctx, requested_role="reader") == "reader"
 
     @patch("yugabytedb_mcp_server.tools.get_access_token")
-    def test_cognito_groups_no_requested_role_defaults_first(self, mock_get_token):
+    def test_cognito_groups_no_requested_role_raises(self, mock_get_token):
+        """Multiple candidates + no requested_role → IdentityError. The
+        server refuses to default to the first entry (which would be the
+        IdP-controlled ordering) to avoid granting the more-privileged
+        role by accident."""
         mock_get_token.return_value = _make_access_token(
             {"cognito:groups": ["writer", "reader"]}
         )
         ctx = _make_ctx(identity_claim="cognito:groups", identity_map=None)
-        assert _get_db_role(ctx) == "writer"
+        with pytest.raises(IdentityError, match="multiple roles"):
+            _get_db_role(ctx)
 
     @patch("yugabytedb_mcp_server.tools.get_access_token")
     def test_cognito_groups_requested_not_in_list_raises(self, mock_get_token):
@@ -437,7 +529,7 @@ class TestGetDbRoleV2:
         entries = [_literal("default", "app-writer", "writer")]
         ctx = _make_ctx(
             identity_claim="realm_access.roles",
-            identity_map=entries,
+            identity_map=_as_map(entries),
             identity_map_name="default",
         )
         assert _get_db_role(ctx) == "writer"
@@ -450,7 +542,7 @@ class TestGetDbRoleV2:
         )
         entries = [_regex("azure", r"^a12d04b1-.+", "reader")]
         ctx = _make_ctx(
-            identity_claim="groups", identity_map=entries, identity_map_name="azure",
+            identity_claim="groups", identity_map=_as_map(entries), identity_map_name="azure",
         )
         assert _get_db_role(ctx) == "reader"
 
@@ -466,7 +558,7 @@ class TestGetDbRoleV2:
             _literal("default", "also-known", "role_b"),
         ]
         ctx = _make_ctx(
-            identity_claim="groups", identity_map=entries, identity_map_name="default",
+            identity_claim="groups", identity_map=_as_map(entries), identity_map_name="default",
         )
         assert _get_db_role(ctx, requested_role="role_b") == "role_b"
 
@@ -479,7 +571,7 @@ class TestGetDbRoleV2:
         )
         entries = [_literal("default", "different_value", "some_role")]
         ctx = _make_ctx(
-            identity_claim="groups", identity_map=entries, identity_map_name="default",
+            identity_claim="groups", identity_map=_as_map(entries), identity_map_name="default",
         )
         with pytest.raises(IdentityError, match="None of the identity-claim values"):
             _get_db_role(ctx)
@@ -491,7 +583,7 @@ class TestGetDbRoleV2:
             {"email": "carol@yugabyte.com"}
         )
         entries = [_regex("default", r"^([a-z]+)@yugabyte\.com$", r"\1")]
-        ctx = _make_ctx(identity_claim="email", identity_map=entries)
+        ctx = _make_ctx(identity_claim="email", identity_map=_as_map(entries))
         assert _get_db_role(ctx) == "carol"
 
 
@@ -530,7 +622,7 @@ class TestSecurityInvariants:
         entries = [_literal("default", "evil", "writer'; DROP TABLE t--")]
         with patch("yugabytedb_mcp_server.tools.get_access_token") as mock:
             mock.return_value = _make_access_token({"sub": "evil"})
-            ctx = _make_ctx(identity_claim="sub", identity_map=entries)
+            ctx = _make_ctx(identity_claim="sub", identity_map=_as_map(entries))
             # Whatever comes back from the map goes to psycopg's Identifier
             # for quoting — this test asserts we don't accidentally strip or
             # sanitize the value here (that would mask a downstream quoting
@@ -565,7 +657,7 @@ class TestSecurityInvariants:
             _literal("default", "raw_a", "mapped_a"),
             _literal("default", "raw_b", "mapped_b"),
         ]
-        ctx = _make_ctx(identity_claim="groups", identity_map=entries)
+        ctx = _make_ctx(identity_claim="groups", identity_map=_as_map(entries))
         # `requested_role="raw_a"` is the RAW claim value; the candidate list
         # contains the *mapped* values, so this must fail.
         with pytest.raises(IdentityError):

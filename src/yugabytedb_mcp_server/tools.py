@@ -149,33 +149,94 @@ def _extract_claim(claims: Dict[str, Any], path: str) -> Any:
     return cursor
 
 
-def _load_identity_map(path: str) -> List[MapEntry]:
-    """Parse a ``pg_ident.conf``-style identity map file.
+def _strip_inline_comment(line: str) -> str:
+    """Return ``line`` with any pg_ident-style comment stripped.
+
+    Only treats ``#`` as a comment marker when it starts the line or is
+    preceded by whitespace. This preserves regexes / role names that
+    contain a literal ``#`` mid-token (e.g. ``/user#\\d+/``).
+    """
+    i = 0
+    while True:
+        j = line.find("#", i)
+        if j < 0:
+            return line
+        if j == 0 or line[j - 1] in " \t":
+            return line[:j]
+        i = j + 1
+
+
+def _validate_db_role_template(
+    role: str, compiled: Optional[re.Pattern], path: str, lineno: int,
+) -> None:
+    """Fail-closed at load time on a db_role template with a broken
+    backreference (``\\N`` referencing a group that doesn't exist).
+
+    Without this, ``m.expand(role)`` would raise ``re.error`` at request
+    time for every match, which surfaces as an unhandled 500 rather than
+    a clean startup refusal.
+    """
+    if compiled is None:
+        # Literal mapping — no expansion, so any bytes are fine.
+        return
+    # sre_parse.parse_template validates group references against the
+    # pattern; anything malformed raises re.error here at LOAD time.
+    try:
+        re.compile(role)  # noqa: F841 -- just to reject obviously invalid
+    except re.error:
+        pass  # role isn't itself a regex; we only care about backref shape
+    # The real check: try an actual expand against a synthetic match. Use a
+    # string that satisfies the pattern (or the empty string if it doesn't
+    # anchor), catch the specific "invalid group reference" family.
+    try:
+        # Compile a throwaway template checker: re.Match.expand triggers
+        # sre_parse.parse_template internally on the template string. We
+        # only need to know if expand would raise for THIS pattern's group
+        # count, which we can get with .groups.
+        n_groups = compiled.groups
+        for ref in re.finditer(r"\\(\d+)", role):
+            g = int(ref.group(1))
+            if g > n_groups:
+                raise ValueError(
+                    f"{path}:{lineno}: db_role template {role!r} references "
+                    f"capture group \\{g}, but the pattern only has "
+                    f"{n_groups} group{'s' if n_groups != 1 else ''}."
+                )
+    except ValueError:
+        raise
+    except re.error as e:
+        raise ValueError(
+            f"{path}:{lineno}: db_role template {role!r} is invalid: {e}"
+        ) from e
+
+
+def _load_identity_map(path: str) -> Dict[str, List[MapEntry]]:
+    """Parse a ``pg_ident.conf``-style identity map file, indexed by map_name.
+
+    Returns a dict of ``map_name → ordered list of that map's entries``. The
+    per-name grouping is done once at startup so ``_apply_map`` doesn't
+    re-filter every entry per value.
 
     Format (matches PostgreSQL's user-name-map file format, used by YSQL's
     ``ysql_ident_conf_csv``):
 
     - Each non-empty, non-comment line has three space-separated fields:
       ``<map_name> <system_value> <db_role>``.
-    - Lines starting with ``#`` (or having ``#`` mid-line for a trailing
-      comment) are treated as comments.
+    - ``#`` starts a comment only at line-start or after whitespace, so a
+      literal ``#`` inside a regex or role name is preserved.
     - ``system_value`` starting with ``/`` is a regex pattern — the rest of
       the field (no closing ``/``) is compiled with ``re.compile`` and
       matched with ``fullmatch``. The ``db_role`` field may reference
       capture groups via ``\\1``, ``\\2``, ....
     - Malformed lines raise ``ValueError`` — caller (server startup) should
       let this propagate to fail-closed instead of silently accepting a
-      typo'd map.
+      typo'd map. Group-reference validity (``\\N`` in db_role) is also
+      checked here.
     """
-    entries: List[MapEntry] = []
+    by_name: Dict[str, List[MapEntry]] = {}
     with open(path) as f:
         for lineno, raw_line in enumerate(f, start=1):
-            # Strip inline comments and surrounding whitespace.
-            line = raw_line.rstrip("\n")
-            hash_idx = line.find("#")
-            if hash_idx >= 0:
-                line = line[:hash_idx]
-            line = line.strip()
+            line = _strip_inline_comment(raw_line.rstrip("\n")).strip()
             if not line:
                 continue
             parts = line.split(None, 2)
@@ -195,37 +256,45 @@ def _load_identity_map(path: str) -> List[MapEntry]:
                     raise ValueError(
                         f"{path}:{lineno}: invalid regex {system_value!r}: {e}"
                     ) from e
-            entries.append(MapEntry(
+            _validate_db_role_template(role, compiled, path, lineno)
+            by_name.setdefault(name, []).append(MapEntry(
                 name=name,
                 pattern=system_value,
                 role=role,
                 is_regex=is_regex,
                 compiled=compiled,
             ))
-    return entries
+    return by_name
 
 
 def _apply_map(
     value: str,
-    entries: List[MapEntry],
+    identity_map: Dict[str, List[MapEntry]],
     map_name: str,
 ) -> Optional[str]:
-    """Try to resolve ``value`` to a DB role via the map entries.
+    """Try to resolve ``value`` to a DB role via the ``map_name`` entries.
 
-    Iterates entries in order; returns the first match's role (with
-    ``\\1``-style substitutions applied for regex entries). Returns ``None``
-    when no entry under ``map_name`` matches the value — caller decides
-    whether "unmapped" is an error (typical) or a fall-through case (never,
-    in this codebase).
+    Iterates the entries under ``map_name`` in order; returns the first
+    match's role (with ``\\1``-style substitutions applied for regex
+    entries). Returns ``None`` when no entry matches the value — caller
+    decides whether "unmapped" is an error (typical) or a fall-through
+    case (never, in this codebase). Also returns ``None`` if a regex
+    match expands to an empty string (a capture group matching ""); an
+    empty role name is never a valid SET ROLE target and would fail with
+    a confusing DB error.
     """
-    for entry in entries:
-        if entry.name != map_name:
-            continue
+    for entry in identity_map.get(map_name, ()):
         if entry.is_regex:
             # PostgreSQL pg_ident.conf matches anchored — use fullmatch.
             m = entry.compiled.fullmatch(value)
             if m is not None:
-                return m.expand(entry.role)
+                expanded = m.expand(entry.role)
+                if expanded == "":
+                    # Empty expansion → treat as unmapped so the caller
+                    # gets a clean IdentityError instead of a downstream
+                    # `SET ROLE ""` failure.
+                    continue
+                return expanded
         else:
             if value == entry.pattern:
                 return entry.role
@@ -241,35 +310,35 @@ def _pick_role(candidates: List[str], requested_role: Optional[str]) -> str:
     cannot pick a role that isn't in the JWT.
 
     Behavior:
-    - Empty candidates → ``IdentityError`` (nothing to pick from).
-    - Single candidate → auto-pick.
-    - Multiple candidates + ``requested_role`` in list → return it.
-    - Multiple candidates + ``requested_role`` NOT in list → ``IdentityError``.
-    - Multiple candidates + ``requested_role is None`` → default to first
-      with a WARNING (documented behavior; agent should pass
-      ``requested_role`` for determinism).
+    - Empty candidates → ``IdentityError``.
+    - Any ``requested_role`` not present in ``candidates`` → ``IdentityError``
+      (regardless of candidate count — a mismatch is never silently ignored).
+    - Single candidate + ``requested_role is None`` → auto-pick.
+    - Multiple candidates + ``requested_role is None`` → ``IdentityError``
+      (fail-closed on ambiguity; the agent must disambiguate explicitly).
+    - Any candidate count + ``requested_role`` in list → return it.
     """
     if not candidates:
         raise IdentityError(
             "None of the identity-claim values resolved to a permitted DB role. "
             "Check YB_MCP_IDENTITY_MAP configuration."
         )
+    if requested_role is not None:
+        if requested_role in candidates:
+            return requested_role
+        raise IdentityError(
+            f"requested_role={requested_role!r} is not in the caller's "
+            f"identity-claim candidates {candidates}. The agent must pick a "
+            f"role that appears in the JWT's mapped list."
+        )
+    # requested_role is None from here on.
     if len(candidates) == 1:
         return candidates[0]
-    if requested_role is None:
-        logger.warning(
-            "Identity claim resolved to multiple roles %s but no requested_role "
-            "was passed. Defaulting to first entry %r. Pass requested_role=<name> "
-            "to disambiguate.",
-            candidates, candidates[0],
-        )
-        return candidates[0]
-    if requested_role in candidates:
-        return requested_role
     raise IdentityError(
-        f"requested_role={requested_role!r} is not in the caller's identity-claim "
-        f"candidates {candidates}. The agent must pick a role that appears in the "
-        f"JWT's mapped list."
+        f"Identity claim resolved to multiple roles {candidates} but no "
+        f"requested_role was passed. Pass requested_role=<name> to pick one — "
+        f"the server refuses to default arbitrarily to avoid granting the "
+        f"more-privileged role by accident."
     )
 
 
@@ -303,7 +372,7 @@ def _get_db_role(ctx: Context, requested_role: Optional[str] = None) -> Optional
     lifespan = ctx.request_context.lifespan_context
     claim_name = lifespan.get("identity_claim", "email")
     transform = lifespan.get("identity_transform", "none")
-    identity_map: Optional[List[MapEntry]] = lifespan.get("identity_map")
+    identity_map: Optional[Dict[str, List[MapEntry]]] = lifespan.get("identity_map")
     identity_map_name: str = lifespan.get("identity_map_name", "default")
 
     _missing_msg = (
