@@ -61,7 +61,7 @@ import webbrowser
 
 import httpx
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 KEYCLOAK_AUTHORIZE_URL = (
     "http://localhost:18081/realms/yb-mcp-map/protocol/openid-connect/auth"
@@ -213,57 +213,65 @@ async def run_mcp(token: str, claims: dict) -> None:
     if requested_role is not None:
         tool_args_common["requested_role"] = requested_role
 
+    # The new `streamable_http_client` API takes an `httpx.AsyncClient`
+    # for header / auth configuration rather than accepting `headers=` as
+    # a kwarg (the old `streamablehttp_client` shape was deprecated in
+    # mcp SDK v1.19+ in favor of this).
     headers = {"Authorization": f"Bearer {token}"}
-    async with streamablehttp_client(MCP_URL, headers=headers) as (
-        read_stream,
-        write_stream,
-        _,
-    ):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
-            tools = await session.list_tools()
-            tool_names = sorted(t.name for t in tools.tools)
-            print(f"==> Connected to MCP server. Tools: {', '.join(tool_names)}\n")
+    async with httpx.AsyncClient(headers=headers) as http_client:
+        # mcp>=2.0 yields (read_stream, write_stream); v1.x yielded a third
+        # `get_session_id` callback. `*_` accepts both so the tutorial works
+        # against whichever version uv resolves.
+        async with streamable_http_client(MCP_URL, http_client=http_client) as (
+            read_stream,
+            write_stream,
+            *_,
+        ):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                tools = await session.list_tools()
+                tool_names = sorted(t.name for t in tools.tools)
+                print(f"==> Connected to MCP server. Tools: {', '.join(tool_names)}\n")
 
-            print("--- 1. Confirm effective database role ---")
-            render(
-                await session.call_tool(
-                    "run_read_only_query",
-                    {
-                        "query": (
-                            "SELECT current_user, session_user, "
-                            "current_setting('role') AS effective_role"
-                        ),
-                        **tool_args_common,
-                    },
+                print("--- 1. Confirm effective database role ---")
+                render(
+                    await session.call_tool(
+                        "run_read_only_query",
+                        {
+                            "query": (
+                                "SELECT current_user, session_user, "
+                                "current_setting('role') AS effective_role"
+                            ),
+                            **tool_args_common,
+                        },
+                    )
                 )
-            )
 
-            print("\n--- 2. SELECT from notes ---")
-            render(
-                await session.call_tool(
-                    "run_read_only_query",
-                    {
-                        "query": "SELECT id, body FROM notes ORDER BY id",
-                        **tool_args_common,
-                    },
+                print("\n--- 2. SELECT from notes ---")
+                render(
+                    await session.call_tool(
+                        "run_read_only_query",
+                        {
+                            "query": "SELECT id, body FROM notes ORDER BY id",
+                            **tool_args_common,
+                        },
+                    )
                 )
-            )
 
-            picked = requested_role or (mapped[0] if mapped else "<none>")
-            print(f"\n--- 3. INSERT into notes as {picked} ---")
-            render(
-                await session.call_tool(
-                    "run_write_query",
-                    {
-                        "query": (
-                            "INSERT INTO notes (body) VALUES "
-                            f"('hello from {picked} (mapping demo)')"
-                        ),
-                        **tool_args_common,
-                    },
+                picked = requested_role or (mapped[0] if mapped else "<none>")
+                print(f"\n--- 3. INSERT into notes as {picked} ---")
+                render(
+                    await session.call_tool(
+                        "run_write_query",
+                        {
+                            "query": (
+                                "INSERT INTO notes (body) VALUES "
+                                f"('hello from {picked} (mapping demo)')"
+                            ),
+                            **tool_args_common,
+                        },
+                    )
                 )
-            )
 
 
 def main() -> None:
