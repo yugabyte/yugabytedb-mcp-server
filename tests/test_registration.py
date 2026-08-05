@@ -36,6 +36,8 @@ _BASE_CONFIG = ServerConfig(
     enable_write_query=False,
     identity_claim="email",
     identity_transform="none",
+    identity_map_path=None,
+    identity_map_name="mcp",
 )
 
 

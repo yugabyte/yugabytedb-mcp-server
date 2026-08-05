@@ -51,7 +51,51 @@ def create_auth_provider(name: str | None):
         )
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var.
+
+    - Unset → ``default``.
+    - Case-insensitive ``true`` / ``1`` / ``yes`` / ``on`` → ``True``.
+    - Case-insensitive ``false`` / ``0`` / ``no`` / ``off`` / ``""`` → ``False``.
+    - Anything else → ``default`` (with a WARNING so an operator-visible
+      typo doesn't silently flip a security flag).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in ("true", "1", "yes", "on"):
+        return True
+    if v in ("false", "0", "no", "off", ""):
+        return False
+    logger.warning(
+        "%s=%r is not a recognized boolean; falling back to default=%s",
+        name, raw, default,
+    )
+    return default
+
+
 def _create_cognito():
+    """AWS Cognito auth provider.
+
+    Two DB-22136 fixes applied here:
+
+    1. **Audience validation (always on).** `JWTVerifier(audience=...)` is
+       initialized with the Cognito App-client ID — Cognito access tokens
+       carry `aud=<client_id>`, so a token minted for a different app client
+       in the same user pool is rejected. Blocks the "any token from this
+       pool works" gap.
+
+    2. **`token_use=access` enforcement (opt-in).** When
+       `YB_MCP_REQUIRE_ACCESS_TOKEN=true`, `_CognitoJWTVerifier` overrides
+       `verify_token` to reject decoded claims whose `token_use != "access"`.
+       Rejects ID tokens and refresh tokens presented as bearers. Off by
+       default because existing deployments with `YB_MCP_IDENTITY_CLAIM=email`
+       rely on ID tokens (email is not in the access token) — see
+       DB-22192. Migration path: switch `identity_claim` to a claim present
+       in access tokens (e.g. `cognito:groups`, `sub`), then flip this env
+       to `true`.
+    """
     from fastmcp.server.auth.oidc_proxy import OIDCProxy
     from fastmcp.server.auth.auth import MultiAuth
     from fastmcp.server.auth.providers.jwt import JWTVerifier
@@ -68,8 +112,99 @@ def _create_cognito():
         def _prepare_scopes_for_token_exchange(self, scopes: list[str]) -> list[str]:
             return []
 
+    class _CognitoJWTVerifier(JWTVerifier):
+        """JWTVerifier with two Cognito-specific overrides:
+
+        1. **Audience matches ``aud`` OR ``client_id``.** Cognito ID tokens
+           carry the app client identifier in the standard ``aud`` claim,
+           but **access tokens omit ``aud`` entirely** and put the identifier
+           in ``client_id`` instead
+           (https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-using-tokens-with-identity-providers.html).
+           FastMCP's stock ``JWTVerifier`` only checks ``aud``, so a
+           straight ``audience=client_id`` argument rejects every Cognito
+           access token with "audience mismatch (got None, expected …)".
+           We disable the parent's audience check (pass ``audience=None``)
+           and run our own check here that accepts either claim.
+
+        2. **``token_use=access`` enforcement** (opt-in via
+           ``YB_MCP_REQUIRE_ACCESS_TOKEN=true``, off by default for
+           backward compat). See DB-22136.
+        """
+
+        def __init__(
+            self,
+            *,
+            require_access_token: bool,
+            expected_audience: str,
+            **kwargs,
+        ):
+            # Disable the parent's aud check — see class docstring for why.
+            super().__init__(audience=None, **kwargs)
+            self._require_access_token = require_access_token
+            self._expected_audience = expected_audience
+
+        def _audience_matches(self, claims: dict) -> bool:
+            """Accept a token if either ``aud`` or ``client_id`` names our
+            expected audience. Handles ``aud`` being a list per RFC 7519."""
+            expected = self._expected_audience
+            aud = claims.get("aud")
+            if aud is not None:
+                if isinstance(aud, list):
+                    if expected in aud:
+                        return True
+                elif aud == expected:
+                    return True
+            # Cognito access-token fallback.
+            if claims.get("client_id") == expected:
+                return True
+            return False
+
+        async def verify_token(self, token: str):
+            result = await super().verify_token(token)
+            if result is None:
+                return None
+            claims = result.claims or {}
+
+            # Audience check (aud OR client_id) — before token_use so a
+            # wrong-audience token is rejected even in the default (non-strict)
+            # mode.
+            if not self._audience_matches(claims):
+                logger.warning(
+                    "Rejected Cognito token: audience mismatch. "
+                    "expected=%r, aud=%r, client_id=%r. "
+                    "Token was minted for a different app client than the one "
+                    "this MCP server is configured to accept (COGNITO_CLIENT_ID).",
+                    self._expected_audience,
+                    claims.get("aud"),
+                    claims.get("client_id"),
+                )
+                return None
+
+            token_use = claims.get("token_use")
+            if self._require_access_token and token_use != "access":
+                logger.warning(
+                    "Rejected Cognito token with token_use=%r "
+                    "(YB_MCP_REQUIRE_ACCESS_TOKEN=true). Only access tokens "
+                    "are accepted at /mcp; present an access token instead "
+                    "of an ID or refresh token.",
+                    token_use,
+                )
+                return None
+            if not self._require_access_token and token_use == "id":
+                # Loud warning on the default path so operators see the
+                # gap in logs and can migrate to access-token-only.
+                logger.warning(
+                    "Accepted Cognito ID token (token_use=id). Consider "
+                    "switching to access tokens: change YB_MCP_IDENTITY_CLAIM "
+                    "to a claim present in access tokens (e.g. cognito:groups "
+                    "or sub) and set YB_MCP_REQUIRE_ACCESS_TOKEN=true. "
+                    "See OIDC.md for the migration path."
+                )
+            return result
+
     pool_id = os.environ["COGNITO_USER_POOL_ID"]
     region = os.environ["COGNITO_AWS_REGION"]
+    client_id = os.environ["COGNITO_CLIENT_ID"]
     logger.debug("Configuring Cognito provider (pool=%s, region=%s)", pool_id, region)
     config_url = (
         f"https://cognito-idp.{region}.amazonaws.com/{pool_id}/"
@@ -82,7 +217,7 @@ def _create_cognito():
 
     proxy = _CognitoProxy(
         config_url=config_url,
-        client_id=os.environ["COGNITO_CLIENT_ID"],
+        client_id=client_id,
         client_secret=os.environ["COGNITO_CLIENT_SECRET"],
         base_url=base_url,
         token_endpoint_auth_method="client_secret_basic",
@@ -97,18 +232,38 @@ def _create_cognito():
     if getattr(proxy, "_cimd_manager", None) is not None:
         proxy._cimd_manager.default_scope = scopes
 
-    raw_jwt_verifier = JWTVerifier(
+    require_access_token = _env_bool("YB_MCP_REQUIRE_ACCESS_TOKEN", default=False)
+    raw_jwt_verifier = _CognitoJWTVerifier(
+        require_access_token=require_access_token,
+        # DB-22136: block tokens minted for other app clients in the same
+        # user pool. Cognito ID tokens set `aud=client_id`; Cognito access
+        # tokens set `client_id` and omit `aud`. `_CognitoJWTVerifier`
+        # accepts either — see class docstring.
+        expected_audience=client_id,
         jwks_uri=str(proxy.oidc_config.jwks_uri),
         issuer=str(proxy.oidc_config.issuer),
     )
 
-    logger.info("Cognito auth provider created (pool=%s, region=%s)", pool_id, region)
+    logger.info(
+        "Cognito auth provider created (pool=%s, region=%s, "
+        "audience=%s, require_access_token=%s)",
+        pool_id, region, client_id, require_access_token,
+    )
     return MultiAuth(server=proxy, verifiers=[raw_jwt_verifier])
 
 
 def _create_oidc():
     """Generic OIDC provider. Untested — exercise at your own risk and please
-    report findings."""
+    report findings.
+
+    DB-22136 audience-validation fix: `OIDC_AUDIENCE` (already read for
+    `OIDCProxy`) is now also forwarded to `JWTVerifier`, so a token issued
+    to a different client of the same issuer is rejected at the verifier
+    layer. `token_use=access` enforcement is NOT applied here because
+    non-Cognito IdPs may not emit `token_use` (or use a different claim
+    name); operators of Cognito-specific setups should use the `cognito`
+    provider instead.
+    """
     from fastmcp.server.auth.oidc_proxy import OIDCProxy
     from fastmcp.server.auth.auth import MultiAuth
     from fastmcp.server.auth.providers.jwt import JWTVerifier
@@ -126,12 +281,26 @@ def _create_oidc():
         base_url=os.environ.get("MCP_BASE_URL", "http://localhost:8000"),
     )
 
+    if not audience:
+        logger.warning(
+            "OIDC provider configured without OIDC_AUDIENCE. Tokens will "
+            "only be checked for signature and issuer, not audience. Any "
+            "validly-signed token from the same issuer will be accepted. "
+            "Set OIDC_AUDIENCE to the client ID / resource identifier this "
+            "server expects."
+        )
+
     raw_jwt_verifier = JWTVerifier(
         jwks_uri=str(proxy.oidc_config.jwks_uri),
         issuer=str(proxy.oidc_config.issuer),
+        # DB-22136: forward the audience to the verifier when present.
+        audience=audience,
     )
 
-    logger.info("OIDC auth provider created (config_url=%s)", config_url)
+    logger.info(
+        "OIDC auth provider created (config_url=%s, audience=%s)",
+        config_url, audience or "<unset>",
+    )
     return MultiAuth(server=proxy, verifiers=[raw_jwt_verifier])
 
 
