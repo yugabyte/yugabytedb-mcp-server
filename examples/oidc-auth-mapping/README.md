@@ -78,7 +78,7 @@ The realm's audience mapper also stamps `aud: yb-mcp-server` on every access tok
 
 ### View the realm in the admin console (optional)
 
-Open http://localhost:18081, sign in as `admin` / `admin`, and navigate to **Realm settings → yb-mcp-map**. Under **Realm roles** you'll see `db-writer` / `db-reader`. Under **Users**, each of the three demo users has role assignments visible on the **Role mapping** tab.
+Open http://localhost:18081, sign in as `admin` / `admin`, and select the realm yb-mcp-map from the drop down menu on the left side. Under **Realm roles**, you'll see `db-writer` / `db-reader`. Under **Users → <username>**, each of the three demo users has role assignments visible on the **Role mapping** tab.
 
 ## Step 2 — Seed the database
 
