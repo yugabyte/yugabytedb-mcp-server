@@ -71,6 +71,33 @@
           }
         }
       ]
+    },
+    {
+      "name": "openid",
+      "description": "OIDC built-in scope 'openid'",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    },
+    {
+      "name": "email",
+      "description": "OIDC built-in scope 'email'",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
+      }
+    },
+    {
+      "name": "profile",
+      "description": "OIDC built-in scope 'profile'",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
+      }
     }
   ],
   "clients": [
@@ -113,7 +140,11 @@
       "enabled": true,
       "emailVerified": true,
       "credentials": [
-        { "type": "password", "value": "Writer123", "temporary": false }
+        {
+          "type": "password",
+          "value": "Writer123",
+          "temporary": false
+        }
       ],
       "realmRoles": [
         "db-writer",
@@ -128,7 +159,11 @@
       "enabled": true,
       "emailVerified": true,
       "credentials": [
-        { "type": "password", "value": "Reader123", "temporary": false }
+        {
+          "type": "password",
+          "value": "Reader123",
+          "temporary": false
+        }
       ],
       "realmRoles": [
         "db-reader",
@@ -143,7 +178,11 @@
       "enabled": true,
       "emailVerified": true,
       "credentials": [
-        { "type": "password", "value": "Dual123", "temporary": false }
+        {
+          "type": "password",
+          "value": "Dual123",
+          "temporary": false
+        }
       ],
       "realmRoles": [
         "db-writer",
