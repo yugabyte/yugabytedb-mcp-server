@@ -739,17 +739,20 @@ def run_write_query(
 
     # Reject oversized queries BEFORE parsing — the guardrail's sqlparse
     # walker spikes CPU on very large inputs (Vishal measured ~6.4s on a
-    # ~1MB query). Cheap first-line defense.
-    if len(query) > max_query_len:
+    # ~1MB query). Cheap first-line defense. Measured in bytes to match
+    # the env var's documented unit; `len(str)` alone counts code points,
+    # which diverges for multibyte UTF-8.
+    query_bytes = len(query.encode("utf-8"))
+    if query_bytes > max_query_len:
         logger.warning(
-            "run_write_query rejected: query length %d exceeds "
+            "run_write_query rejected: query %d bytes exceeds "
             "max_query_len=%d",
-            len(query), max_query_len,
+            query_bytes, max_query_len,
         )
         return json.dumps({
             "error": (
-                f"Query length {len(query)} exceeds YB_MCP_MAX_QUERY_LEN "
-                f"({max_query_len} bytes)."
+                f"Query length {query_bytes} bytes exceeds "
+                f"YB_MCP_MAX_QUERY_LEN ({max_query_len} bytes)."
             ),
             "blocked_by_guardrail": True,
         })

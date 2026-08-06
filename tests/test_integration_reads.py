@@ -243,23 +243,32 @@ async def test_summarize_empty_schema_returns_empty_list(
 # DB-22159 resource limits: statement timeout, result row cap, query length
 # ---------------------------------------------------------------------------
 
-async def test_statement_timeout_kills_pg_sleep(mcp_session_capped):
-    """DB-22159 primary repro. pg_sleep(60) with a 1s statement_timeout
-    must fail within ~1s instead of holding the connection for 60s.
+async def test_statement_timeout_kills_slow_query(mcp_session_capped):
+    """DB-22159 primary repro. A slow query with a 1s statement_timeout
+    must fail within ~1s instead of holding the connection indefinitely.
     Prevents the "5 trivial queries downs the service" attack.
+
+    Note: this used to use ``pg_sleep(60)``, but PR #9's read-side
+    guardrail (DB-22129) blocks pg_sleep pre-execute. We now use a
+    CPU-bound generate_series count large enough that the timeout, not
+    the guardrail, is what fires. This preserves the DB-22159 assertion
+    (server-side timeout works) while acknowledging the defense-in-depth
+    guardrail from PR #9.
     """
     import time
+    # 20M-row count runs ~2-3s locally — well above the 1s cap.
+    # Streams (no aggregation memory, no temp files) so we don't trip
+    # unrelated resource limits.
+    slow_query = "SELECT count(*) FROM generate_series(1, 20000000) g"
     start = time.monotonic()
     result = await mcp_session_capped.call_tool(
-        "run_read_only_query", {"query": "SELECT pg_sleep(60)"},
+        "run_read_only_query", {"query": slow_query},
     )
     elapsed = time.monotonic() - start
     text = raw_text(result)
     assert elapsed < 5, (
         f"statement_timeout should fire fast; took {elapsed:.1f}s. Result: {text!r}"
     )
-    # PG raises "canceling statement due to statement timeout" — the tool
-    # returns it as an "Error executing query: ..." string.
     assert "timeout" in text.lower() or "canceling" in text.lower(), (
         f"expected a timeout error, got: {text!r}"
     )
@@ -284,26 +293,34 @@ async def test_result_row_cap_truncates(mcp_session_capped, test_schema, db_conn
         {"query": f'SELECT id FROM "{test_schema}".big ORDER BY id'},
     )
     parsed = parse_json(result)
-    # Truncation changes the shape: dict with rows + truncated marker.
-    assert isinstance(parsed, dict), f"expected truncation marker, got list: {parsed!r}"
+    # PR #9 shape: {"columns": [...], "rows": [[...]]}. On truncation,
+    # extra keys `truncated`/`returned_rows`/`note` are added onto the
+    # same dict — rows still uses the parallel-arrays shape.
+    assert isinstance(parsed, dict), f"expected dict shape, got: {parsed!r}"
     assert parsed.get("truncated") is True
     assert parsed.get("returned_rows") == 3
+    assert parsed["columns"] == ["id"]
     assert len(parsed["rows"]) == 3
     # First 3 ids returned, remaining 7 dropped.
-    ids = [r["id"] for r in parsed["rows"]]
+    ids = [row[0] for row in parsed["rows"]]
     assert ids == [1, 2, 3]
 
 
 async def test_result_row_cap_not_triggered(mcp_session_capped):
     """Regression: a query returning fewer rows than the cap keeps the
-    v1 shape (list of dicts), no truncation marker."""
+    non-truncated columns/rows shape without any truncation marker."""
     result = await mcp_session_capped.call_tool(
         "run_read_only_query",
         {"query": "SELECT generate_series(1, 2) AS n"},
     )
     parsed = parse_json(result)
-    assert isinstance(parsed, list), f"expected list shape, got: {parsed!r}"
-    assert len(parsed) == 2
+    # PR #9 shape stays even below the truncation cap; just no truncated
+    # marker keys.
+    assert isinstance(parsed, dict), f"expected dict shape, got: {parsed!r}"
+    assert "truncated" not in parsed
+    assert "returned_rows" not in parsed
+    assert parsed["columns"] == ["n"]
+    assert parsed["rows"] == [[1], [2]]
 
 
 async def test_max_query_len_rejects_oversized_query(mcp_session_capped):
@@ -330,5 +347,6 @@ async def test_max_query_len_allows_normal_query(mcp_session_capped):
     result = await mcp_session_capped.call_tool(
         "run_read_only_query", {"query": "SELECT 1 AS n"},
     )
-    parsed = parse_json_list(result)
-    assert parsed == [{"n": 1}]
+    parsed = parse_json(result)
+    # PR #9 shape (parallel arrays), preserved through PR #11 rebase.
+    assert parsed == {"columns": ["n"], "rows": [[1]]}
