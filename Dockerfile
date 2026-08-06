@@ -21,5 +21,15 @@ EXPOSE 8000
 
 # Default to HTTP transport so the container is useful out of the box.
 # Override via `docker run … yugabytedb-mcp <flags>`.
+#
+# DB-22139: the server refuses to start in HTTP mode when
+# MCP_HOST is not loopback AND no auth provider is configured. When
+# running the image as a network-reachable server, set BOTH:
+#
+#   -e MCP_HOST=0.0.0.0
+#   -e MCP_AUTH_PROVIDER=cognito  (plus COGNITO_* env)
+#
+# For dev-only unauthenticated use, add `-e MCP_ALLOW_UNAUTHENTICATED=true`
+# — the server will start with a prominent WARNING but no auth.
 ENTRYPOINT ["yugabytedb-mcp"]
 CMD ["--transport", "http"]

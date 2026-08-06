@@ -157,3 +157,27 @@ async def mcp_session_strict():
         await _safe_aexit(stdio_cm)
 
 
+@pytest_asyncio.fixture
+async def mcp_session_capped():
+    """MCP session with small resource caps for DB-22159 testing:
+    - statement_timeout: 1s (fast enough to fail-fast on pg_sleep)
+    - max_result_rows: 3 (so a 10-row query truncates)
+    - max_query_len: 200 bytes (so a moderately long query is pre-rejected)
+    Write tool enabled so both read + write paths can be exercised."""
+    stdio_cm = stdio_client(_server_params(extra_env={
+        "YB_MCP_ENABLE_WRITE_QUERY": "true",
+        "YB_MCP_STATEMENT_TIMEOUT_MS": "1000",
+        "YB_MCP_MAX_RESULT_ROWS": "3",
+        "YB_MCP_MAX_QUERY_LEN": "200",
+    }))
+    read_stream, write_stream = await stdio_cm.__aenter__()
+    session_cm = ClientSession(read_stream, write_stream)
+    session = await session_cm.__aenter__()
+    await session.initialize()
+    try:
+        yield session
+    finally:
+        await _safe_aexit(session_cm)
+        await _safe_aexit(stdio_cm)
+
+

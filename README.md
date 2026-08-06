@@ -69,8 +69,10 @@ For development from source, see [Development](#development) below.
 | `YB_MCP_REQUIRE_WHERE_ON_DELETE` | `--require-where-on-delete` | No | Reject DELETE without a WHERE clause. Default `false`. |
 | `YB_MCP_ENABLE_WRITE_QUERY` | `--enable-write-query` | No | Enable the `run_write_query` tool. Default `false` (write tool disabled). |
 | `MCP_AUTH_PROVIDER` | `--mcp-auth-provider` | No | `cognito` or `oidc`. Leave unset to disable auth. Full OIDC/Cognito setup + per-user identity mapping is documented in [`OIDC.md`](OIDC.md). |
+| `MCP_HOST` | `--host` | No | Bind host for HTTP transport. Default `127.0.0.1` (loopback). Set to `0.0.0.0` to expose on all interfaces — auth becomes mandatory in that case (see `MCP_AUTH_PROVIDER`). |
 | `MCP_BASE_URL` | — | When auth enabled | Public base URL the server is reachable at (e.g. `https://mcp.example.com`). |
-| `MCP_ALLOWED_ORIGINS` | — | No | Comma-separated allowlist of Origin values for DNS-rebinding defense. Defaults to `MCP_BASE_URL`. |
+| `MCP_ALLOWED_ORIGINS` | — | No | Comma-separated allowlist of Origin values for DNS-rebinding defense. Case-insensitive (RFC 6454). Defaults to `MCP_BASE_URL`. |
+| `MCP_ALLOW_UNAUTHENTICATED` | — | No | Escape hatch to run HTTP mode on a non-loopback host without auth. Dev-only; startup logs a prominent WARNING. |
 | `YB_LOG_LEVEL` | — | No | Log level for the `yugabytedb-mcp` logger family (default `INFO`). |
 | `YB_AWS_SSL_ROOT_CERT_SECRET_ARN` | `--yb-aws-ssl-root-cert-secret-arn` | No | ARN of an AWS Secrets Manager secret holding the YugabyteDB TLS root certificate. |
 | `YB_AWS_SSL_ROOT_CERT_KEY` | `--yb-aws-ssl-root-cert-key` | No | JSON key inside the secret when it stores multiple certs. |
@@ -174,9 +176,14 @@ This list is best-effort, not exhaustive. `destructiveHint: true` is the second 
 
 For multi-user or shared deployments, run the server as Streamable HTTP behind a reverse proxy with TLS, with Cognito OAuth (or generic OIDC) gating access. The full setup — provider config, per-user `SET ROLE` mapping, the identity map file format, the `/auth/login` shortcut, and security guidance — is in [`OIDC.md`](OIDC.md).
 
-Minimum config for Cognito:
+**Secure-by-default:** since the DB-22139 fix, HTTP mode binds `127.0.0.1` by default and **refuses to start** when both of these are true:
+- The bind host is non-loopback (`MCP_HOST` set to `0.0.0.0` or a specific address)
+- No auth provider is configured (`MCP_AUTH_PROVIDER` unset)
+
+For a shared / networked deployment, set both `MCP_HOST=0.0.0.0` and `MCP_AUTH_PROVIDER`:
 
 ```bash
+export MCP_HOST=0.0.0.0                # expose beyond loopback (default: 127.0.0.1)
 export MCP_AUTH_PROVIDER=cognito
 export MCP_BASE_URL=https://mcp.example.com
 export COGNITO_USER_POOL_ID=us-west-2_XXXXXXXX
@@ -188,6 +195,8 @@ export MCP_ALLOWED_ORIGINS=https://mcp.example.com,https://claude.ai
 
 yugabytedb-mcp --transport http --stateless-http
 ```
+
+For **dev-only unauthenticated** use on `0.0.0.0`, set `MCP_ALLOW_UNAUTHENTICATED=true` — the server starts with a prominent WARNING. Do not use this in production.
 
 Behavior:
 

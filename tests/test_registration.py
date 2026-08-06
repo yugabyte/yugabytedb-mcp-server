@@ -24,6 +24,7 @@ from yugabytedb_mcp_server.server import ServerConfig, YugabyteDBMCPServer
 _BASE_CONFIG = ServerConfig(
     yugabytedb_url="host=localhost port=5433 user=yugabyte dbname=yugabyte",
     transport="stdio",
+    host="127.0.0.1",
     stateless_http=False,
     ssl_root_cert_secret_arn=None,
     ssl_root_cert_key=None,
@@ -38,6 +39,11 @@ _BASE_CONFIG = ServerConfig(
     identity_transform="none",
     identity_map_path=None,
     identity_map_name="mcp",
+    pool_min_size=1,
+    pool_max_size=3,
+    statement_timeout_ms=30_000,
+    max_result_rows=10_000,
+    max_query_len=100_000,
 )
 
 
