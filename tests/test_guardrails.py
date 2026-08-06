@@ -48,7 +48,7 @@ def strict_cfg():
     "CREATE TABLE t (id INT)",
     "ALTER TABLE t ADD COLUMN c TEXT",
     "DROP TABLE t",                       # Only DROP DATABASE/SCHEMA blocked
-    "INSERT INTO t SELECT * FROM s",      # INSERT ... SELECT has no row-count enforcement
+    "INSERT INTO t DEFAULT VALUES",       # Single-row default insert, no VALUES tuple
 ])
 def test_allows(sql, cfg):
     validate_query(sql, cfg, read_only=False)  # raises if blocked
@@ -226,9 +226,46 @@ def test_bulk_insert_over_limit(cfg):
     assert "exceeds the maximum" in str(exc.value)
 
 
-def test_bulk_insert_select_no_limit(cfg):
-    # INSERT ... SELECT has no VALUES, so row-count limit does not apply
-    validate_query("INSERT INTO t SELECT * FROM huge_table", cfg, read_only=False)
+def test_insert_select_rejected(cfg):
+    """DB-22131 remainder: ``INSERT … SELECT`` is an unbounded row source
+    (max_insert_rows only counts VALUES tuples statically), so it must
+    be blocked on the write path — otherwise
+    ``INSERT INTO t SELECT generate_series(1, 1_000_000)`` writes a
+    million rows despite max_insert_rows=cfg.max_insert_rows."""
+    with pytest.raises(QueryBlockedError) as exc:
+        validate_query("INSERT INTO t SELECT * FROM huge_table", cfg, read_only=False)
+    assert "INSERT" in str(exc.value) and "SELECT" in str(exc.value)
+
+
+def test_insert_select_generate_series_rejected(cfg):
+    """Vishal's exact repro from the ticket."""
+    with pytest.raises(QueryBlockedError):
+        validate_query(
+            "INSERT INTO t SELECT generate_series(1, 50)", cfg, read_only=False,
+        )
+
+
+def test_insert_with_cte_select_rejected(cfg):
+    """A CTE that hides the SELECT source is still an unbounded copy —
+    the flattened-token walker catches nested SELECTs."""
+    with pytest.raises(QueryBlockedError):
+        validate_query(
+            "WITH src AS (SELECT id FROM other) INSERT INTO t SELECT * FROM src",
+            cfg, read_only=False,
+        )
+
+
+def test_insert_default_values_still_allowed(cfg):
+    """Regression: ``INSERT … DEFAULT VALUES`` inserts one row with all
+    column defaults — bounded and safe. Must not be caught by the new
+    INSERT-…-SELECT rejection."""
+    validate_query("INSERT INTO t DEFAULT VALUES", cfg, read_only=False)
+
+
+def test_insert_values_still_allowed(cfg):
+    """Regression: the vanilla ``INSERT … VALUES (…)`` path is unaffected
+    by the new INSERT-…-SELECT check."""
+    validate_query("INSERT INTO t (id) VALUES (1), (2), (3)", cfg, read_only=False)
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +290,84 @@ def test_delete_without_where_blocked_when_strict(strict_cfg):
 
 def test_delete_with_where_allowed_when_strict(strict_cfg):
     validate_query("DELETE FROM t WHERE id = 1", strict_cfg, read_only=False)
+
+
+# ---------------------------------------------------------------------------
+# CREATE FUNCTION / CREATE PROCEDURE — arbitrary code + privilege escalation
+# ---------------------------------------------------------------------------
+
+def test_create_function_rejected(cfg):
+    """CREATE FUNCTION runs arbitrary PL code and can grant privileges via
+    SECURITY DEFINER — no legitimate MCP-tool use case."""
+    with pytest.raises(QueryBlockedError) as exc:
+        validate_query(
+            "CREATE FUNCTION f() RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$",
+            cfg, read_only=False,
+        )
+    assert "CREATE FUNCTION" in str(exc.value)
+
+
+def test_create_function_security_definer_rejected(cfg):
+    """The SECURITY DEFINER variant is the most dangerous form —
+    privilege escalation to function owner. Same blocklist entry catches
+    it."""
+    with pytest.raises(QueryBlockedError):
+        validate_query(
+            "CREATE FUNCTION f() RETURNS int "
+            "SECURITY DEFINER LANGUAGE SQL AS $$ SELECT 1 $$",
+            cfg, read_only=False,
+        )
+
+
+def test_create_procedure_rejected(cfg):
+    """CREATE PROCEDURE is CREATE FUNCTION's sibling — same class of
+    concern."""
+    with pytest.raises(QueryBlockedError):
+        validate_query(
+            "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN END $$",
+            cfg, read_only=False,
+        )
+
+
+def test_alter_function_rejected(cfg):
+    """ALTER FUNCTION can flip SECURITY DEFINER on an existing function —
+    same escalation risk as CREATE."""
+    with pytest.raises(QueryBlockedError):
+        validate_query(
+            "ALTER FUNCTION f() SECURITY DEFINER", cfg, read_only=False,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bulk-copy shapes intentionally left ALLOWED
+# ---------------------------------------------------------------------------
+# `CREATE TABLE … AS SELECT` and `SELECT … INTO` are unbounded row copies
+# in the same family as `INSERT … SELECT`, but the team chose to allow them
+# — they're commonly used to materialize a snapshot from an existing query
+# and blocking them broke a valid workflow. These tests pin that choice so
+# a future guardrail expansion doesn't silently regress it.
+
+def test_create_table_as_select_allowed(cfg):
+    validate_query(
+        "CREATE TABLE snap AS SELECT * FROM src", cfg, read_only=False,
+    )
+
+
+def test_create_unlogged_table_as_select_allowed(cfg):
+    validate_query(
+        "CREATE UNLOGGED TABLE snap AS SELECT * FROM src",
+        cfg, read_only=False,
+    )
+
+
+def test_select_into_allowed(cfg):
+    validate_query("SELECT * INTO snap FROM src", cfg, read_only=False)
+
+
+def test_create_table_plain_still_allowed(cfg):
+    """Regression: ``CREATE TABLE t (col int)`` (no AS SELECT) is a
+    bounded DDL statement — no rows copied, must not be blocked."""
+    validate_query("CREATE TABLE t (id int, name text)", cfg, read_only=False)
 
 
 # ---------------------------------------------------------------------------
