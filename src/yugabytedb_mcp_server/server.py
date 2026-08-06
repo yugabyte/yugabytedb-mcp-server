@@ -432,8 +432,7 @@ def parse_config() -> ServerConfig:
         default=os.environ.get("YB_MCP_POOL_MAX_SIZE", "5"),
         help="Maximum connections held by the pool. Raise this if you "
              "expect concurrent tool calls; a low value is the DoS surface "
-             "described in DB-22159 (five long-running queries block "
-             "everyone else) "
+             "(five long-running queries block everyone else) "
              "(env: YB_MCP_POOL_MAX_SIZE, default: 5).",
     )
     parser.add_argument(
