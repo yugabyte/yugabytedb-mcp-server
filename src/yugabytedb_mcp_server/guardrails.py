@@ -80,6 +80,13 @@ _BLOCKED_KEYWORD_PAIRS: dict[tuple[str, str], str] = {
     ("ALTER", "SYSTEM"): "ALTER SYSTEM is not allowed",
     ("RESET", "ALL"): "RESET ALL is not allowed",
     ("CREATE", "SCHEMA"): "CREATE SCHEMA is not allowed",
+    # DB-22131 remainder: CREATE FUNCTION / PROCEDURE can run arbitrary
+    # PL code and, with SECURITY DEFINER, escalate to the owner's role.
+    # No legitimate MCP-tool use case; block outright on the write path.
+    ("CREATE", "FUNCTION"): "CREATE FUNCTION is not allowed",
+    ("CREATE", "PROCEDURE"): "CREATE PROCEDURE is not allowed",
+    ("ALTER", "FUNCTION"): "ALTER FUNCTION is not allowed",
+    ("ALTER", "PROCEDURE"): "ALTER PROCEDURE is not allowed",
 }
 
 
@@ -263,6 +270,24 @@ def _count_values_rows(sql: str) -> int | None:
     return None
 
 
+def _stmt_has_select_source(stmt) -> bool:
+    """True if the parsed statement contains a DML ``SELECT`` token.
+
+    Used by the write-path INSERT check to distinguish
+    ``INSERT … SELECT`` (unbounded, blocked) from ``INSERT … VALUES``
+    and ``INSERT … DEFAULT VALUES`` (both static / trivially bounded).
+
+    ``flatten()`` walks the whole token tree so nested subqueries (WITH,
+    parenthesised SELECTs) are caught too. String literals containing
+    the word "SELECT" are tokenised as ``Token.Literal.String.Single``,
+    not ``Token.Keyword.DML``, so they cannot false-positive.
+    """
+    for tok in stmt.flatten():
+        if tok.ttype in T.Keyword.DML and tok.normalized.upper() == "SELECT":
+            return True
+    return False
+
+
 def _has_top_level_where(sql: str) -> bool:
     """Return True if a `Where` group exists at the top level of the statement.
 
@@ -344,12 +369,27 @@ def validate_query(sql: str, config: GuardrailConfig, read_only: bool) -> None:
 
     if stmt_type == "INSERT":
         row_count = _count_values_rows(cleaned)
-        if row_count is not None and row_count > config.max_insert_rows:
+        if row_count is not None:
+            if row_count > config.max_insert_rows:
+                raise QueryBlockedError(
+                    f"INSERT contains {row_count} rows, which exceeds the "
+                    f"maximum of {config.max_insert_rows} rows per statement. "
+                    f"Please split into smaller batches."
+                )
+        elif _stmt_has_select_source(stmt):
+            # `INSERT … SELECT` produces an unbounded number of rows from
+            # a subquery, so `max_insert_rows` (which counts VALUES tuples
+            # statically) can't enforce the cap. Reject on the write path;
+            # users can restructure to `INSERT … VALUES (…), (…)` or split
+            # into batches.
             raise QueryBlockedError(
-                f"INSERT contains {row_count} rows, which exceeds the "
-                f"maximum of {config.max_insert_rows} rows per statement. "
-                f"Please split into smaller batches."
+                "INSERT … SELECT is not allowed on the write tool "
+                "(YB_MCP_MAX_INSERT_ROWS only caps INSERT … VALUES). "
+                "Use INSERT … VALUES with an explicit row list, or split "
+                "the source query into batches."
             )
+        # `INSERT … DEFAULT VALUES` is a single-row insert with no VALUES
+        # tuple and no SELECT source — trivially within the cap, allow.
 
     if config.require_where_on_update and stmt_type == "UPDATE":
         if not _has_top_level_where(cleaned):
