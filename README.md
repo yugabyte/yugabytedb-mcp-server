@@ -161,14 +161,18 @@ The following statement classes are rejected before execution:
 
 - `DROP DATABASE/SCHEMA`, `ALTER DATABASE`, `CREATE DATABASE`
 - Role/privilege ops: `GRANT`, `REVOKE`, `CREATE/ALTER/DROP ROLE`, `CREATE/ALTER/DROP USER`
+- Stored code that can run under the owner (`SECURITY DEFINER`): `CREATE FUNCTION`, `CREATE PROCEDURE`, `ALTER FUNCTION`, `ALTER PROCEDURE`
 - Filesystem / code execution: `COPY TO/FROM`, `LOAD`, anonymous `DO $$ … $$`, `CREATE EXTENSION`
 - Server config: `ALTER SYSTEM`, `RESET ALL`
 - Dangerous built-ins: `pg_sleep`, `pg_read_file`, `pg_write_file`, `lo_import`, `lo_export`, `dblink`
 - Schema isolation: `SET search_path`, `CREATE SCHEMA`
 - Multi-statement queries (anything with a separator semicolon)
 - `psql` meta-commands (`\c`, `\d`, `\!`)
+- `INSERT … SELECT` (unbounded row source; `YB_MCP_MAX_INSERT_ROWS` only caps `INSERT … VALUES`)
 - INSERT … VALUES over `YB_MCP_MAX_INSERT_ROWS`
 - Optionally UPDATE / DELETE without a WHERE clause
+
+`CREATE TABLE … AS SELECT` and `SELECT … INTO` are structurally similar unbounded row copies but are intentionally **allowed** — they're the common way to materialize a snapshot from a query.
 
 This list is best-effort, not exhaustive. `destructiveHint: true` is the second line of defense.
 
