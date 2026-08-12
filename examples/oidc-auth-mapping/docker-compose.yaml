@@ -1,8 +1,6 @@
 # Local Keycloak instance for the identity-mapping tutorial.
 #
-# Sits ALONGSIDE examples/oidc-auth/ — different port (18081 vs 18080),
-# different realm (yb-mcp-map vs yb-mcp), so both examples can run at the
-# same time. This one demonstrates the v2 additions:
+# Demonstrates the OIDC identity-mapping additions:
 #
 #   * list-valued claim (realm_access.roles)
 #   * dotted-path claim extraction (realm_access.roles walks two levels)

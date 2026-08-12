@@ -1,18 +1,13 @@
 -- examples/oidc-auth-mapping/postgres-seed.sql
 --
--- Seed for the identity-mapping tutorial. Same two Postgres roles as the
--- companion examples/oidc-auth/ tutorial (writer / reader), but where THIS
--- tutorial differs is HOW the caller lands on them:
+-- Seed for the identity-mapping tutorial. Two Postgres roles (writer /
+-- reader) reached via the token's realm_access.roles list going through
+-- a pg_ident.conf-style identity map:
 --
---   * examples/oidc-auth/ — email → strip_domain → role
---       writer@yugabyte.com  → SET ROLE writer
---       reader@yugabyte.com  → SET ROLE reader
---
---   * this tutorial — realm_access.roles → identity map → role
---       token contains ["db-writer"]           → SET ROLE writer
---       token contains ["db-reader"]           → SET ROLE reader
---       token contains ["db-writer","db-reader"] + requested_role="writer"
---                                              → SET ROLE writer
+--   token contains ["db-writer"]           → SET ROLE writer
+--   token contains ["db-reader"]           → SET ROLE reader
+--   token contains ["db-writer","db-reader"] + requested_role="writer"
+--                                          → SET ROLE writer
 --
 -- Same enforcement, different plumbing. Run alongside the existing tutorial:
 -- these are Postgres roles, not Keycloak roles — one seed serves both.

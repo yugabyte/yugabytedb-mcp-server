@@ -118,7 +118,6 @@ class ServerConfig:
     auth_provider: str | None
     enable_write_query: bool
     identity_claim: str
-    identity_transform: str
     # PR #10 (OIDC v2) identity mapping
     identity_map_path: str | None
     identity_map_name: str
@@ -290,12 +289,11 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
     )
     if CONFIG.auth_provider:
         logger.info(
-            "Per-user SET ROLE enabled (claim=%s, transform=%s, map=%s). "
+            "Per-user SET ROLE enabled (claim=%s, map=%s). "
             "The pool user must have GRANT to the target roles it needs to "
             "SET ROLE to; superuser works but is not required if an identity "
             "map is set.",
             CONFIG.identity_claim,
-            CONFIG.identity_transform,
             CONFIG.identity_map_path or "<none>",
         )
         # Fail-closed at startup for the "list-valued claim + no map" combo.
@@ -337,7 +335,6 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
             "pool": pool,
             "guardrail_config": guardrail_config,
             "identity_claim": CONFIG.identity_claim,
-            "identity_transform": CONFIG.identity_transform,
             "identity_map": identity_map,
             "identity_map_name": CONFIG.identity_map_name,
             # DB-22159 resource limits — read by tools.py at each call.
@@ -440,19 +437,36 @@ def parse_config() -> ServerConfig:
         default=os.environ.get("MCP_AUTH_PROVIDER"),
         help="Auth provider for the MCP server: 'cognito' or 'oidc'. Leave unset to disable auth (env: MCP_AUTH_PROVIDER)",
     )
+    # DB-22174: strip_domain has been removed. If an existing deployment
+    # still has YB_MCP_IDENTITY_TRANSFORM set (to strip_domain or
+    # anything else), fail startup with a clear migration message rather
+    # than silently ignoring the config.
+    _removed_transform = os.environ.get("YB_MCP_IDENTITY_TRANSFORM")
+    if _removed_transform:
+        raise SystemExit(
+            "YB_MCP_IDENTITY_TRANSFORM has been removed. The only prior "
+            "value, `strip_domain`, silently collapsed users from "
+            f"different email domains (got {_removed_transform!r}). Migrate "
+            "to YB_MCP_IDENTITY_MAP with a pg_ident.conf-style file — see "
+            "OIDC.md."
+        )
+
+    # DB-22136 (paired with the token_use enforcement flip in auth.py): the
+    # default identity_claim switches to ``sub`` in secure mode because
+    # ``email`` is not present in Cognito access tokens. Legacy operators
+    # who still expect ``email`` (and therefore an id token) opt in via
+    # ``YB_MCP_LEGACY_ACCEPT_ID_TOKENS=true``, which also flips the
+    # ``require_access_token`` default back to False.
+    _legacy_auth = os.environ.get(
+        "YB_MCP_LEGACY_ACCEPT_ID_TOKENS", ""
+    ).lower() == "true"
+    _default_identity_claim = "email" if _legacy_auth else "sub"
     parser.add_argument(
         "--identity-claim",
-        default=os.environ.get("YB_MCP_IDENTITY_CLAIM", "email"),
-        help="JWT claim to use as the DB role identifier (env: YB_MCP_IDENTITY_CLAIM, default: email)",
-    )
-    parser.add_argument(
-        "--identity-transform",
-        default=os.environ.get("YB_MCP_IDENTITY_TRANSFORM", "none"),
-        choices=["none", "strip_domain"],
-        help="Transform applied to the identity claim before using as DB role: "
-             "'none' (use as-is) or 'strip_domain' (strip @... from email). "
-             "Only applies when no identity map file is configured; the map "
-             "path replaces this. (env: YB_MCP_IDENTITY_TRANSFORM, default: none)",
+        default=os.environ.get("YB_MCP_IDENTITY_CLAIM", _default_identity_claim),
+        help="JWT claim to use as the DB role identifier "
+             "(env: YB_MCP_IDENTITY_CLAIM, default: 'sub' — or 'email' if "
+             "YB_MCP_LEGACY_ACCEPT_ID_TOKENS=true).",
     )
     parser.add_argument(
         "--identity-map",
@@ -546,7 +560,6 @@ def parse_config() -> ServerConfig:
         auth_provider=args.mcp_auth_provider,
         enable_write_query=args.enable_write_query,
         identity_claim=args.identity_claim,
-        identity_transform=args.identity_transform,
         identity_map_path=args.identity_map,
         identity_map_name=args.identity_map_name,
         pool_min_size=args.pool_min_size,

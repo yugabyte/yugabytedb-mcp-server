@@ -4,13 +4,12 @@ No database or MCP session required — these test the pure extraction,
 transform, and mapping functions in tools.py.
 
 Layout:
-- TestApplyTransform / TestGetDbRole — v1 backward-compat harness (must
-  stay green when v2 features are unset).
-- TestExtractClaim — v2 dotted-path claim extraction.
-- TestMapFileParser — v2 pg_ident.conf-style map file parsing.
-- TestApplyMap — v2 map-entry matching (literal + regex + capture).
-- TestPickRole — v2 list-claim role selection 
-- TestGetDbRoleV2 — end-to-end v2 wiring on `_get_db_role`.
+- TestGetDbRole — no-map path harness.
+- TestExtractClaim — dotted-path claim extraction.
+- TestMapFileParser — pg_ident.conf-style map file parsing.
+- TestApplyMap — map-entry matching (literal + regex + capture).
+- TestPickRole — list-claim role selection.
+- TestGetDbRoleV2 — end-to-end map wiring on `_get_db_role`.
 - TestFailClosed — malformed/missing map files at load time.
 - TestSecurityInvariants — role-name Identifier quoting, empty-list handling.
 """
@@ -23,7 +22,6 @@ from yugabytedb_mcp_server.tools import (
     IdentityError,
     MapEntry,
     _apply_map,
-    _apply_transform,
     _extract_claim,
     _get_db_role,
     _load_identity_map,
@@ -32,46 +30,23 @@ from yugabytedb_mcp_server.tools import (
 
 
 # ---------------------------------------------------------------------------
-# _apply_transform — v1 backward-compat helper
-# ---------------------------------------------------------------------------
-
-class TestApplyTransform:
-    def test_none_passthrough(self):
-        assert _apply_transform("alice@example.com", "none") == "alice@example.com"
-
-    def test_strip_domain(self):
-        assert _apply_transform("alice@example.com", "strip_domain") == "alice"
-
-    def test_strip_domain_no_at_sign(self):
-        assert _apply_transform("alice", "strip_domain") == "alice"
-
-    def test_strip_domain_multiple_at_signs(self):
-        assert _apply_transform("user@sub@example.com", "strip_domain") == "user"
-
-    def test_unknown_transform_passes_through(self):
-        assert _apply_transform("alice@example.com", "unknown") == "alice@example.com"
-
-
-# ---------------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------------
 
 def _make_ctx(
     identity_claim="email",
-    identity_transform="none",
     identity_map=None,
     identity_map_name="default",
 ):
     """Create a minimal mock Context with lifespan_context.
 
-    Passing ``identity_map=None`` (default) selects the v1 backward-compat
-    path via ``_apply_transform``; passing a list of ``MapEntry`` selects the
-    v2 map-lookup path.
+    Passing ``identity_map=None`` (default) selects the no-map path
+    where the raw claim value is used verbatim as the DB role name;
+    passing a list of ``MapEntry`` selects the map-lookup path.
     """
     ctx = MagicMock()
     ctx.request_context.lifespan_context = {
         "identity_claim": identity_claim,
-        "identity_transform": identity_transform,
         "identity_map": identity_map,
         "identity_map_name": identity_map_name,
     }
@@ -91,27 +66,23 @@ def _make_access_token(claims: dict):
 
 class TestGetDbRole:
     @patch("yugabytedb_mcp_server.tools.get_access_token")
-    def test_email_claim_no_transform(self, mock_get_token):
+    def test_email_claim_verbatim(self, mock_get_token):
+        """Scalar claim without a map: value is used verbatim as the DB
+        role name."""
         mock_get_token.return_value = _make_access_token({"email": "alice@example.com"})
-        ctx = _make_ctx(identity_claim="email", identity_transform="none")
+        ctx = _make_ctx(identity_claim="email")
         assert _get_db_role(ctx) == "alice@example.com"
-
-    @patch("yugabytedb_mcp_server.tools.get_access_token")
-    def test_email_claim_strip_domain(self, mock_get_token):
-        mock_get_token.return_value = _make_access_token({"email": "alice@example.com"})
-        ctx = _make_ctx(identity_claim="email", identity_transform="strip_domain")
-        assert _get_db_role(ctx) == "alice"
 
     @patch("yugabytedb_mcp_server.tools.get_access_token")
     def test_sub_claim(self, mock_get_token):
         mock_get_token.return_value = _make_access_token({"sub": "user-uuid-123"})
-        ctx = _make_ctx(identity_claim="sub", identity_transform="none")
+        ctx = _make_ctx(identity_claim="sub")
         assert _get_db_role(ctx) == "user-uuid-123"
 
     @patch("yugabytedb_mcp_server.tools.get_access_token")
     def test_preferred_username_claim(self, mock_get_token):
         mock_get_token.return_value = _make_access_token({"preferred_username": "bob"})
-        ctx = _make_ctx(identity_claim="preferred_username", identity_transform="none")
+        ctx = _make_ctx(identity_claim="preferred_username")
         assert _get_db_role(ctx) == "bob"
 
     @patch("yugabytedb_mcp_server.tools.get_access_token")
@@ -125,7 +96,7 @@ class TestGetDbRole:
         """When a token is present but the required claim is missing, raise
         IdentityError rather than falling back to pool credentials."""
         mock_get_token.return_value = _make_access_token({"sub": "123"})
-        ctx = _make_ctx(identity_claim="email", identity_transform="none")
+        ctx = _make_ctx(identity_claim="email")
         with pytest.raises(IdentityError, match="email"):
             _get_db_role(ctx)
 
@@ -491,11 +462,19 @@ class TestGetDbRoleV2:
 
     @patch("yugabytedb_mcp_server.tools.get_access_token")
     def test_cognito_access_token_groups_flow(self, mock_get_token):
-        """Realistic Cognito access-token workflow — DB-22192 unblocked."""
+        """Realistic Cognito access-token workflow — DB-22192 unblocked.
+        DB-22135: a list claim requires a map (identity → PG-role allowlist)."""
         mock_get_token.return_value = _make_access_token(
             {"sub": "abc", "cognito:groups": ["writer", "reader"]}
         )
-        ctx = _make_ctx(identity_claim="cognito:groups", identity_map=None)
+        entries = [
+            _literal("default", "writer", "writer"),
+            _literal("default", "reader", "reader"),
+        ]
+        ctx = _make_ctx(
+            identity_claim="cognito:groups", identity_map=_as_map(entries),
+            identity_map_name="default",
+        )
         assert _get_db_role(ctx, requested_role="reader") == "reader"
 
     @patch("yugabytedb_mcp_server.tools.get_access_token")
@@ -507,7 +486,14 @@ class TestGetDbRoleV2:
         mock_get_token.return_value = _make_access_token(
             {"cognito:groups": ["writer", "reader"]}
         )
-        ctx = _make_ctx(identity_claim="cognito:groups", identity_map=None)
+        entries = [
+            _literal("default", "writer", "writer"),
+            _literal("default", "reader", "reader"),
+        ]
+        ctx = _make_ctx(
+            identity_claim="cognito:groups", identity_map=_as_map(entries),
+            identity_map_name="default",
+        )
         with pytest.raises(IdentityError, match="multiple roles"):
             _get_db_role(ctx)
 
@@ -516,9 +502,51 @@ class TestGetDbRoleV2:
         mock_get_token.return_value = _make_access_token(
             {"cognito:groups": ["writer", "reader"]}
         )
-        ctx = _make_ctx(identity_claim="cognito:groups", identity_map=None)
+        entries = [
+            _literal("default", "writer", "writer"),
+            _literal("default", "reader", "reader"),
+        ]
+        ctx = _make_ctx(
+            identity_claim="cognito:groups", identity_map=_as_map(entries),
+            identity_map_name="default",
+        )
         with pytest.raises(IdentityError):
             _get_db_role(ctx, requested_role="admin")
+
+    # DB-22135: request-time fail-closed guard on list-claim + no-map.
+    # The startup guard only sees the claim NAME and misses list claims
+    # served under names it doesn't recognize (`roles`, `entitlements`,
+    # custom scopes). This request-time check sees the value shape.
+
+    @patch("yugabytedb_mcp_server.tools.get_access_token")
+    def test_list_claim_without_map_rejected_arbitrary_name(self, mock_get_token):
+        """A list-valued claim under an unrecognized name (`roles` here)
+        + no map file → IdentityError, not silent SET ROLE with raw group
+        names."""
+        mock_get_token.return_value = _make_access_token(
+            {"roles": ["dbadmin", "reader"]}
+        )
+        ctx = _make_ctx(identity_claim="roles", identity_map=None)
+        with pytest.raises(IdentityError, match="YB_MCP_IDENTITY_MAP is unset"):
+            _get_db_role(ctx)
+
+    @patch("yugabytedb_mcp_server.tools.get_access_token")
+    def test_list_claim_without_map_rejected_entitlements(self, mock_get_token):
+        """Another arbitrary name the startup guard doesn't hardcode."""
+        mock_get_token.return_value = _make_access_token(
+            {"entitlements": ["reader"]}
+        )
+        ctx = _make_ctx(identity_claim="entitlements", identity_map=None)
+        with pytest.raises(IdentityError, match="YB_MCP_IDENTITY_MAP is unset"):
+            _get_db_role(ctx)
+
+    @patch("yugabytedb_mcp_server.tools.get_access_token")
+    def test_scalar_claim_without_map_still_allowed(self, mock_get_token):
+        """Regression: a scalar claim without a map continues to work.
+        Only list claims trigger the new fail-closed check."""
+        mock_get_token.return_value = _make_access_token({"sub": "alice"})
+        ctx = _make_ctx(identity_claim="sub", identity_map=None)
+        assert _get_db_role(ctx) == "alice"
 
     @patch("yugabytedb_mcp_server.tools.get_access_token")
     def test_keycloak_realm_roles_flow(self, mock_get_token):

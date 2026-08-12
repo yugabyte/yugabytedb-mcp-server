@@ -70,18 +70,6 @@ def _execute(cur, query, params: tuple | None = None) -> None:
         cur.execute(query)
 
 
-def _apply_transform(value: str, transform: str) -> str:
-    """Apply a named transform to a claim value to derive a DB role name.
-
-    Backward-compat helper used by the no-map path (when
-    ``YB_MCP_IDENTITY_MAP`` is unset). The map-file path replaces this with
-    an explicit map lookup — see ``_apply_map`` and ``_load_identity_map``.
-    """
-    if transform == "strip_domain":
-        return value.split("@", 1)[0]
-    return value
-
-
 class IdentityError(Exception):
     """Raised when an authenticated token lacks the required identity claim."""
 
@@ -99,8 +87,9 @@ class IdentityError(Exception):
 #   via the tool's `requested_role` parameter; server clamps against the
 #   JWT's list.
 # - `YB_MCP_IDENTITY_MAP` points at a `pg_ident.conf`-style file with
-#   literal or regex entries. When configured, replaces the legacy
-#   `_apply_transform` path.
+#   literal or regex entries. When configured, each token claim value is
+#   looked up in the map to derive the DB role. Without a map, the raw
+#   claim value is used as the role name directly.
 # ---------------------------------------------------------------------------
 
 
@@ -355,7 +344,7 @@ def _get_db_role(ctx: Context, requested_role: Optional[str] = None) -> Optional
       against the JWT's list.
     - When ``YB_MCP_IDENTITY_MAP`` is configured, the resolved claim value(s)
       go through ``_apply_map`` (pg_ident.conf-style lookup). Otherwise the
-      legacy ``_apply_transform`` path runs (v1 backward-compat).
+      raw claim value is used verbatim as the DB role name.
 
     Raises ``IdentityError`` when a token IS present but the claim resolves
     to nothing — falling back to pool credentials would be a privilege
@@ -370,8 +359,7 @@ def _get_db_role(ctx: Context, requested_role: Optional[str] = None) -> Optional
         return None
 
     lifespan = ctx.request_context.lifespan_context
-    claim_name = lifespan.get("identity_claim", "email")
-    transform = lifespan.get("identity_transform", "none")
+    claim_name = lifespan.get("identity_claim", "sub")
     identity_map: Optional[Dict[str, List[MapEntry]]] = lifespan.get("identity_map")
     identity_map_name: str = lifespan.get("identity_map_name", "default")
 
@@ -394,6 +382,23 @@ def _get_db_role(ctx: Context, requested_role: Optional[str] = None) -> Optional
         raw_values = [str(v) for v in claim_value if v]
         if not raw_values:
             raise IdentityError(_missing_msg)
+        # DB-22135 fail-closed at request time: a list claim without a
+        # map file means every group name the IdP hands out would be a
+        # candidate SET ROLE target — no allowlist. The startup guard
+        # can only see the claim NAME, so it misses list claims served
+        # under unrecognized names (`roles`, `entitlements`, custom
+        # scopes). Catch them here where the actual value type is known.
+        if identity_map is None:
+            raise IdentityError(
+                f"Claim {claim_name!r} resolved to a list of "
+                f"{len(raw_values)} value(s), but YB_MCP_IDENTITY_MAP is "
+                f"unset. A list claim without a map has no allowlist — "
+                f"every group name would be a candidate SET ROLE target. "
+                f"Configure YB_MCP_IDENTITY_MAP to translate IdP group "
+                f"names to a fixed PG role set, or switch "
+                f"YB_MCP_IDENTITY_CLAIM to a scalar claim like `sub` or "
+                f"`email`."
+            )
     else:
         if not claim_value:
             raise IdentityError(_missing_msg)
@@ -401,7 +406,7 @@ def _get_db_role(ctx: Context, requested_role: Optional[str] = None) -> Optional
 
     # 3. Resolve each raw value to a candidate role.
     #    - With a map: apply pg_ident-style lookup; drop unmapped values.
-    #    - Without a map (v1 backward-compat): apply transform to each.
+    #    - Without a map: use the claim value verbatim as the DB role name.
     if identity_map is not None:
         candidates: List[str] = []
         for v in raw_values:
@@ -409,7 +414,7 @@ def _get_db_role(ctx: Context, requested_role: Optional[str] = None) -> Optional
             if mapped is not None:
                 candidates.append(mapped)
     else:
-        candidates = [_apply_transform(v, transform) for v in raw_values]
+        candidates = list(raw_values)
 
     # 4. Pick one role.
     role = _pick_role(candidates, requested_role)

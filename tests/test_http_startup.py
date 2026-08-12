@@ -42,7 +42,6 @@ _BASE_CONFIG = ServerConfig(
     auth_provider=None,
     enable_write_query=False,
     identity_claim="email",
-    identity_transform="none",
     identity_map_path=None,
     identity_map_name="mcp",
     pool_min_size=1,

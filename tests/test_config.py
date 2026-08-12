@@ -136,32 +136,27 @@ class TestHttpBindConfig:
         assert cfg.port == 65535
 
 
-class TestResourceLimitEnvParsing:
-    """Env-var overrides populate ServerConfig correctly."""
+class TestIdentityTransformRemoved:
+    """DB-22174: YB_MCP_IDENTITY_TRANSFORM has been removed. The only prior
+    value, strip_domain, silently collapsed users across domains, so we
+    fail startup rather than silently ignoring the env."""
 
-    def test_pool_sizes_from_env(self):
-        cfg = _parse_with_env({
-            "YB_MCP_POOL_MIN_SIZE": "2",
-            "YB_MCP_POOL_MAX_SIZE": "20",
-        })
-        assert cfg.pool_min_size == 2
-        assert cfg.pool_max_size == 20
+    def test_env_still_set_fails_startup(self):
+        with pytest.raises(SystemExit, match="YB_MCP_IDENTITY_TRANSFORM has been removed"):
+            _parse_with_env({"YB_MCP_IDENTITY_TRANSFORM": "strip_domain"})
 
-    def test_statement_timeout_from_env(self):
-        cfg = _parse_with_env({"YB_MCP_STATEMENT_TIMEOUT_MS": "5000"})
-        assert cfg.statement_timeout_ms == 5_000
+    def test_none_also_rejected(self):
+        """We can't tell whether an explicit ``none`` is a copy-paste from
+        old docs or a deliberate opt-in, and there's no valid value now —
+        fail on any setting so the operator sees the migration message."""
+        with pytest.raises(SystemExit, match="YB_MCP_IDENTITY_TRANSFORM has been removed"):
+            _parse_with_env({"YB_MCP_IDENTITY_TRANSFORM": "none"})
 
-    def test_max_result_rows_from_env(self):
-        cfg = _parse_with_env({"YB_MCP_MAX_RESULT_ROWS": "500"})
-        assert cfg.max_result_rows == 500
-
-    def test_max_query_len_from_env(self):
-        cfg = _parse_with_env({"YB_MCP_MAX_QUERY_LEN": "1000"})
-        assert cfg.max_query_len == 1_000
-
-    def test_max_result_bytes_from_env(self):
-        cfg = _parse_with_env({"YB_MCP_MAX_RESULT_BYTES": "1048576"})
-        assert cfg.max_result_bytes == 1_048_576
+    def test_unset_starts_normally(self):
+        cfg = _parse_with_env({})
+        # Nothing to assert about the transform — the field is gone. This
+        # test just verifies no startup error when the env is not set.
+        assert cfg.identity_claim == "sub"
 
 
 class TestPoolSizingValidation:
@@ -247,6 +242,34 @@ class TestConnectTimeoutAppend:
         assert self._append("postgres://yb@localhost/db") == (
             "postgres://yb@localhost/db?connect_timeout=10"
         )
+
+
+class TestResourceLimitEnvParsing:
+    """Env-var overrides populate ServerConfig correctly."""
+
+    def test_pool_sizes_from_env(self):
+        cfg = _parse_with_env({
+            "YB_MCP_POOL_MIN_SIZE": "2",
+            "YB_MCP_POOL_MAX_SIZE": "20",
+        })
+        assert cfg.pool_min_size == 2
+        assert cfg.pool_max_size == 20
+
+    def test_statement_timeout_from_env(self):
+        cfg = _parse_with_env({"YB_MCP_STATEMENT_TIMEOUT_MS": "5000"})
+        assert cfg.statement_timeout_ms == 5_000
+
+    def test_max_result_rows_from_env(self):
+        cfg = _parse_with_env({"YB_MCP_MAX_RESULT_ROWS": "500"})
+        assert cfg.max_result_rows == 500
+
+    def test_max_query_len_from_env(self):
+        cfg = _parse_with_env({"YB_MCP_MAX_QUERY_LEN": "1000"})
+        assert cfg.max_query_len == 1_000
+
+    def test_max_result_bytes_from_env(self):
+        cfg = _parse_with_env({"YB_MCP_MAX_RESULT_BYTES": "1048576"})
+        assert cfg.max_result_bytes == 1_048_576
 
 
 class TestResourceLimitEnvValidation:

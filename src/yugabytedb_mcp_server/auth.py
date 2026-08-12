@@ -232,7 +232,17 @@ def _create_cognito():
     if getattr(proxy, "_cimd_manager", None) is not None:
         proxy._cimd_manager.default_scope = scopes
 
-    require_access_token = _env_bool("YB_MCP_REQUIRE_ACCESS_TOKEN", default=False)
+    # DB-22136: reject ID tokens by default. Old behavior was
+    # ``require_access_token=false``, which let an ID token authenticate
+    # ``/mcp`` (with a warning) — Vishal's re-verification flagged this
+    # as still-live even after the audience fix. Compatibility escape
+    # hatch: set ``YB_MCP_LEGACY_ACCEPT_ID_TOKENS=true`` to restore the
+    # old default. ``YB_MCP_REQUIRE_ACCESS_TOKEN`` still works as an
+    # explicit override.
+    _legacy = _env_bool("YB_MCP_LEGACY_ACCEPT_ID_TOKENS", default=False)
+    require_access_token = _env_bool(
+        "YB_MCP_REQUIRE_ACCESS_TOKEN", default=(not _legacy)
+    )
     raw_jwt_verifier = _CognitoJWTVerifier(
         require_access_token=require_access_token,
         # DB-22136: block tokens minted for other app clients in the same

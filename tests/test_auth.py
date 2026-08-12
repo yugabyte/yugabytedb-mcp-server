@@ -348,6 +348,89 @@ async def test_id_token_accepted_when_require_access_off(rsa_keypair, caplog):
 
 
 @pytest.mark.asyncio
+async def test_id_token_rejected_by_default(rsa_keypair, caplog):
+    """DB-22136 (Vishal round-2 reopen): the new default rejects ID tokens
+    without any opt-in. Verified by not touching any of the token_use env
+    vars — default of ``YB_MCP_REQUIRE_ACCESS_TOKEN`` is now True."""
+    # Explicitly remove any env leakage from other tests that might have
+    # set the toggle in the shared os.environ.
+    clean_env = {**COGNITO_ENV}
+    with patch.dict("os.environ", clean_env, clear=True), \
+         patch("httpx.get", side_effect=_mock_httpx_get):
+        provider = _create_cognito()
+
+    verifier = provider.verifiers[0]
+    assert verifier._require_access_token is True, (
+        "default should reject ID tokens (was False before DB-22136 round 2)"
+    )
+    verifier._public_key = rsa_keypair["public_pem"].decode()
+    verifier.public_key = rsa_keypair["public_pem"].decode()
+    verifier.algorithm = "RS256"
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    id_token_claims = {
+        "iss": FAKE_ISSUER,
+        "sub": "user",
+        "aud": COGNITO_ENV["COGNITO_CLIENT_ID"],
+        "token_use": "id",
+        "email": "alice@example.com",
+        "exp": now + datetime.timedelta(minutes=5),
+        "iat": now,
+    }
+    token = _sign_jwt(id_token_claims, rsa_keypair["private_pem"])
+    with caplog.at_level("WARNING"):
+        result = await verifier.verify_token(token)
+    assert result is None, "default config should reject ID token"
+
+
+@pytest.mark.asyncio
+async def test_id_token_accepted_when_legacy_flag_set(rsa_keypair, caplog):
+    """DB-22136 compat flag: ``YB_MCP_LEGACY_ACCEPT_ID_TOKENS=true`` restores
+    the old behavior (accept ID tokens with a warning)."""
+    env = {**COGNITO_ENV, "YB_MCP_LEGACY_ACCEPT_ID_TOKENS": "true"}
+    with patch.dict("os.environ", env, clear=True), \
+         patch("httpx.get", side_effect=_mock_httpx_get):
+        provider = _create_cognito()
+
+    verifier = provider.verifiers[0]
+    assert verifier._require_access_token is False, (
+        "legacy flag should flip require_access_token back to False"
+    )
+    verifier._public_key = rsa_keypair["public_pem"].decode()
+    verifier.public_key = rsa_keypair["public_pem"].decode()
+    verifier.algorithm = "RS256"
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    id_token_claims = {
+        "iss": FAKE_ISSUER,
+        "sub": "user",
+        "aud": COGNITO_ENV["COGNITO_CLIENT_ID"],
+        "token_use": "id",
+        "email": "alice@example.com",
+        "exp": now + datetime.timedelta(minutes=5),
+        "iat": now,
+    }
+    token = _sign_jwt(id_token_claims, rsa_keypair["private_pem"])
+    with caplog.at_level("WARNING"):
+        result = await verifier.verify_token(token)
+    assert result is not None, "legacy flag should accept ID tokens"
+
+
+@pytest.mark.asyncio
+async def test_explicit_require_access_false_overrides_legacy_default(rsa_keypair):
+    """DB-22136: an explicit ``YB_MCP_REQUIRE_ACCESS_TOKEN=false`` continues
+    to opt in to ID tokens even without the compat flag — the explicit
+    value wins over the new default."""
+    env = {**COGNITO_ENV, "YB_MCP_REQUIRE_ACCESS_TOKEN": "false"}
+    with patch.dict("os.environ", env, clear=True), \
+         patch("httpx.get", side_effect=_mock_httpx_get):
+        provider = _create_cognito()
+
+    verifier = provider.verifiers[0]
+    assert verifier._require_access_token is False
+
+
+@pytest.mark.asyncio
 async def test_id_token_rejected_when_require_access_on(rsa_keypair, caplog):
     """`YB_MCP_REQUIRE_ACCESS_TOKEN=true` rejects ID tokens outright."""
     with patch.dict("os.environ", {**COGNITO_ENV, "YB_MCP_REQUIRE_ACCESS_TOKEN": "true"}), \

@@ -25,12 +25,27 @@ _(No unreleased changes.)_
   the operator's `YUGABYTEDB_URL` doesn't set one, so a network
   partition to the DB doesn't hang startup or pool checkouts
   indefinitely. (DB-22159 round 2.)
+- **`YB_MCP_LEGACY_ACCEPT_ID_TOKENS` compat flag.** Restores
+  pre-DB-22136 auth defaults (`YB_MCP_REQUIRE_ACCESS_TOKEN=false`,
+  `YB_MCP_IDENTITY_CLAIM=email`) in one env var. (DB-22136 round 2.)
 
 ### Changed
 
+- **BREAKING: default `YB_MCP_IDENTITY_CLAIM` is now `sub`.**
+  Previously `email`, which is absent from Cognito access tokens. Set
+  `YB_MCP_LEGACY_ACCEPT_ID_TOKENS=true` to keep the old default.
+  (DB-22136 round 2.)
+- **BREAKING: `YB_MCP_REQUIRE_ACCESS_TOKEN` now defaults to `true`.**
+  ID tokens are rejected on `/mcp` by default; the compat flag above
+  reverts. (DB-22136 round 2.)
+- **All INSERT shapes now bounded by `SET LOCAL statement_timeout`**
+  (`YB_MCP_STATEMENT_TIMEOUT_MS`) instead of a static row cap. Every
+  write — INSERT VALUES, INSERT SELECT, INSERT DEFAULT VALUES, UPDATE,
+  DELETE, DDL — runs under the timeout unconditionally, so a runaway
+  statement is killed by the DB. (DB-22131 round 2.)
 - **Pool sizing is validated at startup** — `pool_min_size >
-  pool_max_size` raises a clean `ValueError` before `pool.open`.
-  (DB-22159 round 2.)
+  pool_max_size` raises a clean error before `pool.open`. (DB-22159
+  round 2.)
 - **`summarize_database` now runs under `SET LOCAL statement_timeout`**,
   matching the read / write tools. A slow `COUNT(*)` no longer
   holds a pool connection indefinitely. (DB-22159 round 2.)
@@ -39,16 +54,15 @@ _(No unreleased changes.)_
   error, matching the auth-off + non-loopback guard. Same escape
   hatch: `MCP_ALLOW_UNAUTHENTICATED=true`. (DB-22139 round 2.)
 
-### Changed
-
-- **All INSERT shapes now bounded by `SET LOCAL statement_timeout`**
-  (`YB_MCP_STATEMENT_TIMEOUT_MS`) instead of a static row cap. Every
-  write — INSERT VALUES, INSERT SELECT, INSERT DEFAULT VALUES, UPDATE,
-  DELETE, DDL — runs under the timeout unconditionally, so a runaway
-  statement is killed by the DB. (DB-22131 round 2.)
-
 ### Removed
 
+- **BREAKING: `YB_MCP_IDENTITY_TRANSFORM` removed.** Its only value
+  (`strip_domain`) silently collapsed users across email domains
+  (`alice@a.com` and `alice@b.com` both → role `alice`). Startup
+  now fails if the env var is set, with a message pointing at
+  `YB_MCP_IDENTITY_MAP`. The `strip_domain`-based tutorial
+  (`examples/oidc-auth/`) is removed; use `examples/oidc-auth-mapping/`.
+  (DB-22174 round 2.)
 - **`YB_MCP_MAX_INSERT_ROWS` removed.** The static row cap was
   redundant now that every write goes through `SET LOCAL
   statement_timeout`. Setting the env var is a non-fatal warning at
@@ -61,20 +75,23 @@ _(No unreleased changes.)_
   keyword-pair matcher on `('CREATE', 'FUNCTION')` couldn't see the
   `OR REPLACE` form because sqlparse tokenizes it as one keyword;
   a dedicated scanner now catches the shape. `SECURITY DEFINER`
-  variants are covered. `INSERT ... SELECT`, `CREATE TABLE ... AS
-  SELECT`, and `SELECT ... INTO` are allowed — their runtime is
-  bounded by `SET LOCAL statement_timeout`.
+  variants are covered.
+- **DB-22135 round 2: fail-closed on list-shaped claims at request
+  time.** The startup guard only caught known list-claim names
+  (`cognito:groups`, `realm_access.roles`, `groups`, dotted paths).
+  A request-time check now fires whenever the claim actually
+  resolves to a list AND no `YB_MCP_IDENTITY_MAP` is configured —
+  independent of the claim's name.
 
 ### Added
 
 - **OIDC v2 identity mapping + JWT audience validation (#10).** Maps
   OIDC access-token claims to PostgreSQL roles via a `pg_ident.conf`-style
   identity map. New env vars: `YB_MCP_IDENTITY_CLAIM`,
-  `YB_MCP_IDENTITY_TRANSFORM`, `YB_MCP_IDENTITY_MAP`,
-  `YB_MCP_IDENTITY_MAP_NAME`. `SET ROLE` is issued on each connection
-  checkout using the mapped role, and connections are returned to the
-  pool via `RESET ROLE` + `DISCARD ALL`. JWT audience is validated
-  against the configured resource server.
+  `YB_MCP_IDENTITY_MAP`, `YB_MCP_IDENTITY_MAP_NAME`. `SET ROLE` is
+  issued on each connection checkout using the mapped role, and
+  connections are returned to the pool via `RESET ROLE` + `DISCARD ALL`.
+  JWT audience is validated against the configured resource server.
 - **Keycloak OIDC → Postgres role mapping tutorial (#8).** New example
   under `examples/oidc-auth-mapping/keycloak/` — realm export, docker
   compose, and step-by-step README covering end-to-end auth to YugabyteDB.
@@ -104,23 +121,15 @@ _(No unreleased changes.)_
   - Multi-statement input is rejected on both tools.
   - Optional `WHERE`-clause requirement on `UPDATE`/`DELETE` via
     `YB_MCP_REQUIRE_WHERE_ON_UPDATE` / `..._ON_DELETE`.
-  - `YB_MCP_MAX_INSERT_ROWS` caps `INSERT ... VALUES` row counts on the
-    write tool.
   - Statement timeout applied to reads to bound expensive queries.
-- **Write-tool guardrail: reject additional unbounded write shapes.**
-  `YB_MCP_MAX_INSERT_ROWS` only caps `INSERT ... VALUES`. The following
-  shapes bypassed the cap and are now rejected outright on the write
-  path:
-  - `INSERT ... SELECT ...` (unbounded row copy).
-  - `CREATE FUNCTION`, `CREATE PROCEDURE`, `ALTER FUNCTION`, `ALTER PROCEDURE`
-    (can execute arbitrary PL code and, with `SECURITY DEFINER`, run as the
-    function owner).
-
-  Safe shapes are unaffected: `INSERT ... VALUES (...)` (subject to
-  `YB_MCP_MAX_INSERT_ROWS`) and `INSERT ... DEFAULT VALUES` continue to
-  work, as do `CREATE TABLE ... AS SELECT` and `SELECT ... INTO` (also
-  unbounded copies, but left allowed for their common
-  materialize-a-snapshot use case).
+- **Write-tool guardrail: block `CREATE FUNCTION` / `CREATE PROCEDURE`
+  (and `ALTER FUNCTION` / `ALTER PROCEDURE`).** These can execute
+  arbitrary PL code and, with `SECURITY DEFINER`, run as the
+  function owner. Both the plain and `CREATE OR REPLACE` forms are
+  caught (the latter is tokenized as one keyword by sqlparse and
+  needs a dedicated scanner). `INSERT ... SELECT`, `CREATE TABLE ...
+  AS SELECT`, and `SELECT ... INTO` are allowed — their runtime is
+  bounded by `SET LOCAL statement_timeout`.
 
 ## [2.0.0rc2] - 2026-05-25
 
