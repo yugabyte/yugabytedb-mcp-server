@@ -25,14 +25,17 @@ Blocklists:
 
 Write-only shape checks (skipped when `read_only=True`):
 
-- INSERT row-count limit: counts ``Parenthesis`` children of the top-level
-  ``Values`` group, not raw ``(`` occurrences, so a ``)(`` inside a string
-  literal cannot inflate the count.
 - ``require_where_on_update`` / ``require_where_on_delete``: checks for a
   ``Where`` group at the top level of the parsed statement, so a WHERE
   inside a subquery or inside a string literal does not satisfy the check.
   Uses ``stmt.get_type()`` so ``WITH x AS (…) UPDATE …`` is still
   recognized as an UPDATE.
+
+INSERT row-count limits used to live here (`YB_MCP_MAX_INSERT_ROWS`).
+They were retired in DB-22131 round 2: every write goes through
+`SET LOCAL statement_timeout` in `run_write_query` before executing, so a
+runaway INSERT — VALUES or SELECT or any other shape — is bounded by the
+timeout. A static row cap on top of the timeout is redundant.
 """
 
 import logging
@@ -40,7 +43,7 @@ from dataclasses import dataclass
 
 import sqlparse
 from sqlparse import tokens as T
-from sqlparse.sql import Parenthesis, Statement, Values, Where
+from sqlparse.sql import Statement, Where
 
 logger = logging.getLogger("yugabytedb-mcp.guardrails")
 
@@ -52,7 +55,6 @@ class QueryBlockedError(Exception):
 
 @dataclass
 class GuardrailConfig:
-    max_insert_rows: int = 1000
     require_where_on_update: bool = False
     require_where_on_delete: bool = False
 
@@ -80,13 +82,9 @@ _BLOCKED_KEYWORD_PAIRS: dict[tuple[str, str], str] = {
     ("ALTER", "SYSTEM"): "ALTER SYSTEM is not allowed",
     ("RESET", "ALL"): "RESET ALL is not allowed",
     ("CREATE", "SCHEMA"): "CREATE SCHEMA is not allowed",
-    # DB-22131 remainder: CREATE FUNCTION / PROCEDURE can run arbitrary
-    # PL code and, with SECURITY DEFINER, escalate to the owner's role.
-    # No legitimate MCP-tool use case; block outright on the write path.
-    ("CREATE", "FUNCTION"): "CREATE FUNCTION is not allowed",
-    ("CREATE", "PROCEDURE"): "CREATE PROCEDURE is not allowed",
-    ("ALTER", "FUNCTION"): "ALTER FUNCTION is not allowed",
-    ("ALTER", "PROCEDURE"): "ALTER PROCEDURE is not allowed",
+    # DB-22131: CREATE FUNCTION / PROCEDURE bans are enforced by
+    # ``_check_create_or_alter_routine`` — see there for why the pair
+    # matcher can't catch the ``CREATE OR REPLACE FUNCTION`` form.
 }
 
 
@@ -182,6 +180,31 @@ def _significant_tokens(iterable) -> list:
     return result
 
 
+def _check_create_or_alter_routine(tokens: list) -> None:
+    """Reject ``CREATE [OR REPLACE] FUNCTION|PROCEDURE`` and
+    ``ALTER FUNCTION|PROCEDURE``.
+
+    Can't use the two-keyword-pair matcher because sqlparse tokenizes
+    ``CREATE OR REPLACE`` as a single ``Token.Keyword.DDL`` — the
+    ``('CREATE', 'FUNCTION')`` pair would only match the bare form.
+    Instead: any keyword whose uppercased value starts with ``CREATE`` or
+    ``ALTER``, followed by ``FUNCTION`` or ``PROCEDURE`` as the next
+    significant keyword, is blocked.
+    """
+    for i, tok in enumerate(tokens):
+        if not _is_keyword_token(tok):
+            continue
+        kw_up = tok.value.upper()
+        if not (kw_up.startswith("CREATE") or kw_up.startswith("ALTER")):
+            continue
+        if i + 1 >= len(tokens):
+            continue
+        nxt = tokens[i + 1]
+        if _is_keyword_token(nxt) and nxt.value.upper() in ("FUNCTION", "PROCEDURE"):
+            verb = "CREATE" if kw_up.startswith("CREATE") else "ALTER"
+            raise QueryBlockedError(f"{verb} {nxt.value.upper()} is not allowed")
+
+
 def _check_blocked_ast(stmt: Statement) -> None:
     """Walk the parsed statement, rejecting blocked keywords, keyword pairs,
     and function calls. Recurses into subqueries because `Statement.flatten()`
@@ -194,6 +217,10 @@ def _check_blocked_ast(stmt: Statement) -> None:
     cannot occur by construction.
     """
     tokens = _significant_tokens(stmt.flatten())
+
+    # DB-22131: catch CREATE OR REPLACE FUNCTION and its variants that the
+    # keyword-pair matcher below can't see.
+    _check_create_or_alter_routine(tokens)
 
     for i, tok in enumerate(tokens):
         if _is_keyword_token(tok):
@@ -245,47 +272,6 @@ def _check_blocked_ast(stmt: Statement) -> None:
             # credential/statistics disclosure.
             elif name in _BLOCKED_TABLES:
                 raise QueryBlockedError(f"Access to {name} is not allowed")
-
-
-def _count_values_rows(sql: str) -> int | None:
-    """Count top-level row tuples in a VALUES clause.
-
-    Uses the parsed AST: sqlparse groups a `VALUES (…), (…), (…)` clause as
-    a single `Values` node whose direct children are `Parenthesis` groups
-    (one per row) separated by punctuation commas. A `(`, `)`, or `,`
-    appearing inside a string literal cannot affect the count because those
-    characters are tokenized as part of the enclosing String token, not as
-    separate tokens.
-
-    Returns None when the statement has no top-level Values group
-    (e.g. `INSERT … SELECT`), in which case no row-count limit applies.
-    """
-    parsed = sqlparse.parse(sql)
-    if not parsed:
-        return None
-    stmt = parsed[0]
-    for tok in stmt.tokens:
-        if isinstance(tok, Values):
-            return sum(1 for child in tok.tokens if isinstance(child, Parenthesis))
-    return None
-
-
-def _stmt_has_select_source(stmt) -> bool:
-    """True if the parsed statement contains a DML ``SELECT`` token.
-
-    Used by the write-path INSERT check to distinguish
-    ``INSERT … SELECT`` (unbounded, blocked) from ``INSERT … VALUES``
-    and ``INSERT … DEFAULT VALUES`` (both static / trivially bounded).
-
-    ``flatten()`` walks the whole token tree so nested subqueries (WITH,
-    parenthesised SELECTs) are caught too. String literals containing
-    the word "SELECT" are tokenised as ``Token.Literal.String.Single``,
-    not ``Token.Keyword.DML``, so they cannot false-positive.
-    """
-    for tok in stmt.flatten():
-        if tok.ttype in T.Keyword.DML and tok.normalized.upper() == "SELECT":
-            return True
-    return False
 
 
 def _has_top_level_where(sql: str) -> bool:
@@ -366,30 +352,6 @@ def validate_query(sql: str, config: GuardrailConfig, read_only: bool) -> None:
     # `WITH … UPDATE` as UPDATE, so the require-WHERE check still fires on
     # a CTE-prefixed UPDATE/DELETE.
     stmt_type = (stmt.get_type() or "").upper()
-
-    if stmt_type == "INSERT":
-        row_count = _count_values_rows(cleaned)
-        if row_count is not None:
-            if row_count > config.max_insert_rows:
-                raise QueryBlockedError(
-                    f"INSERT contains {row_count} rows, which exceeds the "
-                    f"maximum of {config.max_insert_rows} rows per statement. "
-                    f"Please split into smaller batches."
-                )
-        elif _stmt_has_select_source(stmt):
-            # `INSERT … SELECT` produces an unbounded number of rows from
-            # a subquery, so `max_insert_rows` (which counts VALUES tuples
-            # statically) can't enforce the cap. Reject on the write path;
-            # users can restructure to `INSERT … VALUES (…), (…)` or split
-            # into batches.
-            raise QueryBlockedError(
-                "INSERT … SELECT is not allowed on the write tool "
-                "(YB_MCP_MAX_INSERT_ROWS only caps INSERT … VALUES). "
-                "Use INSERT … VALUES with an explicit row list, or split "
-                "the source query into batches."
-            )
-        # `INSERT … DEFAULT VALUES` is a single-row insert with no VALUES
-        # tuple and no SELECT source — trivially within the cap, allow.
 
     if config.require_where_on_update and stmt_type == "UPDATE":
         if not _has_top_level_where(cleaned):

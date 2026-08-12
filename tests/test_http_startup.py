@@ -36,7 +36,6 @@ _BASE_CONFIG = ServerConfig(
     ssl_root_cert_key=None,
     ssl_root_cert_path="/tmp/yb-root.crt",
     ssl_root_cert_secret_region=None,
-    max_insert_rows=1000,
     require_where_on_update=False,
     require_where_on_delete=False,
     auth_provider=None,

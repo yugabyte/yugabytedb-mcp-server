@@ -90,27 +90,6 @@ async def test_bulk_insert_under_limit_succeeds(mcp_session_write_enabled, test_
         assert cur.fetchone()[0] == 10
 
 
-async def test_bulk_insert_over_limit_blocked(mcp_session_strict, test_schema, db_conn):
-    """With YB_MCP_MAX_INSERT_ROWS=5, an INSERT of 10 rows must be blocked
-    by the guardrail AND have no DB side effect."""
-    with db_conn.cursor() as cur:
-        cur.execute(f'CREATE TABLE "{test_schema}".t (id INT)')
-
-    rows = ", ".join(f"({i})" for i in range(10))
-    result = await mcp_session_strict.call_tool(
-        "run_write_query",
-        {"query": f'INSERT INTO "{test_schema}".t VALUES {rows}'},
-    )
-    payload = parse_json(result)
-    assert payload.get("blocked_by_guardrail") is True
-    assert "exceeds the maximum" in payload.get("error", "")
-
-    # Confirm DB unchanged
-    with db_conn.cursor() as cur:
-        cur.execute(f'SELECT COUNT(*) FROM "{test_schema}".t')
-        assert cur.fetchone()[0] == 0
-
-
 async def test_strict_update_without_where_blocked(mcp_session_strict, test_schema, db_conn):
     with db_conn.cursor() as cur:
         cur.execute(f'CREATE TABLE "{test_schema}".t (id INT, c TEXT)')

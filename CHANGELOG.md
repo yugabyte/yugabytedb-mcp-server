@@ -11,6 +11,32 @@ _(No unreleased changes.)_
 
 ## [2.0.0] - Unreleased
 
+### Changed
+
+- **All INSERT shapes now bounded by `SET LOCAL statement_timeout`**
+  (`YB_MCP_STATEMENT_TIMEOUT_MS`) instead of a static row cap. Every
+  write — INSERT VALUES, INSERT SELECT, INSERT DEFAULT VALUES, UPDATE,
+  DELETE, DDL — runs under the timeout unconditionally, so a runaway
+  statement is killed by the DB. (DB-22131 round 2.)
+
+### Removed
+
+- **`YB_MCP_MAX_INSERT_ROWS` removed.** The static row cap was
+  redundant now that every write goes through `SET LOCAL
+  statement_timeout`. Setting the env var is a non-fatal warning at
+  startup. (DB-22131 round 2.)
+
+### Security
+
+- **DB-22131 round 2: block `CREATE OR REPLACE FUNCTION` and
+  `CREATE OR REPLACE PROCEDURE` on the write tool.** The
+  keyword-pair matcher on `('CREATE', 'FUNCTION')` couldn't see the
+  `OR REPLACE` form because sqlparse tokenizes it as one keyword;
+  a dedicated scanner now catches the shape. `SECURITY DEFINER`
+  variants are covered. `INSERT ... SELECT`, `CREATE TABLE ... AS
+  SELECT`, and `SELECT ... INTO` are allowed — their runtime is
+  bounded by `SET LOCAL statement_timeout`.
+
 ### Added
 
 - **OIDC v2 identity mapping + JWT audience validation (#10).** Maps

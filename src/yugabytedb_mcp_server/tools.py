@@ -773,10 +773,14 @@ def run_write_query(
         logger.debug("Acquired connection from pool for run_write_query")
         with conn.cursor() as cur:
             try:
-                # DB-22159: SET LOCAL statement_timeout — the SET LOCAL
-                # opens the implicit transaction that psycopg's default
-                # (autocommit=False) uses, and the timeout dies on commit
-                # so it doesn't leak across pool checkouts.
+                # DB-22159 + DB-22131 round 2: SET LOCAL statement_timeout
+                # runs before EVERY write, unconditionally. It's the sole
+                # bound on runtime for INSERT (VALUES, SELECT, DEFAULT
+                # VALUES), UPDATE, DELETE, and DDL — the static row cap
+                # `YB_MCP_MAX_INSERT_ROWS` was retired in DB-22131 round 2.
+                # SET LOCAL opens the implicit transaction that psycopg's
+                # default (autocommit=False) uses, and the timeout dies
+                # on commit so it doesn't leak across pool checkouts.
                 _execute(
                     cur,
                     f"SET LOCAL statement_timeout = '{statement_timeout_ms}ms'",

@@ -64,7 +64,6 @@ For development from source, see [Development](#development) below.
 | `YUGABYTEDB_URL` | `--yugabytedb-url` | Yes | libpq connection string (e.g. `host=… port=5433 dbname=… user=… password=…`). |
 | `YB_MCP_TRANSPORT` | `--transport` | No | `stdio` (default) or `http`. |
 | `YB_MCP_STATELESS_HTTP` | `--stateless-http` | No | `true` enables stateless Streamable-HTTP — required for multi-replica self-hosted deployments. |
-| `YB_MCP_MAX_INSERT_ROWS` | `--max-insert-rows` | No | Reject INSERT … VALUES with more rows than this. Default `1000`. |
 | `YB_MCP_REQUIRE_WHERE_ON_UPDATE` | `--require-where-on-update` | No | Reject UPDATE without a WHERE clause. Default `false`. |
 | `YB_MCP_REQUIRE_WHERE_ON_DELETE` | `--require-where-on-delete` | No | Reject DELETE without a WHERE clause. Default `false`. |
 | `YB_MCP_ENABLE_WRITE_QUERY` | `--enable-write-query` | No | Enable the `run_write_query` tool. Default `false` (write tool disabled). |
@@ -168,9 +167,12 @@ The following statement classes are rejected before execution:
 - Schema isolation: `SET search_path`, `CREATE SCHEMA`
 - Multi-statement queries (anything with a separator semicolon)
 - `psql` meta-commands (`\c`, `\d`, `\!`)
-- `INSERT … SELECT` (unbounded row source; `YB_MCP_MAX_INSERT_ROWS` only caps `INSERT … VALUES`)
-- INSERT … VALUES over `YB_MCP_MAX_INSERT_ROWS`
 - Optionally UPDATE / DELETE without a WHERE clause
+
+Runtime of INSERT / UPDATE / DELETE / DDL is bounded by
+`YB_MCP_STATEMENT_TIMEOUT_MS` (SET LOCAL statement_timeout applied to every
+write) — a runaway `INSERT … SELECT` or wide `INSERT … VALUES` is killed
+by the DB, not by a static row cap.
 
 `CREATE TABLE … AS SELECT` and `SELECT … INTO` are structurally similar unbounded row copies but are intentionally **allowed** — they're the common way to materialize a snapshot from a query.
 

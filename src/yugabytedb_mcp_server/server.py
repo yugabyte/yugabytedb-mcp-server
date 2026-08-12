@@ -98,7 +98,6 @@ class ServerConfig:
     ssl_root_cert_key: str | None
     ssl_root_cert_path: str
     ssl_root_cert_secret_region: str
-    max_insert_rows: int
     require_where_on_update: bool
     require_where_on_delete: bool
     auth_provider: str | None
@@ -210,14 +209,12 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
     logger.debug("ConnectionPool opened successfully")
 
     guardrail_config = GuardrailConfig(
-        max_insert_rows=CONFIG.max_insert_rows,
         require_where_on_update=CONFIG.require_where_on_update,
         require_where_on_delete=CONFIG.require_where_on_delete,
     )
     logger.debug(
-        "GuardrailConfig: max_insert_rows=%d, require_where_on_update=%s, "
+        "GuardrailConfig: require_where_on_update=%s, "
         "require_where_on_delete=%s",
-        guardrail_config.max_insert_rows,
         guardrail_config.require_where_on_update,
         guardrail_config.require_where_on_delete,
     )
@@ -358,12 +355,18 @@ def parse_config() -> ServerConfig:
         default=os.getenv("YB_AWS_SSL_ROOT_CERT_SECRET_REGION"),
         help="Region of the AWS Secrets Manager secret containing the TLS root certificate",
     )
-    parser.add_argument(
-        "--max-insert-rows",
-        type=int,
-        default=int(os.environ.get("YB_MCP_MAX_INSERT_ROWS", "1000")),
-        help="Maximum rows allowed per INSERT VALUES statement (env: YB_MCP_MAX_INSERT_ROWS)",
-    )
+    # DB-22131 round 2: YB_MCP_MAX_INSERT_ROWS has been removed. Every
+    # write goes through SET LOCAL statement_timeout in run_write_query
+    # so a runaway INSERT — VALUES, SELECT, whatever shape — is bounded
+    # by the timeout. A static row cap on top is redundant. Warn (not
+    # fail) so existing deployments that still set the env are noisy
+    # about the removal without blocking startup.
+    if os.environ.get("YB_MCP_MAX_INSERT_ROWS") is not None:
+        logger.warning(
+            "YB_MCP_MAX_INSERT_ROWS has been removed and is ignored. "
+            "INSERT statements are bounded by YB_MCP_STATEMENT_TIMEOUT_MS "
+            "(SET LOCAL statement_timeout applied to every write)."
+        )
     parser.add_argument(
         "--require-where-on-update",
         action="store_true",
@@ -476,7 +479,6 @@ def parse_config() -> ServerConfig:
         ssl_root_cert_key=args.yb_aws_ssl_root_cert_key,
         ssl_root_cert_path=args.yb_ssl_root_cert_path,
         ssl_root_cert_secret_region=args.yb_aws_ssl_root_cert_secret_region,
-        max_insert_rows=args.max_insert_rows,
         require_where_on_update=args.require_where_on_update,
         require_where_on_delete=args.require_where_on_delete,
         auth_provider=args.mcp_auth_provider,

@@ -139,12 +139,11 @@ async def mcp_session_write_enabled():
 
 @pytest_asyncio.fixture
 async def mcp_session_strict():
-    """MCP session with strict WHERE-clause enforcement, a lower bulk-INSERT limit, and write enabled."""
+    """MCP session with strict WHERE-clause enforcement + write enabled."""
     stdio_cm = stdio_client(_server_params(extra_env={
         "YB_MCP_ENABLE_WRITE_QUERY": "true",
         "YB_MCP_REQUIRE_WHERE_ON_UPDATE": "true",
         "YB_MCP_REQUIRE_WHERE_ON_DELETE": "true",
-        "YB_MCP_MAX_INSERT_ROWS": "5",
     }))
     read_stream, write_stream = await stdio_cm.__aenter__()
     session_cm = ClientSession(read_stream, write_stream)
