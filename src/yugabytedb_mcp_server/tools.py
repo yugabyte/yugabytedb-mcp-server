@@ -467,7 +467,13 @@ def summarize_database(
     """
     logger.info("summarize_database called (schema=%s)", schema)
     summary: List[Dict[str, Any]] = []
-    pool = ctx.request_context.lifespan_context["pool"]
+    lifespan = ctx.request_context.lifespan_context
+    pool = lifespan["pool"]
+    # DB-22159 round-2: previously only run_read_only_query /
+    # run_write_query enforced the statement_timeout; a `COUNT(*)` over a
+    # huge table via summarize_database could hold a pool connection
+    # indefinitely. Apply the same cap here.
+    statement_timeout_ms = lifespan["statement_timeout_ms"]
 
     try:
         role = _get_db_role(ctx, requested_role=requested_role)
@@ -480,6 +486,10 @@ def summarize_database(
         with conn.cursor() as cur:
             try:
                 _execute(cur, "BEGIN READ ONLY")
+                _execute(
+                    cur,
+                    f"SET LOCAL statement_timeout = '{statement_timeout_ms}ms'",
+                )
 
                 # Initial tables lookup — if this fails there's nothing to
                 # iterate; report the error and unwind.
@@ -615,6 +625,7 @@ def run_read_only_query(
     max_query_len = lifespan["max_query_len"]
     statement_timeout_ms = lifespan["statement_timeout_ms"]
     max_result_rows = lifespan["max_result_rows"]
+    max_result_bytes = lifespan["max_result_bytes"]
 
     # Reject oversized queries BEFORE parsing or opening a connection.
     # Vishal observed a ~1MB write query burning ~6s of CPU in the
@@ -663,13 +674,34 @@ def run_read_only_query(
                     f"SET LOCAL statement_timeout = '{statement_timeout_ms}ms'",
                 )
                 _execute(cur, query)
-                # fetchmany(max+1) lets us detect truncation without paging
-                # the whole result set into memory first. `SELECT repeat('x',
-                # 100000000)` no longer OOMs the process.
-                rows = cur.fetchmany(max_result_rows + 1)
-                truncated = len(rows) > max_result_rows
-                if truncated:
-                    rows = rows[:max_result_rows]
+                # DB-22159 round-2: stream rows one at a time and apply
+                # BOTH the row cap AND a cumulative byte budget. The old
+                # ``fetchmany(max+1)`` bounded row count only — a wide-row
+                # query (`SELECT repeat('x', 1_000_000) FROM
+                # generate_series(1, 100)`) still buffered ~100 MB before
+                # anyone counted rows. The byte cap trips as soon as the
+                # cumulative row size crosses ``max_result_bytes``.
+                rows = []
+                approx_bytes = 0
+                truncated_by_rows = False
+                truncated_by_bytes = False
+                for row in cur:
+                    if len(rows) >= max_result_rows:
+                        truncated_by_rows = True
+                        break
+                    # Approximate serialized cost: string length of each
+                    # value plus a couple of bytes for JSON delimiters
+                    # (`, ` between values, `[]` for the row). Cheap and
+                    # bounded — psycopg has already materialized this row
+                    # in memory to hand it to us, so the string coercion
+                    # doesn't add asymptotic overhead.
+                    row_bytes = sum(len(str(v)) for v in row) + 2 * len(row)
+                    if approx_bytes + row_bytes > max_result_bytes:
+                        truncated_by_bytes = True
+                        break
+                    rows.append(row)
+                    approx_bytes += row_bytes
+                truncated = truncated_by_rows or truncated_by_bytes
                 column_names = [desc[0] for desc in cur.description]
                 # Use the parallel-arrays shape (PR #9 / DB-22203) so
                 # duplicate column names don't collapse; still robust to a
@@ -680,11 +712,16 @@ def run_read_only_query(
                 }
                 if truncated:
                     result["truncated"] = True
-                    result["returned_rows"] = max_result_rows
+                    result["returned_rows"] = len(rows)
+                    reason = (
+                        "YB_MCP_MAX_RESULT_ROWS "
+                        f"({max_result_rows})"
+                        if truncated_by_rows
+                        else f"YB_MCP_MAX_RESULT_BYTES ({max_result_bytes} bytes)"
+                    )
                     result["note"] = (
-                        f"Result set exceeded YB_MCP_MAX_RESULT_ROWS "
-                        f"({max_result_rows}). Add a LIMIT clause or "
-                        f"narrow the query to see the full result."
+                        f"Result set exceeded {reason}. Add a LIMIT clause "
+                        f"or narrow the query to see the full result."
                     )
                 logger.info(
                     "run_read_only_query returned %d rows × %d columns "

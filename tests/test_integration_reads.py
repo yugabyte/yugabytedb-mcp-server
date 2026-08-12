@@ -274,6 +274,36 @@ async def test_statement_timeout_kills_slow_query(mcp_session_capped):
     )
 
 
+async def test_result_byte_cap_truncates(mcp_session_capped, test_schema, db_conn):
+    """DB-22159 round-2 repro. A query with FEW rows (well under
+    max_result_rows) but WIDE rows now truncates by cumulative byte size
+    — the old fetchmany(row_cap+1) buffered wide rows without bound and
+    could OOM the process. The capped fixture sets max_result_bytes=512
+    so ~5 rows of a 200-char string is enough to trip the cap.
+    """
+    with db_conn.cursor() as cur:
+        cur.execute(f'CREATE TABLE "{test_schema}".wide (val TEXT)')
+        cur.execute(
+            f'INSERT INTO "{test_schema}".wide '
+            f"SELECT repeat('x', 200) FROM generate_series(1, 3)"
+        )
+
+    result = await mcp_session_capped.call_tool(
+        "run_read_only_query",
+        {"query": f'SELECT val FROM "{test_schema}".wide'},
+    )
+    parsed = parse_json(result)
+    assert isinstance(parsed, dict), f"expected dict shape, got: {parsed!r}"
+    assert parsed.get("truncated") is True
+    # 3 rows total, each ~200 chars. Under a 3-row cap AND 512-byte cap,
+    # the byte cap should trip first — only 1-2 rows survive.
+    assert 1 <= parsed.get("returned_rows", 0) <= 2, (
+        f"expected byte cap to trip before row cap; got returned_rows="
+        f"{parsed.get('returned_rows')}"
+    )
+    assert "YB_MCP_MAX_RESULT_BYTES" in parsed.get("note", "")
+
+
 async def test_result_row_cap_truncates(mcp_session_capped, test_schema, db_conn):
     """DB-22159 second repro. A query returning MORE than
     YB_MCP_MAX_RESULT_ROWS (3 in the capped fixture) truncates with a

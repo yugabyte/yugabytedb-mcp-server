@@ -11,6 +11,27 @@ _(No unreleased changes.)_
 
 ## [2.0.0] - Unreleased
 
+### Added
+
+- **`YB_MCP_MAX_RESULT_BYTES` cap.** Cumulative byte budget applied
+  while streaming rows from `run_read_only_query`. A wide-row query
+  (e.g. `SELECT repeat('x', 1_000_000) FROM generate_series(1, 100)`)
+  now truncates on bytes rather than materializing ~100 MiB before
+  the row cap is checked. Default: 50 MiB. (DB-22159 round 2.)
+- **`connect_timeout` on the pool conninfo.** Defaults to `10` when
+  the operator's `YUGABYTEDB_URL` doesn't set one, so a network
+  partition to the DB doesn't hang startup or pool checkouts
+  indefinitely. (DB-22159 round 2.)
+
+### Changed
+
+- **Pool sizing is validated at startup** — `pool_min_size >
+  pool_max_size` raises a clean `ValueError` before `pool.open`.
+  (DB-22159 round 2.)
+- **`summarize_database` now runs under `SET LOCAL statement_timeout`**,
+  matching the read / write tools. A slow `COUNT(*)` no longer
+  holds a pool connection indefinitely. (DB-22159 round 2.)
+
 ### Changed
 
 - **All INSERT shapes now bounded by `SET LOCAL statement_timeout`**

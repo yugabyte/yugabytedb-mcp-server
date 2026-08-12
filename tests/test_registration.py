@@ -42,6 +42,7 @@ _BASE_CONFIG = ServerConfig(
     pool_max_size=3,
     statement_timeout_ms=30_000,
     max_result_rows=10_000,
+    max_result_bytes=50 * 1024 * 1024,
     max_query_len=100_000,
 )
 

@@ -94,6 +94,11 @@ class TestResourceLimitDefaults:
         cfg = _parse_with_env({})
         assert cfg.max_query_len == 100_000
 
+    def test_max_result_bytes_default(self):
+        """DB-22159 round-2: 50 MiB default byte cap."""
+        cfg = _parse_with_env({})
+        assert cfg.max_result_bytes == 50 * 1024 * 1024
+
 
 class TestResourceLimitEnvParsing:
     """Env-var overrides populate ServerConfig correctly."""
@@ -118,11 +123,49 @@ class TestResourceLimitEnvParsing:
         cfg = _parse_with_env({"YB_MCP_MAX_QUERY_LEN": "1000"})
         assert cfg.max_query_len == 1_000
 
+    def test_max_result_bytes_from_env(self):
+        cfg = _parse_with_env({"YB_MCP_MAX_RESULT_BYTES": "1048576"})
+        assert cfg.max_result_bytes == 1_048_576
+
+
+class TestPoolSizingValidation:
+    """DB-22159 round-2: pool_min_size <= pool_max_size is enforced at
+    app_lifespan startup, not silently at pool.open time."""
+
+    def test_min_larger_than_max_rejected(self):
+        """The bad combo is caught inside app_lifespan before the pool is
+        opened. parse_config accepts the individual values (both are just
+        positive ints); the relational check runs later."""
+        from yugabytedb_mcp_server import server as server_module
+        cfg = _parse_with_env({
+            "YB_MCP_POOL_MIN_SIZE": "10",
+            "YB_MCP_POOL_MAX_SIZE": "5",
+        })
+        assert cfg.pool_min_size == 10
+        assert cfg.pool_max_size == 5
+
+        original = getattr(server_module, "CONFIG", None)
+        server_module.CONFIG = cfg
+        try:
+            async def _drive():
+                async with server_module.app_lifespan(None) as _:
+                    pass
+            import asyncio
+            with pytest.raises(ValueError, match="POOL_MIN_SIZE"):
+                asyncio.run(_drive())
+        finally:
+            if original is None:
+                try:
+                    del server_module.CONFIG
+                except AttributeError:
+                    pass
+            else:
+                server_module.CONFIG = original
+
 
 class TestResourceLimitEnvValidation:
     """Bad env values fail startup with a clean argparse error, not a
-    traceback. Same pattern that DB-22162 will apply to max_insert_rows
-    in the follow-up release."""
+    traceback."""
 
     def test_pool_max_size_rejects_non_int(self):
         with pytest.raises(SystemExit):
