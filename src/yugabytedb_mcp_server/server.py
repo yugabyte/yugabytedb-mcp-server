@@ -93,6 +93,7 @@ class ServerConfig:
     yugabytedb_url: str
     transport: str
     host: str
+    port: int
     stateless_http: bool
     ssl_root_cert_secret_arn: str | None
     ssl_root_cert_key: str | None
@@ -353,6 +354,12 @@ def parse_config() -> ServerConfig:
              "(env: MCP_HOST, default: 127.0.0.1)",
     )
     parser.add_argument(
+        "--port",
+        type=_positive_int,
+        default=os.environ.get("MCP_PORT", "8000"),
+        help="Bind port for HTTP transport (env: MCP_PORT, default: 8000).",
+    )
+    parser.add_argument(
         "--stateless-http",
         action="store_true",
         default=os.environ.get("YB_MCP_STATELESS_HTTP", "").lower() == "true",
@@ -513,6 +520,7 @@ def parse_config() -> ServerConfig:
         yugabytedb_url=args.yugabytedb_url,
         transport=args.transport,
         host=args.host,
+        port=args.port,
         stateless_http=args.stateless_http,
         ssl_root_cert_secret_arn=args.yb_aws_ssl_root_cert_secret_arn,
         ssl_root_cert_key=args.yb_aws_ssl_root_cert_key,
@@ -567,9 +575,11 @@ class YugabyteDBMCPServer:
         else:
             logger.info("run_write_query tool disabled (use --enable-write-query or YB_MCP_ENABLE_WRITE_QUERY=true to enable)")
 
-    def run(self, port=8000):
+    def run(self, port: int | None = None):
         if CONFIG.transport == "http":
-            self._run_http(CONFIG.host, port)
+            # DB-22139: port is now a real config value (MCP_PORT / --port).
+            # Fall back to the argument for callers that still pass one.
+            self._run_http(CONFIG.host, port if port is not None else CONFIG.port)
         else:
             self.mcp.run(transport="stdio")
 
@@ -777,11 +787,24 @@ def _check_http_startup(host: str) -> None:
             "=" * 78
         )
 
-    # Independent of auth: an empty Origin allowlist means the
-    # DNS-rebinding defense is off (OriginValidationMiddleware no-ops
-    # when allowed_origins is empty). Warn — non-fatal — so operators
-    # who run browser clients see the gap in logs.
-    if not _parse_allowed_origins():
+    # DB-22139 round-2: when auth is OFF, the Origin allowlist is the only
+    # thing standing between the loopback bind and a browser DNS-rebinding
+    # attack. Fail closed when both are missing rather than emitting a
+    # warning and continuing. Escape hatch: the same
+    # ``MCP_ALLOW_UNAUTHENTICATED=true`` opt-in the auth guard uses.
+    empty_origins = not _parse_allowed_origins()
+    if not has_auth and empty_origins and not allow_unauth:
+        logger.critical(
+            "HTTP transport with no auth provider AND no Origin allowlist. "
+            "DNS-rebinding defense is OFF, so a browser page can drive "
+            "requests to this loopback bind. Set MCP_ALLOWED_ORIGINS "
+            "(comma-separated) or MCP_BASE_URL to enable the allowlist, "
+            "configure MCP_AUTH_PROVIDER, or set "
+            "MCP_ALLOW_UNAUTHENTICATED=true for dev/testing only."
+        )
+        sys.exit(1)
+
+    if empty_origins:
         logger.warning(
             "HTTP transport is running with no Origin allowlist "
             "configured — DNS-rebinding defense is OFF. Set "

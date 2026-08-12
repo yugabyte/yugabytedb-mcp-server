@@ -13,6 +13,9 @@ _(No unreleased changes.)_
 
 ### Added
 
+- **`MCP_PORT` / `--port` config.** HTTP transport now honors a
+  configurable port instead of the hardcoded `8000`. Env:
+  `MCP_PORT`, default `8000`. (DB-22139 round 2.)
 - **`YB_MCP_MAX_RESULT_BYTES` cap.** Cumulative byte budget applied
   while streaming rows from `run_read_only_query`. A wide-row query
   (e.g. `SELECT repeat('x', 1_000_000) FROM generate_series(1, 100)`)
@@ -31,6 +34,10 @@ _(No unreleased changes.)_
 - **`summarize_database` now runs under `SET LOCAL statement_timeout`**,
   matching the read / write tools. A slow `COUNT(*)` no longer
   holds a pool connection indefinitely. (DB-22159 round 2.)
+- **HTTP transport fails closed when auth is off and no Origin
+  allowlist is configured** — previously a warning; now a startup
+  error, matching the auth-off + non-loopback guard. Same escape
+  hatch: `MCP_ALLOW_UNAUTHENTICATED=true`. (DB-22139 round 2.)
 
 ### Changed
 

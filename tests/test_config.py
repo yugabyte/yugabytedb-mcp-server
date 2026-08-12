@@ -99,6 +99,27 @@ class TestResourceLimitDefaults:
         cfg = _parse_with_env({})
         assert cfg.max_result_bytes == 50 * 1024 * 1024
 
+    def test_port_default(self):
+        """DB-22139 round-2: MCP_PORT defaults to 8000."""
+        cfg = _parse_with_env({})
+        assert cfg.port == 8000
+
+
+class TestHttpBindConfig:
+    """DB-22139: MCP_HOST and MCP_PORT come from env / --host / --port."""
+
+    def test_port_from_env(self):
+        cfg = _parse_with_env({"MCP_PORT": "9090"})
+        assert cfg.port == 9090
+
+    def test_port_rejects_non_int(self):
+        with pytest.raises(SystemExit):
+            _parse_with_env({"MCP_PORT": "abc"})
+
+    def test_port_rejects_zero(self):
+        with pytest.raises(SystemExit):
+            _parse_with_env({"MCP_PORT": "0"})
+
 
 class TestResourceLimitEnvParsing:
     """Env-var overrides populate ServerConfig correctly."""
