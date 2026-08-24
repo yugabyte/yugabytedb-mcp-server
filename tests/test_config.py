@@ -163,6 +163,56 @@ class TestPoolSizingValidation:
                 server_module.CONFIG = original
 
 
+class TestConnectTimeoutAppend:
+    """DB-22159 round-2 (post-review): when ``YUGABYTEDB_URL`` doesn't
+    already carry a ``connect_timeout`` we append one. The append has to
+    respect the two conninfo formats libpq accepts — keyword form
+    (space-separated) and URI form (query-string). Space-appending to a
+    URI mangles it (`?sslmode=disable connect_timeout=10` — psycopg
+    rejects with "extra key/value separator")."""
+
+    def _append(self, url: str) -> str:
+        """Mirror the logic in ``app_lifespan``."""
+        if "connect_timeout" in url.lower():
+            return url
+        if url.startswith(("postgres://", "postgresql://")):
+            sep = "&" if "?" in url else "?"
+            return f"{url}{sep}connect_timeout=10"
+        return f"{url} connect_timeout=10"
+
+    def test_keyword_form_bare(self):
+        assert self._append("host=localhost port=5433 dbname=yb user=yb") == (
+            "host=localhost port=5433 dbname=yb user=yb connect_timeout=10"
+        )
+
+    def test_keyword_form_already_set(self):
+        u = "host=localhost connect_timeout=5"
+        assert self._append(u) == u
+
+    def test_keyword_form_case_insensitive_already_set(self):
+        u = "Connect_Timeout=5 host=localhost"
+        assert self._append(u) == u
+
+    def test_uri_form_no_query(self):
+        assert self._append("postgresql://yb@localhost:5433/db") == (
+            "postgresql://yb@localhost:5433/db?connect_timeout=10"
+        )
+
+    def test_uri_form_with_query(self):
+        assert self._append(
+            "postgresql://yb@localhost:5433/db?sslmode=require"
+        ) == "postgresql://yb@localhost:5433/db?sslmode=require&connect_timeout=10"
+
+    def test_uri_form_already_set(self):
+        u = "postgresql://yb@localhost:5433/db?connect_timeout=5"
+        assert self._append(u) == u
+
+    def test_uri_short_scheme(self):
+        assert self._append("postgres://yb@localhost/db") == (
+            "postgres://yb@localhost/db?connect_timeout=10"
+        )
+
+
 class TestResourceLimitEnvValidation:
     """Bad env values fail startup with a clean argparse error, not a
     traceback."""

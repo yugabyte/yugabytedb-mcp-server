@@ -199,9 +199,17 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
     # is unlimited; without a cap, a network partition to the DB during
     # pool warm-up hangs startup indefinitely (or the pool acquire path
     # blocks the tool call for hundreds of seconds). Only add when the
-    # operator hasn't set one explicitly.
-    if "connect_timeout" not in database_url:
-        database_url += " connect_timeout=10"
+    # operator hasn't set one explicitly. libpq accepts both keyword form
+    # (`host=… connect_timeout=10`) and URI form
+    # (`postgresql://…?connect_timeout=10`) — space-appending to a URI
+    # mangles it into `?sslmode=… connect_timeout=10` which psycopg
+    # rejects. Detect the form and use the right separator.
+    if "connect_timeout" not in database_url.lower():
+        if database_url.startswith(("postgres://", "postgresql://")):
+            sep = "&" if "?" in database_url else "?"
+            database_url = f"{database_url}{sep}connect_timeout=10"
+        else:
+            database_url = f"{database_url} connect_timeout=10"
 
     # Connection string can contain a password — log only structural info.
     logger.debug(

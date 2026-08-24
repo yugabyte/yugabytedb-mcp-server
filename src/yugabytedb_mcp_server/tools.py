@@ -663,46 +663,58 @@ def run_read_only_query(
 
     with _conn_as_role(pool, role) as conn:
         logger.debug("Acquired connection from pool for run_read_only_query")
-        with conn.cursor() as cur:
+        # Control cursor drives BEGIN / SET LOCAL / ROLLBACK. The named
+        # cursor below runs the user's SELECT as a server-side cursor
+        # (`DECLARE … CURSOR FOR SELECT`) so rows are fetched on demand
+        # via `FETCH FORWARD N` instead of being materialized in a
+        # client-side buffer at execute() time. This is what actually
+        # makes the byte cap enforceable — a wide-row query no longer
+        # gets buffered wholesale before we count bytes.
+        with conn.cursor() as ctrl_cur:
             try:
-                _execute(cur, "BEGIN READ ONLY")
+                _execute(ctrl_cur, "BEGIN READ ONLY")
                 # DB-22159: SET LOCAL statement_timeout scopes the cap to
                 # this transaction only — the timeout dies with the ROLLBACK
                 # below, so it doesn't leak across pool checkouts.
                 _execute(
-                    cur,
+                    ctrl_cur,
                     f"SET LOCAL statement_timeout = '{statement_timeout_ms}ms'",
                 )
-                _execute(cur, query)
-                # DB-22159 round-2: stream rows one at a time and apply
-                # BOTH the row cap AND a cumulative byte budget. The old
-                # ``fetchmany(max+1)`` bounded row count only — a wide-row
-                # query (`SELECT repeat('x', 1_000_000) FROM
-                # generate_series(1, 100)`) still buffered ~100 MB before
-                # anyone counted rows. The byte cap trips as soon as the
-                # cumulative row size crosses ``max_result_bytes``.
-                rows = []
-                approx_bytes = 0
-                truncated_by_rows = False
-                truncated_by_bytes = False
-                for row in cur:
-                    if len(rows) >= max_result_rows:
-                        truncated_by_rows = True
-                        break
-                    # Approximate serialized cost: string length of each
-                    # value plus a couple of bytes for JSON delimiters
-                    # (`, ` between values, `[]` for the row). Cheap and
-                    # bounded — psycopg has already materialized this row
-                    # in memory to hand it to us, so the string coercion
-                    # doesn't add asymptotic overhead.
-                    row_bytes = sum(len(str(v)) for v in row) + 2 * len(row)
-                    if approx_bytes + row_bytes > max_result_bytes:
-                        truncated_by_bytes = True
-                        break
-                    rows.append(row)
-                    approx_bytes += row_bytes
-                truncated = truncated_by_rows or truncated_by_bytes
-                column_names = [desc[0] for desc in cur.description]
+                # DB-22159 round-2: server-side cursor + small itersize.
+                # psycopg3's client-side cursor buffers ALL rows at
+                # ``execute()`` time, defeating any downstream byte cap;
+                # a named cursor issues DECLARE/FETCH so the DB streams
+                # to us. itersize=10 keeps per-FETCH memory bounded to
+                # ~10 rows at whatever their intrinsic width happens to
+                # be, so a `SELECT repeat('x', N) FROM …` pathological
+                # case still buffers at most 10*N bytes per round-trip
+                # instead of every row × N.
+                with conn.cursor(name="mcp_read_only") as cur:
+                    cur.itersize = 10
+                    _execute(cur, query)
+                    rows = []
+                    approx_bytes = 0
+                    truncated_by_rows = False
+                    truncated_by_bytes = False
+                    for row in cur:
+                        if len(rows) >= max_result_rows:
+                            truncated_by_rows = True
+                            break
+                        # Approximate serialized cost: string length of
+                        # each value plus a couple of bytes for JSON
+                        # delimiters (`, ` between values, `[]` for the
+                        # row). Cheap and bounded — psycopg has already
+                        # materialized this row in memory to hand it to
+                        # us, so the string coercion doesn't add
+                        # asymptotic overhead.
+                        row_bytes = sum(len(str(v)) for v in row) + 2 * len(row)
+                        if approx_bytes + row_bytes > max_result_bytes:
+                            truncated_by_bytes = True
+                            break
+                        rows.append(row)
+                        approx_bytes += row_bytes
+                    truncated = truncated_by_rows or truncated_by_bytes
+                    column_names = [desc[0] for desc in cur.description]
                 # Use the parallel-arrays shape (PR #9 / DB-22203) so
                 # duplicate column names don't collapse; still robust to a
                 # `SELECT a.id, b.id FROM ...` after a join.
@@ -735,7 +747,7 @@ def run_read_only_query(
                 return f"Error executing query: {e}"
             finally:
                 try:
-                    _execute(cur, "ROLLBACK")
+                    _execute(ctrl_cur, "ROLLBACK")
                 except Exception as e:
                     logger.error("Failed to ROLLBACK read-only transaction: %s", e)
 
