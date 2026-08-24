@@ -94,7 +94,11 @@ def clean_env():
 class TestIsLoopback:
     @pytest.mark.parametrize("host", [
         "127.0.0.1",
+        "127.0.0.2",       # full 127.0.0.0/8 block is loopback (post-review fix)
+        "127.255.255.254",
         "::1",
+        "[::1]",           # bracketed IPv6 form (post-review fix)
+        "0:0:0:0:0:0:0:1", # expanded IPv6 form (post-review fix)
         "localhost",
         "LOCALHOST",       # case-insensitive
         " 127.0.0.1 ",     # whitespace tolerated
@@ -108,6 +112,8 @@ class TestIsLoopback:
         "10.0.0.1",
         "mcp.example.com",
         "",
+        "::",              # unspecified — not loopback
+        "not-an-ip",
     ])
     def test_non_loopback_hosts(self, host):
         assert _is_loopback(host) is False

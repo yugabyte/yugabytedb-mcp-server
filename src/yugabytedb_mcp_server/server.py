@@ -88,6 +88,20 @@ def _positive_int(s: str) -> int:
     return v
 
 
+def _tcp_port(s: str) -> int:
+    """argparse `type=` helper for MCP_PORT. Requires 1 <= port <= 65535
+    so a typo (`MCP_PORT=65536`) fails at parse_config with a clear
+    argparse error instead of an uglier uvicorn socket-bind traceback
+    at startup."""
+    try:
+        v = int(s)
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError(f"must be an integer 1–65535, got {s!r}")
+    if not (1 <= v <= 65535):
+        raise argparse.ArgumentTypeError(f"must be 1–65535, got {v}")
+    return v
+
+
 @dataclass
 class ServerConfig:
     yugabytedb_url: str
@@ -355,9 +369,10 @@ def parse_config() -> ServerConfig:
     )
     parser.add_argument(
         "--port",
-        type=_positive_int,
+        type=_tcp_port,
         default=os.environ.get("MCP_PORT", "8000"),
-        help="Bind port for HTTP transport (env: MCP_PORT, default: 8000).",
+        help="Bind port for HTTP transport, 1–65535 "
+             "(env: MCP_PORT, default: 8000).",
     )
     parser.add_argument(
         "--stateless-http",
@@ -719,14 +734,32 @@ def _resolve_auth_scope() -> str | None:
     return None
 
 
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+_LOOPBACK_NAMES = frozenset({"localhost"})
 
 
 def _is_loopback(host: str) -> bool:
     """True if `host` is a loopback address / name. Used by the DB-22139
     refuse-to-start guard to decide whether an unauth deployment is
-    acceptable (loopback-only = OK; any other bind = require auth)."""
-    return host.strip().lower() in _LOOPBACK_HOSTS
+    acceptable (loopback-only = OK; any other bind = require auth).
+
+    Normalizes:
+    - strips surrounding whitespace and IPv6 brackets (`[::1]`)
+    - lowercases
+    - matches the full ``127.0.0.0/8`` block, not just ``127.0.0.1``
+    - matches every IPv6 loopback form via ``ipaddress.ip_address`` —
+      that catches ``::1``, ``0:0:0:0:0:0:0:1``, and any zero-prefix
+      abbreviation libpq / uvicorn would accept
+    """
+    import ipaddress
+    h = host.strip().lower()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    if h in _LOOPBACK_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
 
 
 def _env_bool(name: str) -> bool:
