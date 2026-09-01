@@ -82,6 +82,12 @@ _(No unreleased changes.)_
   A request-time check now fires whenever the claim actually
   resolves to a list AND no `YB_MCP_IDENTITY_MAP` is configured —
   independent of the claim's name.
+- **Refuse to `SET ROLE` to a superuser role.** Defense-in-depth
+  guard: before each per-user `SET ROLE`, `_conn_as_role` queries
+  `pg_roles.rolsuper` for the resolved role and refuses if true.
+  Closes the last-mile OIDC → PG-role escalation path (superuser
+  pool + scalar claim matching a superuser role name). Opt out with
+  `YB_MCP_ALLOW_SUPERUSER_ROLE=true` (off by default).
 
 ### Added
 

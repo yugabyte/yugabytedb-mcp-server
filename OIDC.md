@@ -163,6 +163,7 @@ release, **(v2)** if new.
 | `YB_MCP_IDENTITY_CLAIM` | `--identity-claim` | **(v1, v2-extended)** JWT claim carrying the user's identity. v2 accepts dotted paths like `realm_access.roles` and top-level names with colons like `cognito:groups`. Default: `sub` (or `email` when `YB_MCP_LEGACY_ACCEPT_ID_TOKENS=true`). |
 | `YB_MCP_IDENTITY_MAP` | `--identity-map` | **(v2)** Path to a `pg_ident.conf`-style map file. When set, each claim value is looked up in the map; without a map, the raw claim value is used verbatim as the DB role. See [The identity map file](#the-identity-map-file). |
 | `YB_MCP_IDENTITY_MAP_NAME` | `--identity-map-name` | **(v2)** Which named map inside the file to apply. Default: `default`. |
+| `YB_MCP_ALLOW_SUPERUSER_ROLE` | `--allow-superuser-role` | **(v2)** Defense-in-depth guard. By default the server refuses to `SET ROLE` to any role whose `pg_roles.rolsuper` is true, even if the identity map explicitly resolves there. Set to `true` to disable the guard (not recommended). Default: `false`. |
 | `YB_MCP_REQUIRE_ACCESS_TOKEN` | — | **(v2, Cognito-only)** When `true`, reject tokens with `token_use != "access"` (rejects ID tokens and refresh tokens presented as bearers). Default: `true`. See [Access-token vs ID-token](#access-token-vs-id-token). |
 | `YB_MCP_LEGACY_ACCEPT_ID_TOKENS` | — | **(v2)** Compat flag. When `true`, restores pre-DB-22136 defaults: `identity_claim=email` and `require_access_token=false` (ID tokens accepted). Prefer setting each individually. |
 

@@ -121,6 +121,9 @@ class ServerConfig:
     # PR #10 (OIDC v2) identity mapping
     identity_map_path: str | None
     identity_map_name: str
+    # Defense-in-depth: refuse SET ROLE to a superuser regardless of how
+    # the claim/map resolved the role name. Off flips the guard.
+    allow_superuser_role: bool
     # DB-22159 resource limits — all defaults documented alongside the
     # argparse definitions in parse_config().
     pool_min_size: int
@@ -337,6 +340,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
             "identity_claim": CONFIG.identity_claim,
             "identity_map": identity_map,
             "identity_map_name": CONFIG.identity_map_name,
+            "allow_superuser_role": CONFIG.allow_superuser_role,
             # DB-22159 resource limits — read by tools.py at each call.
             "statement_timeout_ms": CONFIG.statement_timeout_ms,
             "max_result_rows": CONFIG.max_result_rows,
@@ -483,6 +487,18 @@ def parse_config() -> ServerConfig:
         help="Which named map inside the identity map file to apply. "
              "(env: YB_MCP_IDENTITY_MAP_NAME, default: default)",
     )
+    parser.add_argument(
+        "--allow-superuser-role",
+        action="store_true",
+        default=os.environ.get(
+            "YB_MCP_ALLOW_SUPERUSER_ROLE", ""
+        ).lower() == "true",
+        help="Defense-in-depth guard: by default we refuse to SET ROLE "
+             "to a superuser role, even if the identity map explicitly "
+             "resolves there. Setting this flag disables the guard "
+             "(not recommended). "
+             "(env: YB_MCP_ALLOW_SUPERUSER_ROLE=true)",
+    )
     # DB-22159 resource limits — bound the blast radius of a slow query
     # or a huge result set. All parsed with _positive_int so a typo in
     # the env fails startup with a clean argparse error.
@@ -562,6 +578,7 @@ def parse_config() -> ServerConfig:
         identity_claim=args.identity_claim,
         identity_map_path=args.identity_map,
         identity_map_name=args.identity_map_name,
+        allow_superuser_role=args.allow_superuser_role,
         pool_min_size=args.pool_min_size,
         pool_max_size=args.pool_max_size,
         statement_timeout_ms=args.statement_timeout_ms,

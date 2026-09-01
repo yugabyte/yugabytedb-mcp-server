@@ -38,6 +38,7 @@ _BASE_CONFIG = ServerConfig(
     identity_claim="email",
     identity_map_path=None,
     identity_map_name="mcp",
+    allow_superuser_role=False,
     pool_min_size=1,
     pool_max_size=3,
     statement_timeout_ms=30_000,

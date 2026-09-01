@@ -450,15 +450,44 @@ def _get_db_role(ctx: Context, requested_role: Optional[str] = None) -> Optional
 
 
 @contextmanager
-def _conn_as_role(pool, role: str | None):
+def _conn_as_role(pool, role: str | None, allow_superuser_role: bool = False):
     """Acquire a connection and optionally SET ROLE for the duration.
 
     If `role` is not None, executes SET ROLE before yielding and RESET ROLE
     in the finally block so the connection is returned to the pool clean.
+
+    Defense in depth: before running ``SET ROLE`` we query
+    ``pg_roles.rolsuper`` for the resolved role and refuse if it's a
+    superuser. This guards the last-mile of the OIDC → PG-role escalation
+    path: even if the earlier fail-closed guards on the claim shape / map
+    absence didn't catch a caller's claim, the pool won't hand them a
+    superuser role. Opt out with ``YB_MCP_ALLOW_SUPERUSER_ROLE=true``.
     """
     with pool.connection() as conn:
         if role is not None:
             with conn.cursor() as cur:
+                if not allow_superuser_role:
+                    cur.execute(
+                        "SELECT rolsuper FROM pg_roles WHERE rolname = %s",
+                        (role,),
+                    )
+                    row = cur.fetchone()
+                    # row is None when the role doesn't exist in pg_roles —
+                    # let the SET ROLE below fail with its own "role does
+                    # not exist" error rather than masking it.
+                    if row is not None and row[0]:
+                        logger.warning(
+                            "Refusing SET ROLE %r: role is a superuser. "
+                            "Set YB_MCP_ALLOW_SUPERUSER_ROLE=true to opt out.",
+                            role,
+                        )
+                        raise IdentityError(
+                            f"Refusing to SET ROLE {role!r}: role is a "
+                            f"superuser. Configure your identity map to "
+                            f"point at non-superuser roles, or set "
+                            f"YB_MCP_ALLOW_SUPERUSER_ROLE=true to opt out "
+                            f"(not recommended)."
+                        )
                 cur.execute(SQL("SET ROLE {}").format(Identifier(role)))
             logger.debug("SET ROLE %s", role)
         try:
@@ -508,7 +537,7 @@ def summarize_database(
         logger.error("Identity resolution failed: %s", e)
         return [{"error": str(e)}]
 
-    with _conn_as_role(pool, role) as conn:
+    with _conn_as_role(pool, role, allow_superuser_role=lifespan.get("allow_superuser_role", False)) as conn:
         logger.debug("Acquired connection from pool for summarize_database")
         with conn.cursor() as cur:
             try:
@@ -688,7 +717,7 @@ def run_read_only_query(
         logger.error("Identity resolution failed: %s", e)
         return json.dumps({"error": str(e)})
 
-    with _conn_as_role(pool, role) as conn:
+    with _conn_as_role(pool, role, allow_superuser_role=lifespan.get("allow_superuser_role", False)) as conn:
         logger.debug("Acquired connection from pool for run_read_only_query")
         # Control cursor drives BEGIN / SET LOCAL / ROLLBACK. The named
         # cursor below runs the user's SELECT as a server-side cursor
@@ -845,7 +874,7 @@ def run_write_query(
         logger.error("Identity resolution failed: %s", e)
         return json.dumps({"error": str(e)})
 
-    with _conn_as_role(pool, role) as conn:
+    with _conn_as_role(pool, role, allow_superuser_role=lifespan.get("allow_superuser_role", False)) as conn:
         logger.debug("Acquired connection from pool for run_write_query")
         with conn.cursor() as cur:
             try:
