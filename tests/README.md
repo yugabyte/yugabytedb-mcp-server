@@ -70,10 +70,8 @@ YUGABYTEDB_URL="..." uv run pytest tests/
 | `validate_write_query` — comment obfuscation | ✓ | ✓ | |
 | `validate_write_query` — psql meta-commands | ✓ | ✓ | |
 | `validate_write_query` — empty query / comment-only | ✓ | — | |
-| `validate_write_query` — bulk INSERT row limit | ✓ | ✓ (no DB side effect when blocked) | |
 | `validate_write_query` — require WHERE on UPDATE | ✓ | ✓ (no DB side effect when blocked) | |
 | `validate_write_query` — require WHERE on DELETE | ✓ | ✓ (no DB side effect when blocked) | |
-| Helper `_count_values_rows` | ✓ | — | |
 | Helper `_has_top_level_where` | ✓ | — | |
 | Helper `_strip_comments` | ✓ | — | |
 | `create_auth_provider` — None disables auth | ✓ | — | |

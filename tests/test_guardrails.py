@@ -8,7 +8,6 @@ from yugabytedb_mcp_server.guardrails import (
     GuardrailConfig,
     QueryBlockedError,
     validate_query,
-    _count_values_rows,
     _has_top_level_where,
     _strip_comments,
 )
@@ -17,7 +16,6 @@ from yugabytedb_mcp_server.guardrails import (
 @pytest.fixture
 def cfg():
     return GuardrailConfig(
-        max_insert_rows=10,
         require_where_on_update=False,
         require_where_on_delete=False,
     )
@@ -26,7 +24,6 @@ def cfg():
 @pytest.fixture
 def strict_cfg():
     return GuardrailConfig(
-        max_insert_rows=10,
         require_where_on_update=True,
         require_where_on_delete=True,
     )
@@ -49,6 +46,7 @@ def strict_cfg():
     "ALTER TABLE t ADD COLUMN c TEXT",
     "DROP TABLE t",                       # Only DROP DATABASE/SCHEMA blocked
     "INSERT INTO t DEFAULT VALUES",       # Single-row default insert, no VALUES tuple
+    "INSERT INTO t SELECT * FROM s",      # INSERT … SELECT bounded by statement_timeout
 ])
 def test_allows(sql, cfg):
     validate_query(sql, cfg, read_only=False)  # raises if blocked
@@ -211,61 +209,38 @@ def test_blocks_empty(sql, cfg):
 
 
 # ---------------------------------------------------------------------------
-# Bulk INSERT row limit
+# INSERT shapes — all allowed and bounded by SET LOCAL statement_timeout
 # ---------------------------------------------------------------------------
+# DB-22131 round 2: the static ``YB_MCP_MAX_INSERT_ROWS`` cap was retired.
+# Every write goes through statement_timeout in ``run_write_query`` before
+# executing, so a runaway INSERT — VALUES, SELECT, DEFAULT, whatever
+# shape — is bounded by the timeout. These tests pin that every INSERT
+# shape passes the guardrail cleanly.
 
-def test_bulk_insert_under_limit(cfg):
-    rows = ", ".join(["(1)"] * cfg.max_insert_rows)
+def test_bulk_insert_values_allowed(cfg):
+    rows = ", ".join(["(1)"] * 100)
     validate_query(f"INSERT INTO t VALUES {rows}", cfg, read_only=False)
 
 
-def test_bulk_insert_over_limit(cfg):
-    rows = ", ".join(["(1)"] * (cfg.max_insert_rows + 1))
-    with pytest.raises(QueryBlockedError) as exc:
-        validate_query(f"INSERT INTO t VALUES {rows}", cfg, read_only=False)
-    assert "exceeds the maximum" in str(exc.value)
+def test_insert_select_allowed(cfg):
+    """``INSERT … SELECT`` bounded by SET LOCAL statement_timeout."""
+    validate_query(
+        "INSERT INTO t SELECT * FROM huge_table", cfg, read_only=False,
+    )
 
 
-def test_insert_select_rejected(cfg):
-    """DB-22131 remainder: ``INSERT … SELECT`` is an unbounded row source
-    (max_insert_rows only counts VALUES tuples statically), so it must
-    be blocked on the write path — otherwise
-    ``INSERT INTO t SELECT generate_series(1, 1_000_000)`` writes a
-    million rows despite max_insert_rows=cfg.max_insert_rows."""
-    with pytest.raises(QueryBlockedError) as exc:
-        validate_query("INSERT INTO t SELECT * FROM huge_table", cfg, read_only=False)
-    assert "INSERT" in str(exc.value) and "SELECT" in str(exc.value)
+def test_insert_select_with_cte_allowed(cfg):
+    """CTE-prefixed INSERT … SELECT is the same shape, still allowed."""
+    validate_query(
+        "WITH src AS (SELECT id FROM other) INSERT INTO t SELECT * FROM src",
+        cfg, read_only=False,
+    )
 
 
-def test_insert_select_generate_series_rejected(cfg):
-    """Vishal's exact repro from the ticket."""
-    with pytest.raises(QueryBlockedError):
-        validate_query(
-            "INSERT INTO t SELECT generate_series(1, 50)", cfg, read_only=False,
-        )
-
-
-def test_insert_with_cte_select_rejected(cfg):
-    """A CTE that hides the SELECT source is still an unbounded copy —
-    the flattened-token walker catches nested SELECTs."""
-    with pytest.raises(QueryBlockedError):
-        validate_query(
-            "WITH src AS (SELECT id FROM other) INSERT INTO t SELECT * FROM src",
-            cfg, read_only=False,
-        )
-
-
-def test_insert_default_values_still_allowed(cfg):
+def test_insert_default_values_allowed(cfg):
     """Regression: ``INSERT … DEFAULT VALUES`` inserts one row with all
-    column defaults — bounded and safe. Must not be caught by the new
-    INSERT-…-SELECT rejection."""
+    column defaults."""
     validate_query("INSERT INTO t DEFAULT VALUES", cfg, read_only=False)
-
-
-def test_insert_values_still_allowed(cfg):
-    """Regression: the vanilla ``INSERT … VALUES (…)`` path is unaffected
-    by the new INSERT-…-SELECT check."""
-    validate_query("INSERT INTO t (id) VALUES (1), (2), (3)", cfg, read_only=False)
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +313,41 @@ def test_alter_function_rejected(cfg):
         )
 
 
+def test_create_or_replace_function_rejected(cfg):
+    """DB-22131: sqlparse tokenizes ``CREATE OR REPLACE`` as a single
+    Keyword.DDL, so the two-keyword pair matcher on ``('CREATE','FUNCTION')``
+    never fires. The dedicated ``_check_create_or_alter_routine`` scanner
+    catches this form."""
+    with pytest.raises(QueryBlockedError) as exc:
+        validate_query(
+            "CREATE OR REPLACE FUNCTION f() RETURNS int "
+            "LANGUAGE SQL AS $$ SELECT 1 $$",
+            cfg, read_only=False,
+        )
+    assert "CREATE FUNCTION" in str(exc.value)
+
+
+def test_create_or_replace_function_security_definer_rejected(cfg):
+    """The escalation form of the CREATE-OR-REPLACE variant — SECURITY
+    DEFINER on a redefined function. Same block."""
+    with pytest.raises(QueryBlockedError):
+        validate_query(
+            "CREATE OR REPLACE FUNCTION f() RETURNS int "
+            "SECURITY DEFINER LANGUAGE SQL AS $$ SELECT 1 $$",
+            cfg, read_only=False,
+        )
+
+
+def test_create_or_replace_procedure_rejected(cfg):
+    with pytest.raises(QueryBlockedError) as exc:
+        validate_query(
+            "CREATE OR REPLACE PROCEDURE p() "
+            "LANGUAGE plpgsql AS $$ BEGIN END $$",
+            cfg, read_only=False,
+        )
+    assert "CREATE PROCEDURE" in str(exc.value)
+
+
 # ---------------------------------------------------------------------------
 # Bulk-copy shapes intentionally left ALLOWED
 # ---------------------------------------------------------------------------
@@ -373,19 +383,6 @@ def test_create_table_plain_still_allowed(cfg):
 # ---------------------------------------------------------------------------
 # Helper-function unit tests
 # ---------------------------------------------------------------------------
-
-def test_count_values_rows_simple():
-    assert _count_values_rows("INSERT INTO t VALUES (1), (2), (3)") == 3
-
-
-def test_count_values_rows_nested():
-    # Inner parens (e.g. composite types) shouldn't be counted as rows
-    assert _count_values_rows("INSERT INTO t VALUES ((1, 'a')), ((2, 'b'))") == 2
-
-
-def test_count_values_rows_no_values():
-    assert _count_values_rows("INSERT INTO t SELECT * FROM s") is None
-
 
 def test_has_top_level_where_simple():
     assert _has_top_level_where("UPDATE t SET c = 1 WHERE id = 1")

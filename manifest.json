@@ -28,7 +28,6 @@
       "args": ["yugabytedb-mcp-server"],
       "env": {
         "YUGABYTEDB_URL": "${user_config.yugabytedb_url}",
-        "YB_MCP_MAX_INSERT_ROWS": "${user_config.max_insert_rows}",
         "YB_MCP_REQUIRE_WHERE_ON_UPDATE": "${user_config.require_where_on_update}",
         "YB_MCP_REQUIRE_WHERE_ON_DELETE": "${user_config.require_where_on_delete}"
       }
@@ -63,15 +62,6 @@
       "description": "libpq keyword string for your YugabyteDB or PostgreSQL database (e.g. `host=cloud.yugabyte.com port=5433 dbname=yugabyte user=admin password=… sslmode=require`).",
       "required": true,
       "sensitive": true
-    },
-    "max_insert_rows": {
-      "type": "number",
-      "title": "Maximum rows per INSERT VALUES",
-      "description": "Reject INSERT … VALUES statements with more rows than this. Default 1000.",
-      "default": 1000,
-      "required": false,
-      "min": 1,
-      "max": 100000
     },
     "require_where_on_update": {
       "type": "boolean",
