@@ -78,7 +78,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 def _create_cognito():
     """AWS Cognito auth provider.
 
-    Two DB-22136 fixes applied here:
+    Two fixes applied here:
 
     1. **Audience validation (always on).** `JWTVerifier(audience=...)` is
        initialized with the Cognito App-client ID — Cognito access tokens
@@ -92,7 +92,7 @@ def _create_cognito():
        Rejects ID tokens and refresh tokens presented as bearers. Off by
        default because existing deployments with `YB_MCP_IDENTITY_CLAIM=email`
        rely on ID tokens (email is not in the access token) — see
-       DB-22192. Migration path: switch `identity_claim` to a claim present
+ Migration path: switch `identity_claim` to a claim present
        in access tokens (e.g. `cognito:groups`, `sub`), then flip this env
        to `true`.
     """
@@ -128,8 +128,7 @@ def _create_cognito():
 
         2. **``token_use=access`` enforcement** (opt-in via
            ``YB_MCP_REQUIRE_ACCESS_TOKEN=true``, off by default for
-           backward compat). See DB-22136.
-        """
+           backward compat). See        """
 
         def __init__(
             self,
@@ -232,10 +231,20 @@ def _create_cognito():
     if getattr(proxy, "_cimd_manager", None) is not None:
         proxy._cimd_manager.default_scope = scopes
 
-    require_access_token = _env_bool("YB_MCP_REQUIRE_ACCESS_TOKEN", default=False)
+    # Reject ID tokens by default. Old behavior was
+    # ``require_access_token=false``, which let an ID token authenticate
+    # ``/mcp`` (with a warning) — post-review found this was still-live
+    # even after the audience fix. Compatibility escape hatch: set
+    # ``YB_MCP_LEGACY_ACCEPT_ID_TOKENS=true`` to restore the old
+    # default. ``YB_MCP_REQUIRE_ACCESS_TOKEN`` still works as an
+    # explicit override.
+    _legacy = _env_bool("YB_MCP_LEGACY_ACCEPT_ID_TOKENS", default=False)
+    require_access_token = _env_bool(
+        "YB_MCP_REQUIRE_ACCESS_TOKEN", default=(not _legacy)
+    )
     raw_jwt_verifier = _CognitoJWTVerifier(
         require_access_token=require_access_token,
-        # DB-22136: block tokens minted for other app clients in the same
+        # block tokens minted for other app clients in the same
         # user pool. Cognito ID tokens set `aud=client_id`; Cognito access
         # tokens set `client_id` and omit `aud`. `_CognitoJWTVerifier`
         # accepts either — see class docstring.
@@ -256,7 +265,7 @@ def _create_oidc():
     """Generic OIDC provider. Untested — exercise at your own risk and please
     report findings.
 
-    DB-22136 audience-validation fix: `OIDC_AUDIENCE` (already read for
+ audience-validation fix: `OIDC_AUDIENCE` (already read for
     `OIDCProxy`) is now also forwarded to `JWTVerifier`, so a token issued
     to a different client of the same issuer is rejected at the verifier
     layer. `token_use=access` enforcement is NOT applied here because
@@ -293,7 +302,7 @@ def _create_oidc():
     raw_jwt_verifier = JWTVerifier(
         jwks_uri=str(proxy.oidc_config.jwks_uri),
         issuer=str(proxy.oidc_config.issuer),
-        # DB-22136: forward the audience to the verifier when present.
+        # forward the audience to the verifier when present.
         audience=audience,
     )
 

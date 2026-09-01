@@ -70,18 +70,6 @@ def _execute(cur, query, params: tuple | None = None) -> None:
         cur.execute(query)
 
 
-def _apply_transform(value: str, transform: str) -> str:
-    """Apply a named transform to a claim value to derive a DB role name.
-
-    Backward-compat helper used by the no-map path (when
-    ``YB_MCP_IDENTITY_MAP`` is unset). The map-file path replaces this with
-    an explicit map lookup — see ``_apply_map`` and ``_load_identity_map``.
-    """
-    if transform == "strip_domain":
-        return value.split("@", 1)[0]
-    return value
-
-
 class IdentityError(Exception):
     """Raised when an authenticated token lacks the required identity claim."""
 
@@ -99,8 +87,9 @@ class IdentityError(Exception):
 #   via the tool's `requested_role` parameter; server clamps against the
 #   JWT's list.
 # - `YB_MCP_IDENTITY_MAP` points at a `pg_ident.conf`-style file with
-#   literal or regex entries. When configured, replaces the legacy
-#   `_apply_transform` path.
+#   literal or regex entries. When configured, each token claim value is
+#   looked up in the map to derive the DB role. Without a map, the raw
+#   claim value is used as the role name directly.
 # ---------------------------------------------------------------------------
 
 
@@ -355,7 +344,7 @@ def _get_db_role(ctx: Context, requested_role: Optional[str] = None) -> Optional
       against the JWT's list.
     - When ``YB_MCP_IDENTITY_MAP`` is configured, the resolved claim value(s)
       go through ``_apply_map`` (pg_ident.conf-style lookup). Otherwise the
-      legacy ``_apply_transform`` path runs (v1 backward-compat).
+      raw claim value is used verbatim as the DB role name.
 
     Raises ``IdentityError`` when a token IS present but the claim resolves
     to nothing — falling back to pool credentials would be a privilege
@@ -370,8 +359,7 @@ def _get_db_role(ctx: Context, requested_role: Optional[str] = None) -> Optional
         return None
 
     lifespan = ctx.request_context.lifespan_context
-    claim_name = lifespan.get("identity_claim", "email")
-    transform = lifespan.get("identity_transform", "none")
+    claim_name = lifespan.get("identity_claim", "sub")
     identity_map: Optional[Dict[str, List[MapEntry]]] = lifespan.get("identity_map")
     identity_map_name: str = lifespan.get("identity_map_name", "default")
 
@@ -390,10 +378,49 @@ def _get_db_role(ctx: Context, requested_role: Optional[str] = None) -> Optional
 
     # 2. Normalize the claim to a list of non-empty string values. This is
     #    where scalar and list-valued claims converge into one code path.
-    if isinstance(claim_value, list):
+    #
+    # Fail-closed at request time: any *composite* claim value
+    # (list, tuple, dict) without a map means the caller could hand us
+    # arbitrary group names / structures which we'd feed verbatim to
+    # `SET ROLE` — no allowlist. Design intent: fail closed whenever
+    # there is no allowlist/map and the claim is not a fixed enumerated
+    # value, regardless of claim name. Dicts and tuples are rare but
+    # not fixed either. The startup guard can only see the claim NAME,
+    # so it misses composite claims served under unrecognized names
+    # (`roles`, `entitlements`, custom scopes) — catch them here where
+    # the actual value type is known.
+    if isinstance(claim_value, (list, tuple)):
         raw_values = [str(v) for v in claim_value if v]
         if not raw_values:
             raise IdentityError(_missing_msg)
+        if identity_map is None:
+            raise IdentityError(
+                f"Claim {claim_name!r} resolved to a "
+                f"{type(claim_value).__name__} of {len(raw_values)} "
+                f"value(s), but YB_MCP_IDENTITY_MAP is unset. A composite "
+                f"claim without a map has no allowlist — every value "
+                f"would be a candidate SET ROLE target. Configure "
+                f"YB_MCP_IDENTITY_MAP to translate IdP values to a fixed "
+                f"PG role set, or switch YB_MCP_IDENTITY_CLAIM to a "
+                f"scalar claim like `sub` or `email`."
+            )
+    elif isinstance(claim_value, dict):
+        if identity_map is None:
+            raise IdentityError(
+                f"Claim {claim_name!r} resolved to a dict, but "
+                f"YB_MCP_IDENTITY_MAP is unset. A composite claim "
+                f"without a map has no allowlist and no defined mapping "
+                f"to a scalar role name. Configure YB_MCP_IDENTITY_MAP, "
+                f"or switch YB_MCP_IDENTITY_CLAIM to a scalar claim like "
+                f"`sub` or `email`."
+            )
+        # With a map: fall through with a synthesized "raw value" that
+        # the map lookup can key off. Since the map is admin-controlled,
+        # a stringified dict is fine as a lookup key — the operator
+        # decides whether to accept it.
+        if not claim_value:
+            raise IdentityError(_missing_msg)
+        raw_values = [str(claim_value)]
     else:
         if not claim_value:
             raise IdentityError(_missing_msg)
@@ -401,7 +428,7 @@ def _get_db_role(ctx: Context, requested_role: Optional[str] = None) -> Optional
 
     # 3. Resolve each raw value to a candidate role.
     #    - With a map: apply pg_ident-style lookup; drop unmapped values.
-    #    - Without a map (v1 backward-compat): apply transform to each.
+    #    - Without a map: use the claim value verbatim as the DB role name.
     if identity_map is not None:
         candidates: List[str] = []
         for v in raw_values:
@@ -409,7 +436,7 @@ def _get_db_role(ctx: Context, requested_role: Optional[str] = None) -> Optional
             if mapped is not None:
                 candidates.append(mapped)
     else:
-        candidates = [_apply_transform(v, transform) for v in raw_values]
+        candidates = list(raw_values)
 
     # 4. Pick one role.
     role = _pick_role(candidates, requested_role)
@@ -423,15 +450,44 @@ def _get_db_role(ctx: Context, requested_role: Optional[str] = None) -> Optional
 
 
 @contextmanager
-def _conn_as_role(pool, role: str | None):
+def _conn_as_role(pool, role: str | None, allow_superuser_role: bool = False):
     """Acquire a connection and optionally SET ROLE for the duration.
 
     If `role` is not None, executes SET ROLE before yielding and RESET ROLE
     in the finally block so the connection is returned to the pool clean.
+
+    Defense in depth: before running ``SET ROLE`` we query
+    ``pg_roles.rolsuper`` for the resolved role and refuse if it's a
+    superuser. This guards the last-mile of the OIDC → PG-role escalation
+    path: even if the earlier fail-closed guards on the claim shape / map
+    absence didn't catch a caller's claim, the pool won't hand them a
+    superuser role. Opt out with ``YB_MCP_ALLOW_SUPERUSER_ROLE=true``.
     """
     with pool.connection() as conn:
         if role is not None:
             with conn.cursor() as cur:
+                if not allow_superuser_role:
+                    cur.execute(
+                        "SELECT rolsuper FROM pg_roles WHERE rolname = %s",
+                        (role,),
+                    )
+                    row = cur.fetchone()
+                    # row is None when the role doesn't exist in pg_roles —
+                    # let the SET ROLE below fail with its own "role does
+                    # not exist" error rather than masking it.
+                    if row is not None and row[0]:
+                        logger.warning(
+                            "Refusing SET ROLE %r: role is a superuser. "
+                            "Set YB_MCP_ALLOW_SUPERUSER_ROLE=true to opt out.",
+                            role,
+                        )
+                        raise IdentityError(
+                            f"Refusing to SET ROLE {role!r}: role is a "
+                            f"superuser. Configure your identity map to "
+                            f"point at non-superuser roles, or set "
+                            f"YB_MCP_ALLOW_SUPERUSER_ROLE=true to opt out "
+                            f"(not recommended)."
+                        )
                 cur.execute(SQL("SET ROLE {}").format(Identifier(role)))
             logger.debug("SET ROLE %s", role)
         try:
@@ -469,7 +525,7 @@ def summarize_database(
     summary: List[Dict[str, Any]] = []
     lifespan = ctx.request_context.lifespan_context
     pool = lifespan["pool"]
-    # DB-22159 round-2: previously only run_read_only_query /
+    # previously only run_read_only_query /
     # run_write_query enforced the statement_timeout; a `COUNT(*)` over a
     # huge table via summarize_database could hold a pool connection
     # indefinitely. Apply the same cap here.
@@ -481,7 +537,7 @@ def summarize_database(
         logger.error("Identity resolution failed: %s", e)
         return [{"error": str(e)}]
 
-    with _conn_as_role(pool, role) as conn:
+    with _conn_as_role(pool, role, allow_superuser_role=lifespan.get("allow_superuser_role", False)) as conn:
         logger.debug("Acquired connection from pool for summarize_database")
         with conn.cursor() as cur:
             try:
@@ -514,7 +570,7 @@ def summarize_database(
                     tables = []
                 logger.debug("Schema %s has %d tables: %s", schema, len(tables), tables)
 
-                # DB-22138: per-table error handling. A single problematic
+                # per-table error handling. A single problematic
                 # object (view over a since-dropped table, permission-denied
                 # table, division-by-zero in a view, foreign-table connection
                 # error…) previously aborted the whole loop and discarded
@@ -540,7 +596,7 @@ def summarize_database(
                             for col, dtype in cur.fetchall()
                         ]
 
-                        # DB-22158: `schema` is interpolated unquoted here
+                        # `schema` is interpolated unquoted here
                         # — pre-existing gap, deferred. The per-table
                         # SAVEPOINT above does not narrow or widen that
                         # surface; it only prevents one bad object from
@@ -621,14 +677,14 @@ def run_read_only_query(
     lifespan = ctx.request_context.lifespan_context
     pool = lifespan["pool"]
     guardrail_config: GuardrailConfig = lifespan["guardrail_config"]
-    # DB-22159 resource caps
+    # resource caps
     max_query_len = lifespan["max_query_len"]
     statement_timeout_ms = lifespan["statement_timeout_ms"]
     max_result_rows = lifespan["max_result_rows"]
     max_result_bytes = lifespan["max_result_bytes"]
 
     # Reject oversized queries BEFORE parsing or opening a connection.
-    # Vishal observed a ~1MB write query burning ~6s of CPU in the
+    # observed a ~1MB write query burning ~6s of CPU in the
     # guardrail parser alone; keep the pre-parse surface flat. Byte
     # length (UTF-8) matches the DoS rationale and the env-var
     # documentation.
@@ -661,7 +717,7 @@ def run_read_only_query(
         logger.error("Identity resolution failed: %s", e)
         return json.dumps({"error": str(e)})
 
-    with _conn_as_role(pool, role) as conn:
+    with _conn_as_role(pool, role, allow_superuser_role=lifespan.get("allow_superuser_role", False)) as conn:
         logger.debug("Acquired connection from pool for run_read_only_query")
         # Control cursor drives BEGIN / SET LOCAL / ROLLBACK. The named
         # cursor below runs the user's SELECT as a server-side cursor
@@ -673,14 +729,14 @@ def run_read_only_query(
         with conn.cursor() as ctrl_cur:
             try:
                 _execute(ctrl_cur, "BEGIN READ ONLY")
-                # DB-22159: SET LOCAL statement_timeout scopes the cap to
+                # SET LOCAL statement_timeout scopes the cap to
                 # this transaction only — the timeout dies with the ROLLBACK
                 # below, so it doesn't leak across pool checkouts.
                 _execute(
                     ctrl_cur,
                     f"SET LOCAL statement_timeout = '{statement_timeout_ms}ms'",
                 )
-                # DB-22159 round-2: server-side cursor + small itersize.
+                # server-side cursor + small itersize.
                 # psycopg3's client-side cursor buffers ALL rows at
                 # ``execute()`` time, defeating any downstream byte cap;
                 # a named cursor issues DECLARE/FETCH so the DB streams
@@ -715,7 +771,7 @@ def run_read_only_query(
                         approx_bytes += row_bytes
                     truncated = truncated_by_rows or truncated_by_bytes
                     column_names = [desc[0] for desc in cur.description]
-                # Use the parallel-arrays shape (PR #9 / DB-22203) so
+                # Use the parallel-arrays shape (PR #9 / ) so
                 # duplicate column names don't collapse; still robust to a
                 # `SELECT a.id, b.id FROM ...` after a join.
                 result: dict = {
@@ -782,12 +838,12 @@ def run_write_query(
     lifespan = ctx.request_context.lifespan_context
     pool = lifespan["pool"]
     guardrail_config: GuardrailConfig = lifespan["guardrail_config"]
-    # DB-22159 resource caps
+    # resource caps
     max_query_len = lifespan["max_query_len"]
     statement_timeout_ms = lifespan["statement_timeout_ms"]
 
     # Reject oversized queries BEFORE parsing — the guardrail's sqlparse
-    # walker spikes CPU on very large inputs (Vishal measured ~6.4s on a
+    # walker spikes CPU on very large inputs (observed ~6.4s on a
     # ~1MB query). Cheap first-line defense. Measured in bytes to match
     # the env var's documented unit; `len(str)` alone counts code points,
     # which diverges for multibyte UTF-8.
@@ -818,15 +874,15 @@ def run_write_query(
         logger.error("Identity resolution failed: %s", e)
         return json.dumps({"error": str(e)})
 
-    with _conn_as_role(pool, role) as conn:
+    with _conn_as_role(pool, role, allow_superuser_role=lifespan.get("allow_superuser_role", False)) as conn:
         logger.debug("Acquired connection from pool for run_write_query")
         with conn.cursor() as cur:
             try:
-                # DB-22159 + DB-22131 round 2: SET LOCAL statement_timeout
+                # + SET LOCAL statement_timeout
                 # runs before EVERY write, unconditionally. It's the sole
                 # bound on runtime for INSERT (VALUES, SELECT, DEFAULT
                 # VALUES), UPDATE, DELETE, and DDL — the static row cap
-                # `YB_MCP_MAX_INSERT_ROWS` was retired in DB-22131 round 2.
+                # `YB_MCP_MAX_INSERT_ROWS` was retired in .
                 # SET LOCAL opens the implicit transaction that psycopg's
                 # default (autocommit=False) uses, and the timeout dies
                 # on commit so it doesn't leak across pool checkouts.

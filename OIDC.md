@@ -16,7 +16,7 @@ Reference: YugabyteDB YSQL OIDC docs — [oidc-authentication-aad](https://docs.
 ## Table of contents
 
 - [When to use it](#when-to-use-it)
-- [Quick start (v1 default: email + strip_domain)](#quick-start)
+- [Quick start (Cognito + identity map)](#quick-start)
 - [Provider setup](#provider-setup)
   - [AWS Cognito](#aws-cognito)
   - [Generic OIDC](#generic-oidc)
@@ -27,11 +27,10 @@ Reference: YugabyteDB YSQL OIDC docs — [oidc-authentication-aad](https://docs.
   - [The identity map file (pg_ident.conf format)](#the-identity-map-file)
   - [List-valued claims and the `requested_role` parameter](#list-valued-claims)
 - [Worked examples](#worked-examples)
-  - [Example 1 — Cognito with `email` (v1 default)](#example-1)
-  - [Example 2 — Cognito with `cognito:groups` (access-token flow)](#example-2)
-  - [Example 3 — Keycloak with `realm_access.roles`](#example-3)
-  - [Example 4 — Azure AD with GUID-valued groups](#example-4)
-  - [Example 5 — Generic OIDC with a custom claim](#example-5)
+  - [Example 1 — Cognito with `cognito:groups` (access-token flow)](#example-1)
+  - [Example 2 — Keycloak with `realm_access.roles`](#example-2)
+  - [Example 3 — Azure AD with GUID-valued groups](#example-3)
+  - [Example 4 — Generic OIDC with a custom claim](#example-4)
 - [The `/auth/login` endpoint (Cognito password flow)](#the-authlogin-endpoint)
 - [Security guidance](#security-guidance)
 - [Migrating from v1 to v2](#migrating-from-v1-to-v2)
@@ -56,8 +55,10 @@ authorization enforced at the database layer.
 
 ## Quick start
 
-The simplest working setup: AWS Cognito + `email` claim + `strip_domain`
-transform. Each Cognito user's email local-part becomes a Postgres role.
+The recommended setup: AWS Cognito + `sub` claim (present in access
+tokens) + an explicit identity map that pins each user to a Postgres
+role. Each token maps to a Postgres role via a file, not a transform,
+so cross-domain collisions can't occur silently.
 
 ```bash
 # 1. In Postgres — create one role per user and grant the pool user
@@ -66,23 +67,33 @@ psql -c "CREATE ROLE alice;    GRANT SELECT ON tbl TO alice;"
 psql -c "CREATE ROLE bob;      GRANT SELECT ON tbl TO bob;"
 psql -c "GRANT alice, bob TO yugabyte;"
 
-# 2. Configure the server.
+# 2. Write an identity map — one line per user, mapping the Cognito
+#    `sub` (or any claim you pick) to a Postgres role.
+cat > /etc/yb-mcp/ident.conf <<'MAP'
+# map_name  system_value                            db_role
+default     a1b2c3d4-1111-2222-3333-444444444444    alice
+default     e5f6g7h8-5555-6666-7777-888888888888    bob
+MAP
+
+# 3. Configure the server.
 export MCP_AUTH_PROVIDER=cognito
 export MCP_BASE_URL=https://mcp.example.com
 export COGNITO_USER_POOL_ID=us-west-2_XXXXXXXX
 export COGNITO_AWS_REGION=us-west-2
 export COGNITO_CLIENT_ID=…
 export COGNITO_CLIENT_SECRET=…
-export YB_MCP_IDENTITY_CLAIM=email          # default; shown for clarity
-export YB_MCP_IDENTITY_TRANSFORM=strip_domain
+export YB_MCP_IDENTITY_CLAIM=sub                 # present in access tokens
+export YB_MCP_IDENTITY_MAP=/etc/yb-mcp/ident.conf
 
-# 3. Run.
+# 4. Run.
 yugabytedb-mcp --transport http
 ```
 
-Result: a caller authenticating as `alice@example.com` gets `SET ROLE alice`
-on every tool call. `bob@example.com` gets `SET ROLE bob`. Neither can access
-the other's data (assuming Postgres grants are set up correctly).
+Result: a caller with a Cognito token whose `sub` is one of the
+map entries gets `SET ROLE alice` (or `bob`) on every tool call. A
+token whose `sub` isn't in the map is rejected. Neither user can
+access the other's data (assuming Postgres grants are set up
+correctly).
 
 For access-token workflows, list-valued claims, and role allowlists via a
 map file, jump to the [Worked examples](#worked-examples).
@@ -93,7 +104,6 @@ map file, jump to the [Worked examples](#worked-examples).
 
 Two providers are supported: `cognito` (tested end-to-end) and `oidc`
 (generic OIDC; exercised via Keycloak by the tutorials under
-[`examples/oidc-auth/`](examples/oidc-auth/) and
 [`examples/oidc-auth-mapping/`](examples/oidc-auth-mapping/)). Any RFC 6749 /
 OIDC 1.0 compliant provider should work — only the connection details change.
 
@@ -145,11 +155,12 @@ release, **(v2)** if new.
 |---|---|---|
 | `MCP_AUTH_PROVIDER` | `--mcp-auth-provider` | `cognito`, `oidc`, or unset (auth disabled). |
 | `MCP_BASE_URL` | — | Public base URL the server is reachable at (used for OAuth redirects). Required when auth is enabled. |
-| `YB_MCP_IDENTITY_CLAIM` | `--identity-claim` | **(v1, v2-extended)** JWT claim carrying the user's identity. v2 accepts dotted paths like `realm_access.roles` and top-level names with colons like `cognito:groups`. Default: `email`. |
-| `YB_MCP_IDENTITY_TRANSFORM` | `--identity-transform` | **(v1)** `none` (default) or `strip_domain`. Applied only on the no-map path — the map file replaces it when configured. |
-| `YB_MCP_IDENTITY_MAP` | `--identity-map` | **(v2)** Path to a `pg_ident.conf`-style map file. When set, replaces the transform path. See [The identity map file](#the-identity-map-file). |
+| `YB_MCP_IDENTITY_CLAIM` | `--identity-claim` | **(v1, v2-extended)** JWT claim carrying the user's identity. v2 accepts dotted paths like `realm_access.roles` and top-level names with colons like `cognito:groups`. Default: `sub` (or `email` when `YB_MCP_LEGACY_ACCEPT_ID_TOKENS=true`). |
+| `YB_MCP_IDENTITY_MAP` | `--identity-map` | **(v2)** Path to a `pg_ident.conf`-style map file. When set, each claim value is looked up in the map; without a map, the raw claim value is used verbatim as the DB role. See [The identity map file](#the-identity-map-file). |
 | `YB_MCP_IDENTITY_MAP_NAME` | `--identity-map-name` | **(v2)** Which named map inside the file to apply. Default: `default`. |
-| `YB_MCP_REQUIRE_ACCESS_TOKEN` | — | **(v2, Cognito-only)** When `true`, reject tokens with `token_use != "access"` (rejects ID tokens and refresh tokens presented as bearers). Default: `false` for backward compat with `identity_claim=email` deployments that rely on ID tokens. See [Access-token vs ID-token](#access-token-vs-id-token). |
+| `YB_MCP_ALLOW_SUPERUSER_ROLE` | `--allow-superuser-role` | **(v2)** Defense-in-depth guard. By default the server refuses to `SET ROLE` to any role whose `pg_roles.rolsuper` is true, even if the identity map explicitly resolves there. Set to `true` to disable the guard (not recommended). Default: `false`. |
+| `YB_MCP_REQUIRE_ACCESS_TOKEN` | — | **(v2, Cognito-only)** When `true`, reject tokens with `token_use != "access"` (rejects ID tokens and refresh tokens presented as bearers). Default: `true`. See [Access-token vs ID-token](#access-token-vs-id-token). |
+| `YB_MCP_LEGACY_ACCEPT_ID_TOKENS` | — | **(v2)** Compat flag. When `true`, allows these: `identity_claim=email` and `require_access_token=false` (ID tokens accepted). Prefer setting each individually. |
 
 Cognito-specific (only required when `MCP_AUTH_PROVIDER=cognito`) — see
 [AWS Cognito](#aws-cognito) above.
@@ -182,7 +193,7 @@ JWT access token
   │      │    apply the map — literal or regex lookup per entry.
   │      │    Unmapped values are dropped (not fallen through).
   │      └─ Otherwise:
-  │           apply `YB_MCP_IDENTITY_TRANSFORM` (`none` or `strip_domain`).
+  │           use the raw claim value verbatim as the DB role name.
   │
   ├─ (5) Pick one candidate
   │      ├─ 0 candidates → IdentityError (fail-closed)
@@ -201,7 +212,7 @@ Two error modes:
   through to pool credentials.
 - **`SET ROLE` failure** at the DB layer — the mapped role doesn't exist,
   or the pool user doesn't have `GRANT` on it. Currently surfaces as a
-  `ToolError`; DB-22175 tracks turning this into a clean `IdentityError`.
+  `ToolError`; tracks turning this into a clean `IdentityError`.
 
 ### Claim types
 
@@ -335,37 +346,7 @@ The server clamps — the agent cannot request a role that isn't in the JWT.
 
 ### Example 1
 
-**Cognito with `email` (v1 default; simplest case).**
-
-```bash
-export MCP_AUTH_PROVIDER=cognito
-export COGNITO_USER_POOL_ID=us-west-2_XXXXXXXX
-export COGNITO_AWS_REGION=us-west-2
-export COGNITO_CLIENT_ID=abc123
-export COGNITO_CLIENT_SECRET=…
-export YB_MCP_IDENTITY_CLAIM=email
-export YB_MCP_IDENTITY_TRANSFORM=strip_domain
-# YB_MCP_IDENTITY_MAP unset — v1 backward-compat path
-```
-
-For each Cognito user, create a matching Postgres role:
-
-```sql
-CREATE ROLE alice; GRANT alice TO yugabyte;
-CREATE ROLE bob;   GRANT bob   TO yugabyte;
-```
-
-A caller authenticating as `alice@example.com` runs SQL under `SET ROLE
-alice`.
-
-**Caveat** (DB-22192): Cognito ID tokens carry `email` but access tokens
-don't. Under this configuration the server needs to accept ID tokens. Once
-`token_use=access` enforcement lands (PR #3 opt-in), switch to Example 2.
-
-### Example 2
-
-**Cognito with `cognito:groups` (access-token workflow; recommended
-long-term).**
+**Cognito with `cognito:groups` (access-token workflow; recommended).**
 
 Configure Cognito to add users to User Pool Groups (Console → User pools →
 Groups). Access tokens now carry `cognito:groups`:
@@ -406,10 +387,10 @@ CREATE ROLE reader; GRANT SELECT ON tbl TO reader; GRANT reader TO yugabyte;
 ```
 
 Server-side flow: `_extract_claim` gets `["writer","reader"]` →
-`_apply_transform("none")` on each → candidates `["writer","reader"]` →
-`_pick_role(candidates, "reader")` returns `"reader"` → `SET ROLE reader`.
+no-map path (raw claim used verbatim) → candidates `["writer","reader"]`
+→ `_pick_role(candidates, "reader")` returns `"reader"` → `SET ROLE reader`.
 
-### Example 3
+### Example 2
 
 **Keycloak with `realm_access.roles` (dotted-path claim + map file).**
 
@@ -451,7 +432,7 @@ Server-side flow: `_extract_claim` walks
 Keycloak boilerplate roles never reach the database. The map IS the
 allowlist.
 
-### Example 4
+### Example 3
 
 **Azure AD with GUID-valued `groups` (regex map required).**
 
@@ -493,7 +474,7 @@ azure  /^APP_YB_MCP_(.+)$   \1
 
 `APP_YB_MCP_writer` → `writer`.
 
-### Example 5
+### Example 4
 
 **Generic OIDC (e.g. Okta) with a custom claim.**
 
@@ -537,8 +518,8 @@ Requires the Cognito app client to have `ALLOW_USER_PASSWORD_AUTH` enabled
 password-reset, and other challenge flows are not handled — those require the
 browser OAuth flow.
 
-Hardening gaps tracked in DB-22190 (uniform error detail — currently leaks
-whether the email exists) and DB-22191 (no app-level rate limiting; returns
+Hardening gaps tracked in (uniform error detail — currently leaks
+whether the email exists) and (no app-level rate limiting; returns
 refresh token in the response body). Both scheduled for follow-up release.
 
 ---
@@ -571,8 +552,7 @@ Two approaches:
 
 Without a map file AND a superuser pool, any authenticated user whose
 claim happens to spell an existing role name gets `SET ROLE` to that role —
-including superuser roles named after real users. This is DB-22135.
-
+including superuser roles named after real users. This is
 ### Why the map is an allowlist
 
 The map's `<system_value>` field is a whitelist. Values not matching any
@@ -603,14 +583,15 @@ path closes. To be ready:
 
 - Prefer identity claims present in access tokens (`sub`, `cognito:groups`,
   custom claims via a Cognito Lambda). Don't rely on `email`.
-- Example 2 above is the recommended long-term shape.
+- Example 1 above is the recommended long-term shape.
 
 ---
 
 ## Migrating from v1 to v2
 
-The v2 mapping is fully backward-compatible. If `YB_MCP_IDENTITY_MAP` is
-unset, the server behaves exactly like v1 (email → strip_domain → role).
+Cognito access tokens are required by default. Set
+`YB_MCP_LEGACY_ACCEPT_ID_TOKENS=true` to opt back into ID tokens if
+your deployment still uses `email` from the ID token.
 
 Migration checklist for an existing deployment:
 
@@ -662,7 +643,7 @@ and let the server auto-pick with a WARNING).
 
 **`role "X" does not exist`** (as a `ToolError`, not `IdentityError`).
 The mapping produced a role name that Postgres doesn't have. Either
-create the role or fix the map. DB-22175 tracks converting this into a
+create the role or fix the map. tracks converting this into a
 clean `IdentityError` at the tool layer.
 
 **Server refuses to start with `ValueError: /path/ident.conf:N: …`.**

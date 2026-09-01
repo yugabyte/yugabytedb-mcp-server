@@ -1,13 +1,12 @@
 # OIDC identity-mapping tutorial — realm-role claim + map file + `requested_role`
 
-Companion to [`examples/oidc-auth/`](../oidc-auth/README.md). That tutorial proves per-user Postgres roles work end-to-end using the simplest possible claim (`email`) with a transform. **This** tutorial proves the same enforcement with the v2 identity-mapping additions:
+An end-to-end tutorial that proves per-user Postgres roles work with
+the OIDC identity-mapping features:
 
 - **List-valued claim** — `realm_access.roles` is a JSON array, not a scalar
 - **Dotted-path claim extraction** — the server walks `realm_access` then `roles`
 - **Identity map file** — an allowlist that translates Keycloak realm-role names to Postgres role names AND drops Keycloak boilerplate roles (`offline_access`, `default-roles-*`, `uma_authorization`)
 - **`requested_role` on ambiguity** — a user whose token maps to more than one Postgres role picks explicitly per tool call
-
-The two tutorials run side-by-side without interfering — different Keycloak port (18081 vs 18080), different realm (`yb-mcp-map` vs `yb-mcp`), same Postgres roles (`writer` / `reader`), same demo table.
 
 ## What you'll prove by the end
 
@@ -42,8 +41,6 @@ The two tutorials run side-by-side without interfering — different Keycloak po
 - **`uv`** — to run the MCP server (`brew install uv`, `pip install uv`, or [docs.astral.sh/uv](https://docs.astral.sh/uv/))
 - A reachable **YugabyteDB** instance — `yugabyted start` locally is fine; PostgreSQL works too
 - 15–20 minutes
-
-If you already ran the sibling [`examples/oidc-auth/`](../oidc-auth/README.md) tutorial, you can skip Step 2 (Postgres seed) — the roles / table / grants are identical.
 
 ## Step 1 — Start Keycloak
 

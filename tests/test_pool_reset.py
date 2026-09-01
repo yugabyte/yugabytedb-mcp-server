@@ -1,4 +1,4 @@
-"""Unit tests for `_pool_reset` (DB-22133 + DB-22202).
+"""Unit tests for `_pool_reset`.
 
 `_pool_reset` is the `reset=` callback wired into the psycopg
 ConnectionPool. It runs two statements on every connection return so

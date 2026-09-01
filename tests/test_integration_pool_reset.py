@@ -1,17 +1,17 @@
-"""Integration tests for DISCARD ALL pool reset (DB-22133 + DB-22202).
+"""Integration tests for DISCARD ALL pool reset.
 
 Verifies that session state left behind by one tool call is scrubbed
 before the next pool checkout. Requires YUGABYTEDB_URL.
 
-Repros driven directly from Vishal's ticket text:
+Repros driven from the audit's exact wording:
 
-- DB-22133: SET ROLE inside a checkout doesn't leak to the next checkout
+- SET ROLE inside a checkout doesn't leak to the next checkout
   even when `_conn_as_role`'s `RESET ROLE` in `finally` gets skipped
   (belt-and-braces test using a raw pool, not the tool wrapper).
-- DB-22202 (advisory locks): SELECT pg_advisory_lock(k) survives the
+- (advisory locks): SELECT pg_advisory_lock(k) survives the
   read tool's ROLLBACK; with DISCARD ALL, the lock is released on
   return so an independent acquisition of the same key doesn't block.
-- DB-22202 (prepared statement cache): DEALLOCATE ALL through the read
+- (prepared statement cache): DEALLOCATE ALL through the read
   tool desyncs psycopg's prepared-statement cache; with DISCARD ALL,
   the next read query succeeds instead of failing with
   `prepared statement "_pg3_0" does not exist`.
@@ -45,7 +45,7 @@ def _url() -> str:
 # ---------------------------------------------------------------------------
 
 def test_discard_all_clears_set_role():
-    """DB-22133: SET ROLE on a checkout, return connection, next checkout
+    """ SET ROLE on a checkout, return connection, next checkout
     is back to the pool's default role."""
     pool = ConnectionPool(
         conninfo=_url(),
@@ -77,7 +77,7 @@ def test_discard_all_clears_set_role():
         with pool.connection() as conn:
             role_after = conn.execute("SELECT current_role").fetchone()[0]
             assert role_after == baseline, (
-                f"DB-22133: SET ROLE leaked across pool checkouts. "
+                f" SET ROLE leaked across pool checkouts. "
                 f"expected={baseline}, got={role_after}"
             )
 
@@ -89,7 +89,7 @@ def test_discard_all_clears_set_role():
 
 
 def test_discard_all_clears_advisory_lock():
-    """DB-22202: advisory lock taken on one checkout must not survive to
+    """ advisory lock taken on one checkout must not survive to
     the next. Proves the cross-user DoS repro is closed."""
     lock_key = 42421  # arbitrary; test-scoped
 
@@ -119,7 +119,7 @@ def test_discard_all_clears_advisory_lock():
                 (lock_key,),
             ).fetchone()[0]
             assert still_held == 0, (
-                f"DB-22202: pg_advisory_lock({lock_key}) survived pool "
+                f" pg_advisory_lock({lock_key}) survived pool "
                 f"return; DISCARD ALL didn't release it. "
                 f"still_held rows={still_held}"
             )
@@ -128,7 +128,7 @@ def test_discard_all_clears_advisory_lock():
 
 
 def test_discard_all_survives_prepared_statement_desync():
-    """DB-22202: DEALLOCATE ALL inside a tool call desyncs psycopg's
+    """ DEALLOCATE ALL inside a tool call desyncs psycopg's
     client-side prepared-statement cache. Without DISCARD ALL on
     connection return, subsequent read queries fail with
     `prepared statement "_pg3_0" does not exist`. With DISCARD ALL,

@@ -182,7 +182,7 @@ This list is best-effort, not exhaustive. `destructiveHint: true` is the second 
 
 For multi-user or shared deployments, run the server as Streamable HTTP behind a reverse proxy with TLS, with Cognito OAuth (or generic OIDC) gating access. The full setup — provider config, per-user `SET ROLE` mapping, the identity map file format, the `/auth/login` shortcut, and security guidance — is in [`OIDC.md`](OIDC.md).
 
-**Secure-by-default:** since the DB-22139 fix, HTTP mode binds `127.0.0.1` by default and **refuses to start** when both of these are true:
+**Secure-by-default:** since the fix, HTTP mode binds `127.0.0.1` by default and **refuses to start** when both of these are true:
 - The bind host is non-loopback (`MCP_HOST` set to `0.0.0.0` or a specific address)
 - No auth provider is configured (`MCP_AUTH_PROVIDER` unset)
 

@@ -8,11 +8,11 @@
 # ///
 """One-command MCP client for the identity-mapping tutorial.
 
-Companion to examples/oidc-auth/demo_client.py — same auth-code + PKCE
-flow, but drives the v2 identity-mapping path:
+Drives the OIDC identity-mapping path end-to-end via an auth-code +
+PKCE flow:
 
   * JWT claim = realm_access.roles  (list-valued, nested)
-  * identity map replaces the strip_domain transform
+  * pg_ident.conf-style map translates each raw claim value to a PG role
   * for the dual-role user, the tool call passes requested_role so the
     server clamps the ambiguous candidate list to a single pick
 

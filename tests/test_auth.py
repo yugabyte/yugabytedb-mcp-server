@@ -227,7 +227,7 @@ async def test_jwt_verifier_rejects_tampered_signature(rsa_keypair):
 
 
 # ---------------------------------------------------------------------------
-# DB-22136: audience validation
+# audience validation
 # ---------------------------------------------------------------------------
 # The pre-fix code passed no `audience=` to JWTVerifier, so a token minted
 # for a different app client in the same Cognito user pool was accepted at
@@ -237,7 +237,7 @@ async def test_jwt_verifier_rejects_tampered_signature(rsa_keypair):
 
 @pytest.mark.asyncio
 async def test_jwt_verifier_rejects_wrong_audience(rsa_keypair):
-    """DB-22136: token minted for another client (different `aud`) must be
+    """ token minted for another client (different `aud`) must be
     rejected once audience validation is enabled."""
     from fastmcp.server.auth.providers.jwt import JWTVerifier
 
@@ -287,7 +287,7 @@ async def test_jwt_verifier_accepts_matching_audience(rsa_keypair):
 
 
 def test_cognito_provider_wires_client_id_as_expected_audience():
-    """DB-22136: _create_cognito must pass COGNITO_CLIENT_ID as the
+    """ _create_cognito must pass COGNITO_CLIENT_ID as the
     verifier's expected audience so tokens for other same-pool clients are
     rejected. The custom `_CognitoJWTVerifier` stores this on
     `_expected_audience` (the parent JWTVerifier's `audience` attribute is
@@ -303,11 +303,11 @@ def test_cognito_provider_wires_client_id_as_expected_audience():
 
 
 # ---------------------------------------------------------------------------
-# DB-22136: token_use=access enforcement (Cognito, opt-in)
+# token_use=access enforcement (Cognito, opt-in)
 # ---------------------------------------------------------------------------
 # _CognitoJWTVerifier rejects tokens where `token_use != "access"` when
 # YB_MCP_REQUIRE_ACCESS_TOKEN=true. Default off for backward compat with
-# email-in-ID-token deployments (see DB-22192).
+# email-in-ID-token deployments.
 
 @pytest.mark.asyncio
 async def test_id_token_accepted_when_require_access_off(rsa_keypair, caplog):
@@ -345,6 +345,89 @@ async def test_id_token_accepted_when_require_access_off(rsa_keypair, caplog):
     assert result is not None, "ID token accepted when require_access is off"
     assert any("ID token" in r.message for r in caplog.records), \
         "expected a WARNING about accepted ID token"
+
+
+@pytest.mark.asyncio
+async def test_id_token_rejected_by_default(rsa_keypair, caplog):
+    """Post-review requirement: the new default rejects ID tokens without
+    any opt-in. Verified by not touching any of the token_use env vars —
+    default of ``YB_MCP_REQUIRE_ACCESS_TOKEN`` is now True."""
+    # Explicitly remove any env leakage from other tests that might have
+    # set the toggle in the shared os.environ.
+    clean_env = {**COGNITO_ENV}
+    with patch.dict("os.environ", clean_env, clear=True), \
+         patch("httpx.get", side_effect=_mock_httpx_get):
+        provider = _create_cognito()
+
+    verifier = provider.verifiers[0]
+    assert verifier._require_access_token is True, (
+        "default should reject ID tokens (was False before )"
+    )
+    verifier._public_key = rsa_keypair["public_pem"].decode()
+    verifier.public_key = rsa_keypair["public_pem"].decode()
+    verifier.algorithm = "RS256"
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    id_token_claims = {
+        "iss": FAKE_ISSUER,
+        "sub": "user",
+        "aud": COGNITO_ENV["COGNITO_CLIENT_ID"],
+        "token_use": "id",
+        "email": "alice@example.com",
+        "exp": now + datetime.timedelta(minutes=5),
+        "iat": now,
+    }
+    token = _sign_jwt(id_token_claims, rsa_keypair["private_pem"])
+    with caplog.at_level("WARNING"):
+        result = await verifier.verify_token(token)
+    assert result is None, "default config should reject ID token"
+
+
+@pytest.mark.asyncio
+async def test_id_token_accepted_when_legacy_flag_set(rsa_keypair, caplog):
+    """ compat flag: ``YB_MCP_LEGACY_ACCEPT_ID_TOKENS=true`` restores
+    the old behavior (accept ID tokens with a warning)."""
+    env = {**COGNITO_ENV, "YB_MCP_LEGACY_ACCEPT_ID_TOKENS": "true"}
+    with patch.dict("os.environ", env, clear=True), \
+         patch("httpx.get", side_effect=_mock_httpx_get):
+        provider = _create_cognito()
+
+    verifier = provider.verifiers[0]
+    assert verifier._require_access_token is False, (
+        "legacy flag should flip require_access_token back to False"
+    )
+    verifier._public_key = rsa_keypair["public_pem"].decode()
+    verifier.public_key = rsa_keypair["public_pem"].decode()
+    verifier.algorithm = "RS256"
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    id_token_claims = {
+        "iss": FAKE_ISSUER,
+        "sub": "user",
+        "aud": COGNITO_ENV["COGNITO_CLIENT_ID"],
+        "token_use": "id",
+        "email": "alice@example.com",
+        "exp": now + datetime.timedelta(minutes=5),
+        "iat": now,
+    }
+    token = _sign_jwt(id_token_claims, rsa_keypair["private_pem"])
+    with caplog.at_level("WARNING"):
+        result = await verifier.verify_token(token)
+    assert result is not None, "legacy flag should accept ID tokens"
+
+
+@pytest.mark.asyncio
+async def test_explicit_require_access_false_overrides_legacy_default(rsa_keypair):
+    """ an explicit ``YB_MCP_REQUIRE_ACCESS_TOKEN=false`` continues
+    to opt in to ID tokens even without the compat flag — the explicit
+    value wins over the new default."""
+    env = {**COGNITO_ENV, "YB_MCP_REQUIRE_ACCESS_TOKEN": "false"}
+    with patch.dict("os.environ", env, clear=True), \
+         patch("httpx.get", side_effect=_mock_httpx_get):
+        provider = _create_cognito()
+
+    verifier = provider.verifiers[0]
+    assert verifier._require_access_token is False
 
 
 @pytest.mark.asyncio
@@ -415,7 +498,7 @@ async def test_access_token_accepted_when_require_access_on(rsa_keypair):
 
 @pytest.mark.asyncio
 async def test_access_token_wrong_client_id_rejected(rsa_keypair, caplog):
-    """DB-22136: an access token minted for a different app client in the
+    """ an access token minted for a different app client in the
     same pool must be rejected. Real Cognito tokens carry the identifier
     in `client_id`, not `aud`, so the check must inspect both."""
     with patch.dict("os.environ", COGNITO_ENV, clear=False), \
@@ -473,7 +556,7 @@ async def test_refresh_token_rejected_when_require_access_on(rsa_keypair):
 
 
 # ---------------------------------------------------------------------------
-# DB-22136: OIDC path forwards OIDC_AUDIENCE to the verifier
+# OIDC path forwards OIDC_AUDIENCE to the verifier
 # ---------------------------------------------------------------------------
 
 def test_oidc_provider_wires_audience_env_to_verifier():

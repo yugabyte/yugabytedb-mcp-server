@@ -278,7 +278,7 @@ class TestValidateOrigin:
 
 
 # ===================================================================
-# 2b. DB-22176 — Origin allowlist is case-insensitive
+# 2b. — Origin allowlist is case-insensitive
 # ===================================================================
 #
 # RFC 6454 declares scheme + host to be case-insensitive; browsers

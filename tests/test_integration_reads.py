@@ -21,7 +21,7 @@ async def test_run_read_only_query_simple(mcp_session):
 
 
 async def test_run_read_only_query_duplicate_column_names(mcp_session):
-    """DB-22203: duplicate output column names must not collapse. Previously
+    """ duplicate output column names must not collapse. Previously
     `dict(zip(cols, row))` silently dropped the first `id`. Now columns and
     rows are parallel arrays so all values survive."""
     result = await mcp_session.call_tool(
@@ -33,7 +33,7 @@ async def test_run_read_only_query_duplicate_column_names(mcp_session):
 
 
 async def test_run_read_only_query_join_star_no_column_loss(mcp_session, test_schema, db_conn):
-    """DB-22203 real-world repro: SELECT * over a join where both tables have
+    """ real-world repro: SELECT * over a join where both tables have
     an `id` column. Both `id` values must be present, not collapsed."""
     with db_conn.cursor() as cur:
         cur.execute(f'CREATE TABLE "{test_schema}".a (id INT, tag TEXT)')
@@ -112,12 +112,12 @@ async def test_summarize_database_seeded_schema(mcp_session, test_schema, db_con
 
 
 # ---------------------------------------------------------------------------
-# DB-22138: per-table error handling — a single erroring object must not
+# per-table error handling — a single erroring object must not
 # discard every other table in the summary.
 # ---------------------------------------------------------------------------
 
 async def test_summarize_continues_past_error_view(mcp_session, test_schema, db_conn):
-    """DB-22138 primary repro: schema has a good table plus a view whose
+    """ primary repro: schema has a good table plus a view whose
     COUNT(*) raises (division-by-zero). The view sorts alphabetically first
     (`a_bad` before `z_good`), so v1 would abort at the view and never
     reach the table. Fix: SAVEPOINT per table + per-object error entry."""
@@ -143,7 +143,7 @@ async def test_summarize_continues_past_error_view(mcp_session, test_schema, db_
             by_name[key] = entry
 
     assert "z_good" in by_name, (
-        f"good table missing from summary — DB-22138 regression. Got: {parsed!r}"
+        f"good table missing from summary — regression. Got: {parsed!r}"
     )
     assert by_name["z_good"].get("row_count") == 3
 
@@ -162,8 +162,8 @@ async def test_summarize_continues_past_permission_denied(
 ):
     """Under a role that lacks SELECT on one table, that table's entry
     contains a permission-denied error but the OTHER tables still get
-    their row counts. Verifies the least-privilege docs scenario Vishal
-    called out in the ticket."""
+    their row counts. Verifies the least-privilege docs scenario the
+    audit called out."""
     with db_conn.cursor() as cur:
         cur.execute(f'CREATE TABLE "{test_schema}".public_table (id INT)')
         cur.execute(f'INSERT INTO "{test_schema}".public_table VALUES (1), (2)')
@@ -185,7 +185,7 @@ async def test_summarize_continues_past_permission_denied(
     by_name = {e.get("table"): e for e in parsed if e.get("table") is not None}
 
     # Regardless of pool privileges: BOTH tables must have entries. That's
-    # the DB-22138 fix — one problematic object never removes other entries.
+    # the fix — one problematic object never removes other entries.
     assert "public_table" in by_name, f"good table missing: {parsed!r}"
     assert "secret_table" in by_name, f"restricted table missing entirely: {parsed!r}"
 
@@ -231,7 +231,7 @@ async def test_summarize_empty_schema_returns_empty_list(
     mcp_session, test_schema, db_conn,
 ):
     """Regression: an empty schema still returns []. This shouldn't have
-    changed with the DB-22138 fix — the initial tables lookup returns []
+    changed with the fix — the initial tables lookup returns []
     and the loop is a no-op."""
     # test_schema is created by the fixture but not populated.
     result = await mcp_session.call_tool("summarize_database", {"schema": test_schema})
@@ -240,18 +240,18 @@ async def test_summarize_empty_schema_returns_empty_list(
 
 
 # ---------------------------------------------------------------------------
-# DB-22159 resource limits: statement timeout, result row cap, query length
+# resource limits: statement timeout, result row cap, query length
 # ---------------------------------------------------------------------------
 
 async def test_statement_timeout_kills_slow_query(mcp_session_capped):
-    """DB-22159 primary repro. A slow query with a 1s statement_timeout
+    """ primary repro. A slow query with a 1s statement_timeout
     must fail within ~1s instead of holding the connection indefinitely.
     Prevents the "5 trivial queries downs the service" attack.
 
     Note: this used to use ``pg_sleep(60)``, but PR #9's read-side
-    guardrail (DB-22129) blocks pg_sleep pre-execute. We now use a
+    guardrail blocks pg_sleep pre-execute. We now use a
     CPU-bound generate_series count large enough that the timeout, not
-    the guardrail, is what fires. This preserves the DB-22159 assertion
+    the guardrail, is what fires. This preserves the assertion
     (server-side timeout works) while acknowledging the defense-in-depth
     guardrail from PR #9.
     """
@@ -275,7 +275,7 @@ async def test_statement_timeout_kills_slow_query(mcp_session_capped):
 
 
 async def test_result_byte_cap_truncates(mcp_session_capped, test_schema, db_conn):
-    """DB-22159 round-2 repro. A query with FEW rows (well under
+    """repro. A query with FEW rows (well under
     max_result_rows) but WIDE rows now truncates by cumulative byte size
     — the old fetchmany(row_cap+1) buffered wide rows without bound and
     could OOM the process. The capped fixture sets max_result_bytes=512
@@ -305,7 +305,7 @@ async def test_result_byte_cap_truncates(mcp_session_capped, test_schema, db_con
 
 
 async def test_result_row_cap_truncates(mcp_session_capped, test_schema, db_conn):
-    """DB-22159 second repro. A query returning MORE than
+    """ second repro. A query returning MORE than
     YB_MCP_MAX_RESULT_ROWS (3 in the capped fixture) truncates with a
     `truncated: true` marker instead of buffering the whole result set
     into memory and risking OOM.
@@ -354,7 +354,7 @@ async def test_result_row_cap_not_triggered(mcp_session_capped):
 
 
 async def test_max_query_len_rejects_oversized_query(mcp_session_capped):
-    """DB-22159 third repro. Queries whose text length exceeds
+    """ third repro. Queries whose text length exceeds
     YB_MCP_MAX_QUERY_LEN (200 bytes in the capped fixture) are rejected
     BEFORE reaching the DB — no connection acquisition, no parser CPU
     spike."""
