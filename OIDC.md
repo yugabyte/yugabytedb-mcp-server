@@ -95,11 +95,6 @@ token whose `sub` isn't in the map is rejected. Neither user can
 access the other's data (assuming Postgres grants are set up
 correctly).
 
-> `YB_MCP_IDENTITY_TRANSFORM=strip_domain` from the v1 release has been
-> removed because it silently collapsed users across email
-> domains. Setting the env still at startup fails with a migration
-> message. Use the identity map above instead.
-
 For access-token workflows, list-valued claims, and role allowlists via a
 map file, jump to the [Worked examples](#worked-examples).
 
@@ -165,7 +160,7 @@ release, **(v2)** if new.
 | `YB_MCP_IDENTITY_MAP_NAME` | `--identity-map-name` | **(v2)** Which named map inside the file to apply. Default: `default`. |
 | `YB_MCP_ALLOW_SUPERUSER_ROLE` | `--allow-superuser-role` | **(v2)** Defense-in-depth guard. By default the server refuses to `SET ROLE` to any role whose `pg_roles.rolsuper` is true, even if the identity map explicitly resolves there. Set to `true` to disable the guard (not recommended). Default: `false`. |
 | `YB_MCP_REQUIRE_ACCESS_TOKEN` | — | **(v2, Cognito-only)** When `true`, reject tokens with `token_use != "access"` (rejects ID tokens and refresh tokens presented as bearers). Default: `true`. See [Access-token vs ID-token](#access-token-vs-id-token). |
-| `YB_MCP_LEGACY_ACCEPT_ID_TOKENS` | — | **(v2)** Compat flag. When `true`, restores pre-round-2 defaults: `identity_claim=email` and `require_access_token=false` (ID tokens accepted). Prefer setting each individually. |
+| `YB_MCP_LEGACY_ACCEPT_ID_TOKENS` | — | **(v2)** Compat flag. When `true`, allows these: `identity_claim=email` and `require_access_token=false` (ID tokens accepted). Prefer setting each individually. |
 
 Cognito-specific (only required when `MCP_AUTH_PROVIDER=cognito`) — see
 [AWS Cognito](#aws-cognito) above.
@@ -594,18 +589,9 @@ path closes. To be ready:
 
 ## Migrating from v1 to v2
 
-The v2 mapping is not fully backward-compatible. Two changes require
-attention on upgrade:
-
-1. **`YB_MCP_IDENTITY_TRANSFORM` has been removed**. The
-   `strip_domain` value silently collapsed users across email domains;
-   startup now fails if this env var is set. Migrate to
-   `YB_MCP_IDENTITY_MAP` with one entry per user, or key the mapping
-   off `preferred_username` / `sub` and use the raw claim as the role
-   name.
-2. **Cognito access tokens are required by default**. Set
-   `YB_MCP_LEGACY_ACCEPT_ID_TOKENS=true` to opt back into ID tokens if
-   your deployment still uses `email` from the ID token.
+Cognito access tokens are required by default. Set
+`YB_MCP_LEGACY_ACCEPT_ID_TOKENS=true` to opt back into ID tokens if
+your deployment still uses `email` from the ID token.
 
 Migration checklist for an existing deployment:
 

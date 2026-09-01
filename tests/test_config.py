@@ -136,29 +136,6 @@ class TestHttpBindConfig:
         assert cfg.port == 65535
 
 
-class TestIdentityTransformRemoved:
-    """ YB_MCP_IDENTITY_TRANSFORM has been removed. The only prior
-    value, strip_domain, silently collapsed users across domains, so we
-    fail startup rather than silently ignoring the env."""
-
-    def test_env_still_set_fails_startup(self):
-        with pytest.raises(SystemExit, match="YB_MCP_IDENTITY_TRANSFORM has been removed"):
-            _parse_with_env({"YB_MCP_IDENTITY_TRANSFORM": "strip_domain"})
-
-    def test_none_also_rejected(self):
-        """We can't tell whether an explicit ``none`` is a copy-paste from
-        old docs or a deliberate opt-in, and there's no valid value now —
-        fail on any setting so the operator sees the migration message."""
-        with pytest.raises(SystemExit, match="YB_MCP_IDENTITY_TRANSFORM has been removed"):
-            _parse_with_env({"YB_MCP_IDENTITY_TRANSFORM": "none"})
-
-    def test_unset_starts_normally(self):
-        cfg = _parse_with_env({})
-        # Nothing to assert about the transform — the field is gone. This
-        # test just verifies no startup error when the env is not set.
-        assert cfg.identity_claim == "sub"
-
-
 class TestPoolSizingValidation:
     """pool_min_size <= pool_max_size is enforced at
     app_lifespan startup, not silently at pool.open time."""

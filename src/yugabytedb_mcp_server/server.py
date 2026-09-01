@@ -441,20 +441,6 @@ def parse_config() -> ServerConfig:
         default=os.environ.get("MCP_AUTH_PROVIDER"),
         help="Auth provider for the MCP server: 'cognito' or 'oidc'. Leave unset to disable auth (env: MCP_AUTH_PROVIDER)",
     )
-    # strip_domain has been removed. If an existing deployment
-    # still has YB_MCP_IDENTITY_TRANSFORM set (to strip_domain or
-    # anything else), fail startup with a clear migration message rather
-    # than silently ignoring the config.
-    _removed_transform = os.environ.get("YB_MCP_IDENTITY_TRANSFORM")
-    if _removed_transform:
-        raise SystemExit(
-            "YB_MCP_IDENTITY_TRANSFORM has been removed. The only prior "
-            "value, `strip_domain`, silently collapsed users from "
-            f"different email domains (got {_removed_transform!r}). Migrate "
-            "to YB_MCP_IDENTITY_MAP with a pg_ident.conf-style file — see "
-            "OIDC.md."
-        )
-
     # (paired with the token_use enforcement flip in auth.py): the
     # default identity_claim switches to ``sub`` in secure mode because
     # ``email`` is not present in Cognito access tokens. Legacy operators

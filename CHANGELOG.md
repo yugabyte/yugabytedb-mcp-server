@@ -55,13 +55,6 @@ _(No unreleased changes.)_
 
 ### Removed
 
-- **BREAKING: `YB_MCP_IDENTITY_TRANSFORM` removed.** Its only value
-  (`strip_domain`) silently collapsed users across email domains
-  (`alice@a.com` and `alice@b.com` both → role `alice`). Startup
-  now fails if the env var is set, with a message pointing at
-  `YB_MCP_IDENTITY_MAP`. The `strip_domain`-based tutorial
-  (`examples/oidc-auth/`) is removed; use `examples/oidc-auth-mapping/`.
-
 - **`YB_MCP_MAX_INSERT_ROWS` removed.** The static row cap was
   redundant now that every write goes through `SET LOCAL
   statement_timeout`. Setting the env var is a non-fatal warning at
