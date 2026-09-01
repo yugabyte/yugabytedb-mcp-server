@@ -25,6 +25,7 @@ _BASE_CONFIG = ServerConfig(
     yugabytedb_url="host=localhost port=5433 user=yugabyte dbname=yugabyte",
     transport="stdio",
     host="127.0.0.1",
+    port=8000,
     stateless_http=False,
     ssl_root_cert_secret_arn=None,
     ssl_root_cert_key=None,

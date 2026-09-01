@@ -31,6 +31,7 @@ _BASE_CONFIG = ServerConfig(
     yugabytedb_url="host=localhost port=5433 user=yugabyte dbname=yugabyte",
     transport="http",
     host="127.0.0.1",
+    port=8000,
     stateless_http=False,
     ssl_root_cert_secret_arn=None,
     ssl_root_cert_key=None,
@@ -93,7 +94,11 @@ def clean_env():
 class TestIsLoopback:
     @pytest.mark.parametrize("host", [
         "127.0.0.1",
+        "127.0.0.2",       # full 127.0.0.0/8 block is loopback (post-review fix)
+        "127.255.255.254",
         "::1",
+        "[::1]",           # bracketed IPv6 form (post-review fix)
+        "0:0:0:0:0:0:0:1", # expanded IPv6 form (post-review fix)
         "localhost",
         "LOCALHOST",       # case-insensitive
         " 127.0.0.1 ",     # whitespace tolerated
@@ -107,6 +112,8 @@ class TestIsLoopback:
         "10.0.0.1",
         "mcp.example.com",
         "",
+        "::",              # unspecified — not loopback
+        "not-an-ip",
     ])
     def test_non_loopback_hosts(self, host):
         assert _is_loopback(host) is False
@@ -154,14 +161,39 @@ class TestCheckHttpStartup:
         # No CRITICAL log for the auth gap either.
         assert not any(r.levelname == "CRITICAL" for r in caplog.records)
 
-    def test_loopback_no_auth_starts(self, with_config, caplog):
-        """Loopback bind without auth is fine — no one outside the box
-        can reach the port."""
+    def test_loopback_no_auth_with_allowlist_starts(self, with_config, caplog):
+        """Loopback bind without auth is fine WHEN an Origin allowlist is
+        configured — DNS-rebinding defense catches browser attacks that
+        would otherwise reach 127.0.0.1."""
         with_config(host="127.0.0.1", auth_provider=None)
-        caplog.set_level("WARNING")
-        _check_http_startup("127.0.0.1")  # doesn't exit
-        # No CRITICAL log for the auth gap.
+        with patch.dict(os.environ, {"MCP_ALLOWED_ORIGINS": "https://mcp.example.com"}), \
+             caplog.at_level("WARNING"):
+            _check_http_startup("127.0.0.1")  # doesn't exit
         assert not any(r.levelname == "CRITICAL" for r in caplog.records)
+
+    def test_loopback_no_auth_no_allowlist_refuses_to_start(self, with_config, caplog):
+        """DB-22139 round-2: loopback + no auth + no Origin allowlist =
+        a browser DNS-rebinding attack can reach the loopback bind. Fail
+        closed rather than warn-and-continue."""
+        with_config(host="127.0.0.1", auth_provider=None)
+        with caplog.at_level("CRITICAL"):
+            with pytest.raises(SystemExit) as exc:
+                _check_http_startup("127.0.0.1")
+        assert exc.value.code == 1
+        combined_log = " ".join(r.message for r in caplog.records)
+        assert "DNS-rebinding" in combined_log
+        assert "MCP_ALLOWED_ORIGINS" in combined_log
+
+    def test_loopback_no_auth_no_allowlist_with_escape_starts(
+        self, with_config, caplog,
+    ):
+        """The same escape hatch (MCP_ALLOW_UNAUTHENTICATED=true) that
+        lets the public + no-auth case run also covers the no-allowlist
+        case, since both live in the same defense-in-depth layer."""
+        with_config(host="127.0.0.1", auth_provider=None)
+        with patch.dict(os.environ, {"MCP_ALLOW_UNAUTHENTICATED": "true"}), \
+             caplog.at_level("WARNING"):
+            _check_http_startup("127.0.0.1")  # doesn't exit
 
     def test_loopback_with_auth_starts(self, with_config):
         """Loopback with auth is definitely fine."""

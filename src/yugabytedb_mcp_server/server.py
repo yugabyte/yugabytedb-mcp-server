@@ -88,11 +88,26 @@ def _positive_int(s: str) -> int:
     return v
 
 
+def _tcp_port(s: str) -> int:
+    """argparse `type=` helper for MCP_PORT. Requires 1 <= port <= 65535
+    so a typo (`MCP_PORT=65536`) fails at parse_config with a clear
+    argparse error instead of an uglier uvicorn socket-bind traceback
+    at startup."""
+    try:
+        v = int(s)
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError(f"must be an integer 1–65535, got {s!r}")
+    if not (1 <= v <= 65535):
+        raise argparse.ArgumentTypeError(f"must be 1–65535, got {v}")
+    return v
+
+
 @dataclass
 class ServerConfig:
     yugabytedb_url: str
     transport: str
     host: str
+    port: int
     stateless_http: bool
     ssl_root_cert_secret_arn: str | None
     ssl_root_cert_key: str | None
@@ -353,6 +368,13 @@ def parse_config() -> ServerConfig:
              "(env: MCP_HOST, default: 127.0.0.1)",
     )
     parser.add_argument(
+        "--port",
+        type=_tcp_port,
+        default=os.environ.get("MCP_PORT", "8000"),
+        help="Bind port for HTTP transport, 1–65535 "
+             "(env: MCP_PORT, default: 8000).",
+    )
+    parser.add_argument(
         "--stateless-http",
         action="store_true",
         default=os.environ.get("YB_MCP_STATELESS_HTTP", "").lower() == "true",
@@ -513,6 +535,7 @@ def parse_config() -> ServerConfig:
         yugabytedb_url=args.yugabytedb_url,
         transport=args.transport,
         host=args.host,
+        port=args.port,
         stateless_http=args.stateless_http,
         ssl_root_cert_secret_arn=args.yb_aws_ssl_root_cert_secret_arn,
         ssl_root_cert_key=args.yb_aws_ssl_root_cert_key,
@@ -567,9 +590,11 @@ class YugabyteDBMCPServer:
         else:
             logger.info("run_write_query tool disabled (use --enable-write-query or YB_MCP_ENABLE_WRITE_QUERY=true to enable)")
 
-    def run(self, port=8000):
+    def run(self, port: int | None = None):
         if CONFIG.transport == "http":
-            self._run_http(CONFIG.host, port)
+            # DB-22139: port is now a real config value (MCP_PORT / --port).
+            # Fall back to the argument for callers that still pass one.
+            self._run_http(CONFIG.host, port if port is not None else CONFIG.port)
         else:
             self.mcp.run(transport="stdio")
 
@@ -709,14 +734,32 @@ def _resolve_auth_scope() -> str | None:
     return None
 
 
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+_LOOPBACK_NAMES = frozenset({"localhost"})
 
 
 def _is_loopback(host: str) -> bool:
     """True if `host` is a loopback address / name. Used by the DB-22139
     refuse-to-start guard to decide whether an unauth deployment is
-    acceptable (loopback-only = OK; any other bind = require auth)."""
-    return host.strip().lower() in _LOOPBACK_HOSTS
+    acceptable (loopback-only = OK; any other bind = require auth).
+
+    Normalizes:
+    - strips surrounding whitespace and IPv6 brackets (`[::1]`)
+    - lowercases
+    - matches the full ``127.0.0.0/8`` block, not just ``127.0.0.1``
+    - matches every IPv6 loopback form via ``ipaddress.ip_address`` —
+      that catches ``::1``, ``0:0:0:0:0:0:0:1``, and any zero-prefix
+      abbreviation libpq / uvicorn would accept
+    """
+    import ipaddress
+    h = host.strip().lower()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    if h in _LOOPBACK_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
 
 
 def _env_bool(name: str) -> bool:
@@ -777,11 +820,24 @@ def _check_http_startup(host: str) -> None:
             "=" * 78
         )
 
-    # Independent of auth: an empty Origin allowlist means the
-    # DNS-rebinding defense is off (OriginValidationMiddleware no-ops
-    # when allowed_origins is empty). Warn — non-fatal — so operators
-    # who run browser clients see the gap in logs.
-    if not _parse_allowed_origins():
+    # DB-22139 round-2: when auth is OFF, the Origin allowlist is the only
+    # thing standing between the loopback bind and a browser DNS-rebinding
+    # attack. Fail closed when both are missing rather than emitting a
+    # warning and continuing. Escape hatch: the same
+    # ``MCP_ALLOW_UNAUTHENTICATED=true`` opt-in the auth guard uses.
+    empty_origins = not _parse_allowed_origins()
+    if not has_auth and empty_origins and not allow_unauth:
+        logger.critical(
+            "HTTP transport with no auth provider AND no Origin allowlist. "
+            "DNS-rebinding defense is OFF, so a browser page can drive "
+            "requests to this loopback bind. Set MCP_ALLOWED_ORIGINS "
+            "(comma-separated) or MCP_BASE_URL to enable the allowlist, "
+            "configure MCP_AUTH_PROVIDER, or set "
+            "MCP_ALLOW_UNAUTHENTICATED=true for dev/testing only."
+        )
+        sys.exit(1)
+
+    if empty_origins:
         logger.warning(
             "HTTP transport is running with no Origin allowlist "
             "configured — DNS-rebinding defense is OFF. Set "
