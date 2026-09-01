@@ -32,7 +32,7 @@ Write-only shape checks (skipped when `read_only=True`):
   recognized as an UPDATE.
 
 INSERT row-count limits used to live here (`YB_MCP_MAX_INSERT_ROWS`).
-They were retired in DB-22131 round 2: every write goes through
+They were retired in every write goes through
 `SET LOCAL statement_timeout` in `run_write_query` before executing, so a
 runaway INSERT — VALUES or SELECT or any other shape — is bounded by the
 timeout. A static row cap on top of the timeout is redundant.
@@ -82,7 +82,7 @@ _BLOCKED_KEYWORD_PAIRS: dict[tuple[str, str], str] = {
     ("ALTER", "SYSTEM"): "ALTER SYSTEM is not allowed",
     ("RESET", "ALL"): "RESET ALL is not allowed",
     ("CREATE", "SCHEMA"): "CREATE SCHEMA is not allowed",
-    # DB-22131: CREATE FUNCTION / PROCEDURE bans are enforced by
+    # CREATE FUNCTION / PROCEDURE bans are enforced by
     # ``_check_create_or_alter_routine`` — see there for why the pair
     # matcher can't catch the ``CREATE OR REPLACE FUNCTION`` form.
 }
@@ -218,7 +218,7 @@ def _check_blocked_ast(stmt: Statement) -> None:
     """
     tokens = _significant_tokens(stmt.flatten())
 
-    # DB-22131: catch CREATE OR REPLACE FUNCTION and its variants that the
+    # catch CREATE OR REPLACE FUNCTION and its variants that the
     # keyword-pair matcher below can't see.
     _check_create_or_alter_routine(tokens)
 

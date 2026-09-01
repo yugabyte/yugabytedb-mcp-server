@@ -1,6 +1,6 @@
 """Unit tests for _sanitize_for_json in tools.py.
 
-Covers DB-22157 (NaN/Infinity produced invalid JSON tokens; bytea was
+Covers (NaN/Infinity produced invalid JSON tokens; bytea was
 rendered as lossy Python repr). Also acts as a regression harness for the
 existing default=str fallthrough (datetime/Decimal/UUID/IPv4Address).
 
@@ -24,7 +24,7 @@ from yugabytedb_mcp_server.tools import _sanitize_for_json
 
 
 # ---------------------------------------------------------------------------
-# DB-22157: non-finite floats produce invalid JSON via bare NaN/Infinity tokens
+# non-finite floats produce invalid JSON via bare NaN/Infinity tokens
 # ---------------------------------------------------------------------------
 
 class TestNonFiniteFloats:
@@ -70,7 +70,7 @@ class TestNonFiniteFloats:
 
 
 # ---------------------------------------------------------------------------
-# DB-22157: bytea encoded as lossy Python repr via default=str
+# bytea encoded as lossy Python repr via default=str
 # ---------------------------------------------------------------------------
 
 class TestBytesEncoding:
@@ -206,11 +206,11 @@ class TestEdgeCases:
 
 
 # ---------------------------------------------------------------------------
-# DB-22203: run_read_only_query response shape must not use dict(zip(cols, row))
+# run_read_only_query response shape must not use dict(zip(cols, row))
 # ---------------------------------------------------------------------------
 
 class TestReadResultShape:
-    """DB-22203: previously `run_read_only_query` returned
+    """ previously `run_read_only_query` returned
     `[dict(zip(cols, row)) for row in rows]`, which silently dropped
     duplicate column names (e.g. `SELECT * FROM a, b` where both tables
     have `id`, or `SELECT 1 AS id, 2 AS id`). The new shape is

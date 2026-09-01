@@ -96,7 +96,7 @@ access the other's data (assuming Postgres grants are set up
 correctly).
 
 > `YB_MCP_IDENTITY_TRANSFORM=strip_domain` from the v1 release has been
-> removed (DB-22174) because it silently collapsed users across email
+> removed because it silently collapsed users across email
 > domains. Setting the env still at startup fails with a migration
 > message. Use the identity map above instead.
 
@@ -165,7 +165,7 @@ release, **(v2)** if new.
 | `YB_MCP_IDENTITY_MAP_NAME` | `--identity-map-name` | **(v2)** Which named map inside the file to apply. Default: `default`. |
 | `YB_MCP_ALLOW_SUPERUSER_ROLE` | `--allow-superuser-role` | **(v2)** Defense-in-depth guard. By default the server refuses to `SET ROLE` to any role whose `pg_roles.rolsuper` is true, even if the identity map explicitly resolves there. Set to `true` to disable the guard (not recommended). Default: `false`. |
 | `YB_MCP_REQUIRE_ACCESS_TOKEN` | — | **(v2, Cognito-only)** When `true`, reject tokens with `token_use != "access"` (rejects ID tokens and refresh tokens presented as bearers). Default: `true`. See [Access-token vs ID-token](#access-token-vs-id-token). |
-| `YB_MCP_LEGACY_ACCEPT_ID_TOKENS` | — | **(v2)** Compat flag. When `true`, restores pre-DB-22136 defaults: `identity_claim=email` and `require_access_token=false` (ID tokens accepted). Prefer setting each individually. |
+| `YB_MCP_LEGACY_ACCEPT_ID_TOKENS` | — | **(v2)** Compat flag. When `true`, restores pre-round-2 defaults: `identity_claim=email` and `require_access_token=false` (ID tokens accepted). Prefer setting each individually. |
 
 Cognito-specific (only required when `MCP_AUTH_PROVIDER=cognito`) — see
 [AWS Cognito](#aws-cognito) above.
@@ -217,7 +217,7 @@ Two error modes:
   through to pool credentials.
 - **`SET ROLE` failure** at the DB layer — the mapped role doesn't exist,
   or the pool user doesn't have `GRANT` on it. Currently surfaces as a
-  `ToolError`; DB-22175 tracks turning this into a clean `IdentityError`.
+  `ToolError`; tracks turning this into a clean `IdentityError`.
 
 ### Claim types
 
@@ -523,8 +523,8 @@ Requires the Cognito app client to have `ALLOW_USER_PASSWORD_AUTH` enabled
 password-reset, and other challenge flows are not handled — those require the
 browser OAuth flow.
 
-Hardening gaps tracked in DB-22190 (uniform error detail — currently leaks
-whether the email exists) and DB-22191 (no app-level rate limiting; returns
+Hardening gaps tracked in (uniform error detail — currently leaks
+whether the email exists) and (no app-level rate limiting; returns
 refresh token in the response body). Both scheduled for follow-up release.
 
 ---
@@ -557,8 +557,7 @@ Two approaches:
 
 Without a map file AND a superuser pool, any authenticated user whose
 claim happens to spell an existing role name gets `SET ROLE` to that role —
-including superuser roles named after real users. This is DB-22135.
-
+including superuser roles named after real users. This is
 ### Why the map is an allowlist
 
 The map's `<system_value>` field is a whitelist. Values not matching any
@@ -598,13 +597,13 @@ path closes. To be ready:
 The v2 mapping is not fully backward-compatible. Two changes require
 attention on upgrade:
 
-1. **`YB_MCP_IDENTITY_TRANSFORM` has been removed** (DB-22174). The
+1. **`YB_MCP_IDENTITY_TRANSFORM` has been removed**. The
    `strip_domain` value silently collapsed users across email domains;
    startup now fails if this env var is set. Migrate to
    `YB_MCP_IDENTITY_MAP` with one entry per user, or key the mapping
    off `preferred_username` / `sub` and use the raw claim as the role
    name.
-2. **Cognito access tokens are required by default** (DB-22136). Set
+2. **Cognito access tokens are required by default**. Set
    `YB_MCP_LEGACY_ACCEPT_ID_TOKENS=true` to opt back into ID tokens if
    your deployment still uses `email` from the ID token.
 
@@ -658,7 +657,7 @@ and let the server auto-pick with a WARNING).
 
 **`role "X" does not exist`** (as a `ToolError`, not `IdentityError`).
 The mapping produced a role name that Postgres doesn't have. Either
-create the role or fix the map. DB-22175 tracks converting this into a
+create the role or fix the map. tracks converting this into a
 clean `IdentityError` at the tool layer.
 
 **Server refuses to start with `ValueError: /path/ident.conf:N: …`.**

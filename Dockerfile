@@ -22,7 +22,7 @@ EXPOSE 8000
 # Default to HTTP transport so the container is useful out of the box.
 # Override via `docker run … yugabytedb-mcp <flags>`.
 #
-# DB-22139: the server refuses to start in HTTP mode when
+# the server refuses to start in HTTP mode when
 # MCP_HOST is not loopback AND no auth provider is configured. When
 # running the image as a network-reachable server, set BOTH:
 #

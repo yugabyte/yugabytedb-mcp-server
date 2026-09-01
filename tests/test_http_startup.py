@@ -1,4 +1,4 @@
-"""Unit tests for the HTTP-mode startup guard (DB-22139).
+"""Unit tests for the HTTP-mode startup guard.
 
 Covers `_check_http_startup` — the fail-closed check that runs before
 uvicorn opens the socket. Pre-fix the server bound `0.0.0.0:8000` and
@@ -75,7 +75,7 @@ def with_config():
 
 @pytest.fixture(autouse=True)
 def clean_env():
-    """Prevent test env pollution — clear the DB-22139 escape hatch env
+    """Prevent test env pollution — clear the escape hatch env
     and the Origin allowlist before every test."""
     with patch.dict(os.environ, {}, clear=False):
         for k in (
@@ -140,13 +140,13 @@ class TestEnvBool:
     def test_only_true_is_true(self, val):
         """Matches the parse_config idiom — only the literal `true` (case-
         insensitive) is True. `1`, `yes`, etc. are False. Documents current
-        behavior; DB-22186 tracks broadening this in the follow-up release."""
+        behavior; tracks broadening this in the follow-up release."""
         with patch.dict(os.environ, {"X": val}):
             assert _env_bool("X") is False
 
 
 # ---------------------------------------------------------------------------
-# _check_http_startup — DB-22139 fail-closed guard
+# _check_http_startup — fail-closed guard
 # ---------------------------------------------------------------------------
 
 class TestCheckHttpStartup:
@@ -172,7 +172,7 @@ class TestCheckHttpStartup:
         assert not any(r.levelname == "CRITICAL" for r in caplog.records)
 
     def test_loopback_no_auth_no_allowlist_refuses_to_start(self, with_config, caplog):
-        """DB-22139 round-2: loopback + no auth + no Origin allowlist =
+        """loopback + no auth + no Origin allowlist =
         a browser DNS-rebinding attack can reach the loopback bind. Fail
         closed rather than warn-and-continue."""
         with_config(host="127.0.0.1", auth_provider=None)
@@ -208,7 +208,7 @@ class TestCheckHttpStartup:
         assert not any(r.levelname == "CRITICAL" for r in caplog.records)
 
     def test_public_no_auth_no_escape_refuses_to_start(self, with_config, caplog):
-        """DB-22139 primary repro: HTTP mode + non-loopback host +
+        """ primary repro: HTTP mode + non-loopback host +
         no auth + no escape hatch → sys.exit(1) with a CRITICAL log
         explaining what went wrong."""
         with_config(host="0.0.0.0", auth_provider=None)

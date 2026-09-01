@@ -15,44 +15,43 @@ _(No unreleased changes.)_
 
 - **`MCP_PORT` / `--port` config.** HTTP transport now honors a
   configurable port instead of the hardcoded `8000`. Env:
-  `MCP_PORT`, default `8000`. (DB-22139 round 2.)
+  `MCP_PORT`, default `8000`.
 - **`YB_MCP_MAX_RESULT_BYTES` cap.** Cumulative byte budget applied
   while streaming rows from `run_read_only_query`. A wide-row query
   (e.g. `SELECT repeat('x', 1_000_000) FROM generate_series(1, 100)`)
   now truncates on bytes rather than materializing ~100 MiB before
-  the row cap is checked. Default: 50 MiB. (DB-22159 round 2.)
+  the row cap is checked. Default: 50 MiB.
 - **`connect_timeout` on the pool conninfo.** Defaults to `10` when
   the operator's `YUGABYTEDB_URL` doesn't set one, so a network
   partition to the DB doesn't hang startup or pool checkouts
-  indefinitely. (DB-22159 round 2.)
+  indefinitely.
 - **`YB_MCP_LEGACY_ACCEPT_ID_TOKENS` compat flag.** Restores
-  pre-DB-22136 auth defaults (`YB_MCP_REQUIRE_ACCESS_TOKEN=false`,
-  `YB_MCP_IDENTITY_CLAIM=email`) in one env var. (DB-22136 round 2.)
+  pre-round-2 auth defaults (`YB_MCP_REQUIRE_ACCESS_TOKEN=false`,
+  `YB_MCP_IDENTITY_CLAIM=email`) in one env var.
 
 ### Changed
 
 - **BREAKING: default `YB_MCP_IDENTITY_CLAIM` is now `sub`.**
   Previously `email`, which is absent from Cognito access tokens. Set
   `YB_MCP_LEGACY_ACCEPT_ID_TOKENS=true` to keep the old default.
-  (DB-22136 round 2.)
+
 - **BREAKING: `YB_MCP_REQUIRE_ACCESS_TOKEN` now defaults to `true`.**
   ID tokens are rejected on `/mcp` by default; the compat flag above
-  reverts. (DB-22136 round 2.)
+  reverts.
 - **All INSERT shapes now bounded by `SET LOCAL statement_timeout`**
   (`YB_MCP_STATEMENT_TIMEOUT_MS`) instead of a static row cap. Every
   write — INSERT VALUES, INSERT SELECT, INSERT DEFAULT VALUES, UPDATE,
   DELETE, DDL — runs under the timeout unconditionally, so a runaway
-  statement is killed by the DB. (DB-22131 round 2.)
+  statement is killed by the DB.
 - **Pool sizing is validated at startup** — `pool_min_size >
-  pool_max_size` raises a clean error before `pool.open`. (DB-22159
-  round 2.)
+  pool_max_size` raises a clean error before `pool.open`. (  round 2.)
 - **`summarize_database` now runs under `SET LOCAL statement_timeout`**,
   matching the read / write tools. A slow `COUNT(*)` no longer
-  holds a pool connection indefinitely. (DB-22159 round 2.)
+  holds a pool connection indefinitely.
 - **HTTP transport fails closed when auth is off and no Origin
   allowlist is configured** — previously a warning; now a startup
   error, matching the auth-off + non-loopback guard. Same escape
-  hatch: `MCP_ALLOW_UNAUTHENTICATED=true`. (DB-22139 round 2.)
+  hatch: `MCP_ALLOW_UNAUTHENTICATED=true`.
 
 ### Removed
 
@@ -62,21 +61,21 @@ _(No unreleased changes.)_
   now fails if the env var is set, with a message pointing at
   `YB_MCP_IDENTITY_MAP`. The `strip_domain`-based tutorial
   (`examples/oidc-auth/`) is removed; use `examples/oidc-auth-mapping/`.
-  (DB-22174 round 2.)
+
 - **`YB_MCP_MAX_INSERT_ROWS` removed.** The static row cap was
   redundant now that every write goes through `SET LOCAL
   statement_timeout`. Setting the env var is a non-fatal warning at
-  startup. (DB-22131 round 2.)
+  startup.
 
 ### Security
 
-- **DB-22131 round 2: block `CREATE OR REPLACE FUNCTION` and
+- **block `CREATE OR REPLACE FUNCTION` and
   `CREATE OR REPLACE PROCEDURE` on the write tool.** The
   keyword-pair matcher on `('CREATE', 'FUNCTION')` couldn't see the
   `OR REPLACE` form because sqlparse tokenizes it as one keyword;
   a dedicated scanner now catches the shape. `SECURITY DEFINER`
   variants are covered.
-- **DB-22135 round 2: fail-closed on list-shaped claims at request
+- **fail-closed on list-shaped claims at request
   time.** The startup guard only caught known list-claim names
   (`cognito:groups`, `realm_access.roles`, `groups`, dotted paths).
   A request-time check now fires whenever the claim actually

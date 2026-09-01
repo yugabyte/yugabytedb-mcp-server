@@ -379,14 +379,14 @@ def _get_db_role(ctx: Context, requested_role: Optional[str] = None) -> Optional
     # 2. Normalize the claim to a list of non-empty string values. This is
     #    where scalar and list-valued claims converge into one code path.
     #
-    # DB-22135 fail-closed at request time: any *composite* claim value
+    # Fail-closed at request time: any *composite* claim value
     # (list, tuple, dict) without a map means the caller could hand us
     # arbitrary group names / structures which we'd feed verbatim to
-    # `SET ROLE` — no allowlist. Vishal's re-open comment: "fail closed
-    # whenever there is no allowlist/map and the claim is not a fixed
-    # enumerated value (regardless of claim name)". Dicts and tuples are
-    # rare but not fixed either. The startup guard can only see the claim
-    # NAME, so it misses composite claims served under unrecognized names
+    # `SET ROLE` — no allowlist. Design intent: fail closed whenever
+    # there is no allowlist/map and the claim is not a fixed enumerated
+    # value, regardless of claim name. Dicts and tuples are rare but
+    # not fixed either. The startup guard can only see the claim NAME,
+    # so it misses composite claims served under unrecognized names
     # (`roles`, `entitlements`, custom scopes) — catch them here where
     # the actual value type is known.
     if isinstance(claim_value, (list, tuple)):
@@ -525,7 +525,7 @@ def summarize_database(
     summary: List[Dict[str, Any]] = []
     lifespan = ctx.request_context.lifespan_context
     pool = lifespan["pool"]
-    # DB-22159 round-2: previously only run_read_only_query /
+    # previously only run_read_only_query /
     # run_write_query enforced the statement_timeout; a `COUNT(*)` over a
     # huge table via summarize_database could hold a pool connection
     # indefinitely. Apply the same cap here.
@@ -570,7 +570,7 @@ def summarize_database(
                     tables = []
                 logger.debug("Schema %s has %d tables: %s", schema, len(tables), tables)
 
-                # DB-22138: per-table error handling. A single problematic
+                # per-table error handling. A single problematic
                 # object (view over a since-dropped table, permission-denied
                 # table, division-by-zero in a view, foreign-table connection
                 # error…) previously aborted the whole loop and discarded
@@ -596,7 +596,7 @@ def summarize_database(
                             for col, dtype in cur.fetchall()
                         ]
 
-                        # DB-22158: `schema` is interpolated unquoted here
+                        # `schema` is interpolated unquoted here
                         # — pre-existing gap, deferred. The per-table
                         # SAVEPOINT above does not narrow or widen that
                         # surface; it only prevents one bad object from
@@ -677,14 +677,14 @@ def run_read_only_query(
     lifespan = ctx.request_context.lifespan_context
     pool = lifespan["pool"]
     guardrail_config: GuardrailConfig = lifespan["guardrail_config"]
-    # DB-22159 resource caps
+    # resource caps
     max_query_len = lifespan["max_query_len"]
     statement_timeout_ms = lifespan["statement_timeout_ms"]
     max_result_rows = lifespan["max_result_rows"]
     max_result_bytes = lifespan["max_result_bytes"]
 
     # Reject oversized queries BEFORE parsing or opening a connection.
-    # Vishal observed a ~1MB write query burning ~6s of CPU in the
+    # observed a ~1MB write query burning ~6s of CPU in the
     # guardrail parser alone; keep the pre-parse surface flat. Byte
     # length (UTF-8) matches the DoS rationale and the env-var
     # documentation.
@@ -729,14 +729,14 @@ def run_read_only_query(
         with conn.cursor() as ctrl_cur:
             try:
                 _execute(ctrl_cur, "BEGIN READ ONLY")
-                # DB-22159: SET LOCAL statement_timeout scopes the cap to
+                # SET LOCAL statement_timeout scopes the cap to
                 # this transaction only — the timeout dies with the ROLLBACK
                 # below, so it doesn't leak across pool checkouts.
                 _execute(
                     ctrl_cur,
                     f"SET LOCAL statement_timeout = '{statement_timeout_ms}ms'",
                 )
-                # DB-22159 round-2: server-side cursor + small itersize.
+                # server-side cursor + small itersize.
                 # psycopg3's client-side cursor buffers ALL rows at
                 # ``execute()`` time, defeating any downstream byte cap;
                 # a named cursor issues DECLARE/FETCH so the DB streams
@@ -771,7 +771,7 @@ def run_read_only_query(
                         approx_bytes += row_bytes
                     truncated = truncated_by_rows or truncated_by_bytes
                     column_names = [desc[0] for desc in cur.description]
-                # Use the parallel-arrays shape (PR #9 / DB-22203) so
+                # Use the parallel-arrays shape (PR #9 / ) so
                 # duplicate column names don't collapse; still robust to a
                 # `SELECT a.id, b.id FROM ...` after a join.
                 result: dict = {
@@ -838,12 +838,12 @@ def run_write_query(
     lifespan = ctx.request_context.lifespan_context
     pool = lifespan["pool"]
     guardrail_config: GuardrailConfig = lifespan["guardrail_config"]
-    # DB-22159 resource caps
+    # resource caps
     max_query_len = lifespan["max_query_len"]
     statement_timeout_ms = lifespan["statement_timeout_ms"]
 
     # Reject oversized queries BEFORE parsing — the guardrail's sqlparse
-    # walker spikes CPU on very large inputs (Vishal measured ~6.4s on a
+    # walker spikes CPU on very large inputs (observed ~6.4s on a
     # ~1MB query). Cheap first-line defense. Measured in bytes to match
     # the env var's documented unit; `len(str)` alone counts code points,
     # which diverges for multibyte UTF-8.
@@ -878,11 +878,11 @@ def run_write_query(
         logger.debug("Acquired connection from pool for run_write_query")
         with conn.cursor() as cur:
             try:
-                # DB-22159 + DB-22131 round 2: SET LOCAL statement_timeout
+                # + SET LOCAL statement_timeout
                 # runs before EVERY write, unconditionally. It's the sole
                 # bound on runtime for INSERT (VALUES, SELECT, DEFAULT
                 # VALUES), UPDATE, DELETE, and DDL — the static row cap
-                # `YB_MCP_MAX_INSERT_ROWS` was retired in DB-22131 round 2.
+                # `YB_MCP_MAX_INSERT_ROWS` was retired in .
                 # SET LOCAL opens the implicit transaction that psycopg's
                 # default (autocommit=False) uses, and the timeout dies
                 # on commit so it doesn't leak across pool checkouts.

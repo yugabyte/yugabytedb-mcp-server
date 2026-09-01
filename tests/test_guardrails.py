@@ -211,7 +211,7 @@ def test_blocks_empty(sql, cfg):
 # ---------------------------------------------------------------------------
 # INSERT shapes — all allowed and bounded by SET LOCAL statement_timeout
 # ---------------------------------------------------------------------------
-# DB-22131 round 2: the static ``YB_MCP_MAX_INSERT_ROWS`` cap was retired.
+# the static ``YB_MCP_MAX_INSERT_ROWS`` cap was retired.
 # Every write goes through statement_timeout in ``run_write_query`` before
 # executing, so a runaway INSERT — VALUES, SELECT, DEFAULT, whatever
 # shape — is bounded by the timeout. These tests pin that every INSERT
@@ -314,7 +314,7 @@ def test_alter_function_rejected(cfg):
 
 
 def test_create_or_replace_function_rejected(cfg):
-    """DB-22131: sqlparse tokenizes ``CREATE OR REPLACE`` as a single
+    """ sqlparse tokenizes ``CREATE OR REPLACE`` as a single
     Keyword.DDL, so the two-keyword pair matcher on ``('CREATE','FUNCTION')``
     never fires. The dedicated ``_check_create_or_alter_routine`` scanner
     catches this form."""
@@ -402,7 +402,7 @@ def test_strip_comments_removes_both_styles():
 
 
 # ---------------------------------------------------------------------------
-# DB-22131: keyword-in-string-literal must not trip the guardrail
+# keyword-in-string-literal must not trip the guardrail
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("sql", [
@@ -420,7 +420,7 @@ def test_string_literal_keywords_do_not_false_positive(sql, cfg):
 
 
 # ---------------------------------------------------------------------------
-# DB-22131: advertised protections must not be bypassable by equivalent syntax
+# advertised protections must not be bypassable by equivalent syntax
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("sql", [
@@ -445,7 +445,7 @@ def test_blocks_do_block_regardless_of_language_clause(sql, cfg):
 
 
 def test_where_in_string_literal_does_not_satisfy_strict_where(strict_cfg):
-    # DB-22131 class C: 'reset where needed' inside a string must not
+    # class C: 'reset where needed' inside a string must not
     # count as a real WHERE clause.
     with pytest.raises(QueryBlockedError) as exc:
         validate_query(
@@ -456,7 +456,7 @@ def test_where_in_string_literal_does_not_satisfy_strict_where(strict_cfg):
 
 
 def test_parens_in_string_literal_do_not_inflate_insert_row_count(cfg):
-    # DB-22131 class C: ')(' inside a string was previously counted as a
+    # class C: ')(' inside a string was previously counted as a
     # new row tuple. Verify a 1-row INSERT with such a value passes.
     validate_query(
         "INSERT INTO t (msg) VALUES ('has )( parens')",
@@ -465,7 +465,7 @@ def test_parens_in_string_literal_do_not_inflate_insert_row_count(cfg):
 
 
 # ---------------------------------------------------------------------------
-# DB-22129: read-only path still blocks side-effecting SQL
+# read-only path still blocks side-effecting SQL
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("sql", [
@@ -583,7 +583,7 @@ def test_top_level_where_detected_after_cte(strict_cfg):
 
 
 # ---------------------------------------------------------------------------
-# DB-22172: read-tool multi-statement escape via COMMIT/END prefix
+# read-tool multi-statement escape via COMMIT/END prefix
 # ---------------------------------------------------------------------------
 # The read tool wraps queries in `BEGIN READ ONLY ... ROLLBACK`, but a caller
 # whose input starts with COMMIT/END closes the read-only transaction before
@@ -603,7 +603,7 @@ def test_top_level_where_detected_after_cte(strict_cfg):
     "COMMIT; SELECT 1",                          # even a second SELECT is blocked
 ])
 def test_multi_statement_escape_blocked_read_only(sql, cfg):
-    """DB-22172: read tool must reject multi-statement input so a COMMIT/END
+    """ read tool must reject multi-statement input so a COMMIT/END
     prefix cannot end the BEGIN READ ONLY transaction and let downstream
     statements auto-commit outside the read-only wrapper."""
     with pytest.raises(QueryBlockedError) as exc:
@@ -616,9 +616,9 @@ def test_multi_statement_escape_blocked_read_only(sql, cfg):
     "END; DROP TABLE t",
 ])
 def test_multi_statement_escape_blocked_write(sql, cfg):
-    """DB-22172: same multi-statement rejection on the write path (regression
-    check — was already covered by DB-22131 multi-statement tests, but explicit
-    for the DB-22172 scenario)."""
+    """ same multi-statement rejection on the write path (regression
+    check — was already covered by multi-statement tests, but explicit
+    for the scenario)."""
     with pytest.raises(QueryBlockedError) as exc:
         validate_query(sql, cfg, read_only=False)
     assert "Multi-statement" in str(exc.value)
@@ -636,10 +636,9 @@ def test_bare_commit_alone_not_multi_statement(cfg):
 
 
 # ---------------------------------------------------------------------------
-# DB-22129: privileged catalog tables (credential / statistics disclosure)
+# privileged catalog tables (credential / statistics disclosure)
 # ---------------------------------------------------------------------------
-# `SELECT rolname, rolpassword FROM pg_authid` was called out in the DB-22129
-# repro list. The function blocklist doesn't catch it (pg_authid is a table,
+# `SELECT rolname, rolpassword FROM pg_authid` was called out in the# repro list. The function blocklist doesn't catch it (pg_authid is a table,
 # not a function), so we cover it via a table-name blocklist walked in the
 # same AST pass. Applies to both read and write paths.
 
@@ -661,7 +660,7 @@ def test_bare_commit_alone_not_multi_statement(cfg):
     "WITH c AS (SELECT * FROM pg_authid) SELECT * FROM c",
 ])
 def test_blocks_privileged_catalog_reads_read_path(sql, cfg):
-    """DB-22129: reads of credential/statistics catalogs are guardrail-blocked
+    """ reads of credential/statistics catalogs are guardrail-blocked
     on the read path regardless of whether Postgres RBAC would also reject."""
     with pytest.raises(QueryBlockedError, match="not allowed"):
         validate_query(sql, cfg, read_only=True)
@@ -673,7 +672,7 @@ def test_blocks_privileged_catalog_reads_read_path(sql, cfg):
     "INSERT INTO pg_user_mappings VALUES (1, 2, ARRAY['x'])",
 ])
 def test_blocks_privileged_catalog_writes(sql, cfg):
-    """DB-22129: same tables are also blocked on the write path — an operator
+    """ same tables are also blocked on the write path — an operator
     running the server as a role with catalog-modification privileges must not
     be able to mutate them via run_write_query."""
     with pytest.raises(QueryBlockedError, match="not allowed"):

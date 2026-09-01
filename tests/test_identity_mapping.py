@@ -462,8 +462,8 @@ class TestGetDbRoleV2:
 
     @patch("yugabytedb_mcp_server.tools.get_access_token")
     def test_cognito_access_token_groups_flow(self, mock_get_token):
-        """Realistic Cognito access-token workflow — DB-22192 unblocked.
-        DB-22135: a list claim requires a map (identity → PG-role allowlist)."""
+        """Realistic Cognito access-token workflow — unblocked.
+ a list claim requires a map (identity → PG-role allowlist)."""
         mock_get_token.return_value = _make_access_token(
             {"sub": "abc", "cognito:groups": ["writer", "reader"]}
         )
@@ -513,7 +513,7 @@ class TestGetDbRoleV2:
         with pytest.raises(IdentityError):
             _get_db_role(ctx, requested_role="admin")
 
-    # DB-22135: request-time fail-closed guard on list-claim + no-map.
+    # request-time fail-closed guard on list-claim + no-map.
     # The startup guard only sees the claim NAME and misses list claims
     # served under names it doesn't recognize (`roles`, `entitlements`,
     # custom scopes). This request-time check sees the value shape.
@@ -548,7 +548,7 @@ class TestGetDbRoleV2:
         ctx = _make_ctx(identity_claim="sub", identity_map=None)
         assert _get_db_role(ctx) == "alice"
 
-    # DB-22135 round-2 (post-review): Vishal's phrasing is "the claim is
+    # Post-review: the specific case is "the claim is
     # not a fixed enumerated value (regardless of claim name)". A dict
     # and a tuple aren't fixed either. Guard widened to cover both.
 
@@ -591,7 +591,7 @@ class TestGetDbRoleV2:
 
     @patch("yugabytedb_mcp_server.tools.get_access_token")
     def test_azure_group_guid_flow(self, mock_get_token):
-        """Azure AD GUID → readable role via regex map — closes DB-22174."""
+        """Azure AD GUID → readable role via regex map — closes """
         mock_get_token.return_value = _make_access_token(
             {"groups": ["a12d04b1-7463-8e23-94d2-8d71f17ab99b"]}
         )
@@ -619,7 +619,7 @@ class TestGetDbRoleV2:
 
     @patch("yugabytedb_mcp_server.tools.get_access_token")
     def test_map_all_values_unmapped_raises(self, mock_get_token):
-        """DB-22135: if the map has no entry for any of the claim's values,
+        """ if the map has no entry for any of the claim's values,
         raise instead of falling through to the raw claim."""
         mock_get_token.return_value = _make_access_token(
             {"groups": ["unknown-a", "unknown-b"]}

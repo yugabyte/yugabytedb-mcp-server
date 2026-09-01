@@ -34,17 +34,17 @@ def _pool_reset(conn) -> None:
     Two statements run in sequence:
 
     1. ``DISCARD ALL`` — Postgres's canonical "scrub session" statement.
-       Clears the current role (superset of RESET ROLE — closes DB-22133),
+       Clears the current role (superset of RESET ROLE — closes ),
        prepared statements + cached plans (closes the pool-slot poisoning
-       half of DB-22202), session GUCs, temp tables, and sequences.
+       half of ), session GUCs, temp tables, and sequences.
 
     2. ``SELECT pg_advisory_unlock_all()`` — YugabyteDB's ``DISCARD ALL``
        does NOT release advisory locks, which is a deviation from vanilla
        Postgres 15 semantics. Empirically verified against local YB
        (2025.2.0): a lock taken on one checkout survives ``DISCARD ALL``
        and is visible to other sessions via ``pg_locks``. Explicitly
-       releasing here closes the advisory-lock half of DB-22202 (the
-       cross-user DoS repro Vishal filed).
+       releasing here closes the advisory-lock half of (the
+       cross-user DoS repro observed).
 
     Neither statement can run inside a transaction block. psycopg's
     default is ``autocommit=False``, so a bare ``conn.execute(...)``
@@ -76,7 +76,7 @@ def _pool_reset(conn) -> None:
 
 def _positive_int(s: str) -> int:
     """argparse `type=` helper: parse `s` as int; raise ArgumentTypeError
-    on non-int or `< 1`. Used for the DB-22159 resource-limit env vars so
+    on non-int or `< 1`. Used for the resource-limit env vars so
     a typo (`YB_MCP_POOL_MAX_SIZE=abc` or `=0`) fails startup with a
     clear message instead of a raw ValueError traceback."""
     try:
@@ -124,7 +124,7 @@ class ServerConfig:
     # Defense-in-depth: refuse SET ROLE to a superuser regardless of how
     # the claim/map resolved the role name. Off flips the guard.
     allow_superuser_role: bool
-    # DB-22159 resource limits — all defaults documented alongside the
+    # resource limits — all defaults documented alongside the
     # argparse definitions in parse_config().
     pool_min_size: int
     pool_max_size: int
@@ -193,7 +193,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
         logger.critical("YUGABYTEDB_URL is not set")
         sys.exit(1)
 
-    # DB-22159 round-2: validate pool sizing at startup so a misconfig
+    # validate pool sizing at startup so a misconfig
     # (min > max) fails with a clean error instead of a raw psycopg
     # traceback at pool.open time.
     if CONFIG.pool_min_size > CONFIG.pool_max_size:
@@ -212,7 +212,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
             database_url += f" sslrootcert={cert_path}"
             logger.debug("Appended sslrootcert to connection string")
 
-    # DB-22159 round-2: bound the TCP connect attempt too. libpq's default
+    # bound the TCP connect attempt too. libpq's default
     # is unlimited; without a cap, a network partition to the DB during
     # pool warm-up hangs startup indefinitely (or the pool acquire path
     # blocks the tool call for hundreds of seconds). Only add when the
@@ -240,11 +240,11 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
         max_size=CONFIG.pool_max_size,
         open=True,
         check=ConnectionPool.check_connection,
-        # DB-22133 / DB-22202: reset connections on return to the pool so
+        # / reset connections on return to the pool so
         # session-level state from one user's tool call doesn't bleed to
         # the next. DISCARD ALL is a superset of RESET ROLE — it also
-        # clears advisory locks (advisory-lock cross-user DoS in DB-22202),
-        # prepared-statement plans (pool-slot poisoning in DB-22202),
+        # clears advisory locks (advisory-lock cross-user DoS in ),
+        # prepared-statement plans (pool-slot poisoning in ),
         # session GUCs, temp tables, and cached plans. Runs after every
         # `with pool.connection() as conn:` block, so any state the tool
         # accidentally leaves behind is scrubbed before the next checkout.
@@ -341,7 +341,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
             "identity_map": identity_map,
             "identity_map_name": CONFIG.identity_map_name,
             "allow_superuser_role": CONFIG.allow_superuser_role,
-            # DB-22159 resource limits — read by tools.py at each call.
+            # resource limits — read by tools.py at each call.
             "statement_timeout_ms": CONFIG.statement_timeout_ms,
             "max_result_rows": CONFIG.max_result_rows,
             "max_result_bytes": CONFIG.max_result_bytes,
@@ -406,7 +406,7 @@ def parse_config() -> ServerConfig:
         default=os.getenv("YB_AWS_SSL_ROOT_CERT_SECRET_REGION"),
         help="Region of the AWS Secrets Manager secret containing the TLS root certificate",
     )
-    # DB-22131 round 2: YB_MCP_MAX_INSERT_ROWS has been removed. Every
+    # YB_MCP_MAX_INSERT_ROWS has been removed. Every
     # write goes through SET LOCAL statement_timeout in run_write_query
     # so a runaway INSERT — VALUES, SELECT, whatever shape — is bounded
     # by the timeout. A static row cap on top is redundant. Warn (not
@@ -441,7 +441,7 @@ def parse_config() -> ServerConfig:
         default=os.environ.get("MCP_AUTH_PROVIDER"),
         help="Auth provider for the MCP server: 'cognito' or 'oidc'. Leave unset to disable auth (env: MCP_AUTH_PROVIDER)",
     )
-    # DB-22174: strip_domain has been removed. If an existing deployment
+    # strip_domain has been removed. If an existing deployment
     # still has YB_MCP_IDENTITY_TRANSFORM set (to strip_domain or
     # anything else), fail startup with a clear migration message rather
     # than silently ignoring the config.
@@ -455,7 +455,7 @@ def parse_config() -> ServerConfig:
             "OIDC.md."
         )
 
-    # DB-22136 (paired with the token_use enforcement flip in auth.py): the
+    # (paired with the token_use enforcement flip in auth.py): the
     # default identity_claim switches to ``sub`` in secure mode because
     # ``email`` is not present in Cognito access tokens. Legacy operators
     # who still expect ``email`` (and therefore an id token) opt in via
@@ -499,7 +499,7 @@ def parse_config() -> ServerConfig:
              "(not recommended). "
              "(env: YB_MCP_ALLOW_SUPERUSER_ROLE=true)",
     )
-    # DB-22159 resource limits — bound the blast radius of a slow query
+    # resource limits — bound the blast radius of a slow query
     # or a huge result set. All parsed with _positive_int so a typo in
     # the env fails startup with a clean argparse error.
     parser.add_argument(
@@ -555,7 +555,7 @@ def parse_config() -> ServerConfig:
         default=os.environ.get("YB_MCP_MAX_QUERY_LEN", "100000"),
         help="Reject queries whose text length exceeds this byte count. "
              "Rejection happens before parsing / execution — avoids the "
-             "~6s CPU spike Vishal measured when the guardrail parses a "
+             "~6s CPU spike observed when the guardrail parses a "
              "1MB query "
              "(env: YB_MCP_MAX_QUERY_LEN, default: 100000).",
     )
@@ -622,14 +622,14 @@ class YugabyteDBMCPServer:
 
     def run(self, port: int | None = None):
         if CONFIG.transport == "http":
-            # DB-22139: port is now a real config value (MCP_PORT / --port).
+            # port is now a real config value (MCP_PORT / --port).
             # Fall back to the argument for callers that still pass one.
             self._run_http(CONFIG.host, port if port is not None else CONFIG.port)
         else:
             self.mcp.run(transport="stdio")
 
     def _run_http(self, host, port):
-        # DB-22139: refuse to start when the operator has combined a
+        # refuse to start when the operator has combined a
         # public bind host with no auth. Pre-fix: server defaulted to
         # `0.0.0.0:8000` and accepted anonymous /mcp requests — an
         # unauthenticated MCP→DB proxy on any IP that could reach the
@@ -768,8 +768,7 @@ _LOOPBACK_NAMES = frozenset({"localhost"})
 
 
 def _is_loopback(host: str) -> bool:
-    """True if `host` is a loopback address / name. Used by the DB-22139
-    refuse-to-start guard to decide whether an unauth deployment is
+    """True if `host` is a loopback address / name. Used by the    refuse-to-start guard to decide whether an unauth deployment is
     acceptable (loopback-only = OK; any other bind = require auth).
 
     Normalizes:
@@ -799,7 +798,7 @@ def _env_bool(name: str) -> bool:
 
 
 def _check_http_startup(host: str) -> None:
-    """DB-22139 fail-closed guard: refuse to start when HTTP mode is
+    """ fail-closed guard: refuse to start when HTTP mode is
     exposed on a non-loopback host without an auth provider.
 
     Pre-fix: the server bound `0.0.0.0:8000` by default and accepted
@@ -850,7 +849,7 @@ def _check_http_startup(host: str) -> None:
             "=" * 78
         )
 
-    # DB-22139 round-2: when auth is OFF, the Origin allowlist is the only
+    # when auth is OFF, the Origin allowlist is the only
     # thing standing between the loopback bind and a browser DNS-rebinding
     # attack. Fail closed when both are missing rather than emitting a
     # warning and continuing. Escape hatch: the same
@@ -885,7 +884,7 @@ def _parse_allowed_origins() -> set[str]:
     non-empty, requests with an Origin not in the set are rejected.
     Requests without an Origin header (non-browser clients) always pass.
 
-    DB-22176: RFC 6454 declares scheme + host to be case-insensitive.
+ RFC 6454 declares scheme + host to be case-insensitive.
     Browsers lowercase them before sending the Origin header, so an
     admin who types `MCP_ALLOWED_ORIGINS=https://MyApp.Example.com`
     would silently reject every real browser request (which sends
@@ -926,7 +925,7 @@ class OriginValidationMiddleware:
 
         headers = Headers(scope=scope)
         origin = headers.get("origin")
-        # DB-22176: RFC 6454 says scheme + host are case-insensitive.
+        # RFC 6454 says scheme + host are case-insensitive.
         # `_parse_allowed_origins` lowercases the config; match on the
         # lowercased incoming Origin so `HTTPS://GOOD.EXAMPLE.COM` from
         # a legitimate browser still passes when the allowlist has

@@ -2,7 +2,7 @@
 
 Verifies:
 - `summarize_database` and `run_read_only_query` are both `readOnlyHint=True,
-  destructiveHint=False`. `run_read_only_query`'s guardrail (DB-22129) strips
+  destructiveHint=False`. `run_read_only_query`'s guardrail strips
   the dangerous-function surface before execution, so the tool's advertised
   read-only semantic holds.
 - `run_write_query` is gated behind `enable_write_query` and carries the
@@ -95,7 +95,7 @@ def _get_tool(mcp, name):
 # ---------------------------------------------------------------------------
 
 class TestReadToolAnnotation:
-    """`run_read_only_query`'s dangerous-function blocklist (DB-22129) strips
+    """`run_read_only_query`'s dangerous-function blocklist strips
     the RCE / file-read / dblink / set_config / privileged-catalog surface
     before execution, so the tool truly is read-only end-to-end. Advertise
     accordingly."""

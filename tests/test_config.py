@@ -1,4 +1,4 @@
-"""Unit tests for parse_config resource-limit env vars (DB-22159).
+"""Unit tests for parse_config resource-limit env vars.
 
 Covers the `_positive_int` argparse helper and verifies the defaults +
 env-var → ServerConfig plumbing for the five new resource-limit knobs.
@@ -18,8 +18,8 @@ from yugabytedb_mcp_server.server import _positive_int, parse_config
 # ---------------------------------------------------------------------------
 
 class TestPositiveInt:
-    """DB-22159 argparse helper: parse s as int, raise ArgumentTypeError if
-    non-int or `< 1`. Same pattern is used for the DB-22162 fix in the
+    """ argparse helper: parse s as int, raise ArgumentTypeError if
+    non-int or `< 1`. Same pattern is used for the fix in the
     follow-up release."""
 
     def test_accepts_positive_int(self):
@@ -71,7 +71,7 @@ def _parse_with_env(env: dict) -> object:
 
 
 class TestResourceLimitDefaults:
-    """When none of the DB-22159 env vars are set, defaults match the
+    """When none of the env vars are set, defaults match the
     documented values."""
 
     def test_pool_min_size_default(self):
@@ -95,18 +95,18 @@ class TestResourceLimitDefaults:
         assert cfg.max_query_len == 100_000
 
     def test_max_result_bytes_default(self):
-        """DB-22159 round-2: 50 MiB default byte cap."""
+        """50 MiB default byte cap."""
         cfg = _parse_with_env({})
         assert cfg.max_result_bytes == 50 * 1024 * 1024
 
     def test_port_default(self):
-        """DB-22139 round-2: MCP_PORT defaults to 8000."""
+        """MCP_PORT defaults to 8000."""
         cfg = _parse_with_env({})
         assert cfg.port == 8000
 
 
 class TestHttpBindConfig:
-    """DB-22139: MCP_HOST and MCP_PORT come from env / --host / --port."""
+    """ MCP_HOST and MCP_PORT come from env / --host / --port."""
 
     def test_port_from_env(self):
         cfg = _parse_with_env({"MCP_PORT": "9090"})
@@ -121,7 +121,7 @@ class TestHttpBindConfig:
             _parse_with_env({"MCP_PORT": "0"})
 
     def test_port_rejects_above_65535(self):
-        """DB-22139 round-2 (post-review): port must fit a TCP port. 65536
+        """Post-review: port must fit a TCP port. 65536
         used to slip through _positive_int and later crashed uvicorn with
         a raw socket-bind traceback."""
         with pytest.raises(SystemExit):
@@ -137,7 +137,7 @@ class TestHttpBindConfig:
 
 
 class TestIdentityTransformRemoved:
-    """DB-22174: YB_MCP_IDENTITY_TRANSFORM has been removed. The only prior
+    """ YB_MCP_IDENTITY_TRANSFORM has been removed. The only prior
     value, strip_domain, silently collapsed users across domains, so we
     fail startup rather than silently ignoring the env."""
 
@@ -160,7 +160,7 @@ class TestIdentityTransformRemoved:
 
 
 class TestPoolSizingValidation:
-    """DB-22159 round-2: pool_min_size <= pool_max_size is enforced at
+    """pool_min_size <= pool_max_size is enforced at
     app_lifespan startup, not silently at pool.open time."""
 
     def test_min_larger_than_max_rejected(self):
@@ -195,7 +195,7 @@ class TestPoolSizingValidation:
 
 
 class TestConnectTimeoutAppend:
-    """DB-22159 round-2 (post-review): when ``YUGABYTEDB_URL`` doesn't
+    """Post-review: when ``YUGABYTEDB_URL`` doesn't
     already carry a ``connect_timeout`` we append one. The append has to
     respect the two conninfo formats libpq accepts — keyword form
     (space-separated) and URI form (query-string). Space-appending to a
