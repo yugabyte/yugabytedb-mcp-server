@@ -113,6 +113,7 @@ class ServerConfig:
     pool_max_size: int
     statement_timeout_ms: int
     max_result_rows: int
+    max_result_bytes: int
     max_query_len: int
 
 
@@ -175,6 +176,16 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
         logger.critical("YUGABYTEDB_URL is not set")
         sys.exit(1)
 
+    # DB-22159 round-2: validate pool sizing at startup so a misconfig
+    # (min > max) fails with a clean error instead of a raw psycopg
+    # traceback at pool.open time.
+    if CONFIG.pool_min_size > CONFIG.pool_max_size:
+        raise ValueError(
+            f"YB_MCP_POOL_MIN_SIZE ({CONFIG.pool_min_size}) exceeds "
+            f"YB_MCP_POOL_MAX_SIZE ({CONFIG.pool_max_size}). Lower the "
+            f"minimum or raise the maximum."
+        )
+
     logger.info("Connecting to database...")
     database_url = CONFIG.yugabytedb_url
     cert_path = write_root_cert()
@@ -183,6 +194,22 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
         if "sslrootcert" not in database_url:
             database_url += f" sslrootcert={cert_path}"
             logger.debug("Appended sslrootcert to connection string")
+
+    # DB-22159 round-2: bound the TCP connect attempt too. libpq's default
+    # is unlimited; without a cap, a network partition to the DB during
+    # pool warm-up hangs startup indefinitely (or the pool acquire path
+    # blocks the tool call for hundreds of seconds). Only add when the
+    # operator hasn't set one explicitly. libpq accepts both keyword form
+    # (`host=… connect_timeout=10`) and URI form
+    # (`postgresql://…?connect_timeout=10`) — space-appending to a URI
+    # mangles it into `?sslmode=… connect_timeout=10` which psycopg
+    # rejects. Detect the form and use the right separator.
+    if "connect_timeout" not in database_url.lower():
+        if database_url.startswith(("postgres://", "postgresql://")):
+            sep = "&" if "?" in database_url else "?"
+            database_url = f"{database_url}{sep}connect_timeout=10"
+        else:
+            database_url = f"{database_url} connect_timeout=10"
 
     # Connection string can contain a password — log only structural info.
     logger.debug(
@@ -301,6 +328,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
             # DB-22159 resource limits — read by tools.py at each call.
             "statement_timeout_ms": CONFIG.statement_timeout_ms,
             "max_result_rows": CONFIG.max_result_rows,
+            "max_result_bytes": CONFIG.max_result_bytes,
             "max_query_len": CONFIG.max_query_len,
         }
     finally:
@@ -459,6 +487,17 @@ def parse_config() -> ServerConfig:
              "(env: YB_MCP_MAX_RESULT_ROWS, default: 10000).",
     )
     parser.add_argument(
+        "--max-result-bytes",
+        type=_positive_int,
+        default=os.environ.get("YB_MCP_MAX_RESULT_BYTES", str(50 * 1024 * 1024)),
+        help="Cap the total byte size of a result set. Enforced while "
+             "streaming rows so a query like `SELECT repeat('x', 1_000_000) "
+             "FROM generate_series(1, 100)` can't OOM the process even with "
+             "max_result_rows large. Truncated responses carry a "
+             "`truncated: true` marker "
+             "(env: YB_MCP_MAX_RESULT_BYTES, default: 50 MiB).",
+    )
+    parser.add_argument(
         "--max-query-len",
         type=_positive_int,
         default=os.environ.get("YB_MCP_MAX_QUERY_LEN", "100000"),
@@ -491,6 +530,7 @@ def parse_config() -> ServerConfig:
         pool_max_size=args.pool_max_size,
         statement_timeout_ms=args.statement_timeout_ms,
         max_result_rows=args.max_result_rows,
+        max_result_bytes=args.max_result_bytes,
         max_query_len=args.max_query_len,
     )
 

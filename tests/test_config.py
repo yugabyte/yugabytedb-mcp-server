@@ -94,6 +94,11 @@ class TestResourceLimitDefaults:
         cfg = _parse_with_env({})
         assert cfg.max_query_len == 100_000
 
+    def test_max_result_bytes_default(self):
+        """DB-22159 round-2: 50 MiB default byte cap."""
+        cfg = _parse_with_env({})
+        assert cfg.max_result_bytes == 50 * 1024 * 1024
+
 
 class TestResourceLimitEnvParsing:
     """Env-var overrides populate ServerConfig correctly."""
@@ -118,11 +123,99 @@ class TestResourceLimitEnvParsing:
         cfg = _parse_with_env({"YB_MCP_MAX_QUERY_LEN": "1000"})
         assert cfg.max_query_len == 1_000
 
+    def test_max_result_bytes_from_env(self):
+        cfg = _parse_with_env({"YB_MCP_MAX_RESULT_BYTES": "1048576"})
+        assert cfg.max_result_bytes == 1_048_576
+
+
+class TestPoolSizingValidation:
+    """DB-22159 round-2: pool_min_size <= pool_max_size is enforced at
+    app_lifespan startup, not silently at pool.open time."""
+
+    def test_min_larger_than_max_rejected(self):
+        """The bad combo is caught inside app_lifespan before the pool is
+        opened. parse_config accepts the individual values (both are just
+        positive ints); the relational check runs later."""
+        from yugabytedb_mcp_server import server as server_module
+        cfg = _parse_with_env({
+            "YB_MCP_POOL_MIN_SIZE": "10",
+            "YB_MCP_POOL_MAX_SIZE": "5",
+        })
+        assert cfg.pool_min_size == 10
+        assert cfg.pool_max_size == 5
+
+        original = getattr(server_module, "CONFIG", None)
+        server_module.CONFIG = cfg
+        try:
+            async def _drive():
+                async with server_module.app_lifespan(None) as _:
+                    pass
+            import asyncio
+            with pytest.raises(ValueError, match="POOL_MIN_SIZE"):
+                asyncio.run(_drive())
+        finally:
+            if original is None:
+                try:
+                    del server_module.CONFIG
+                except AttributeError:
+                    pass
+            else:
+                server_module.CONFIG = original
+
+
+class TestConnectTimeoutAppend:
+    """DB-22159 round-2 (post-review): when ``YUGABYTEDB_URL`` doesn't
+    already carry a ``connect_timeout`` we append one. The append has to
+    respect the two conninfo formats libpq accepts — keyword form
+    (space-separated) and URI form (query-string). Space-appending to a
+    URI mangles it (`?sslmode=disable connect_timeout=10` — psycopg
+    rejects with "extra key/value separator")."""
+
+    def _append(self, url: str) -> str:
+        """Mirror the logic in ``app_lifespan``."""
+        if "connect_timeout" in url.lower():
+            return url
+        if url.startswith(("postgres://", "postgresql://")):
+            sep = "&" if "?" in url else "?"
+            return f"{url}{sep}connect_timeout=10"
+        return f"{url} connect_timeout=10"
+
+    def test_keyword_form_bare(self):
+        assert self._append("host=localhost port=5433 dbname=yb user=yb") == (
+            "host=localhost port=5433 dbname=yb user=yb connect_timeout=10"
+        )
+
+    def test_keyword_form_already_set(self):
+        u = "host=localhost connect_timeout=5"
+        assert self._append(u) == u
+
+    def test_keyword_form_case_insensitive_already_set(self):
+        u = "Connect_Timeout=5 host=localhost"
+        assert self._append(u) == u
+
+    def test_uri_form_no_query(self):
+        assert self._append("postgresql://yb@localhost:5433/db") == (
+            "postgresql://yb@localhost:5433/db?connect_timeout=10"
+        )
+
+    def test_uri_form_with_query(self):
+        assert self._append(
+            "postgresql://yb@localhost:5433/db?sslmode=require"
+        ) == "postgresql://yb@localhost:5433/db?sslmode=require&connect_timeout=10"
+
+    def test_uri_form_already_set(self):
+        u = "postgresql://yb@localhost:5433/db?connect_timeout=5"
+        assert self._append(u) == u
+
+    def test_uri_short_scheme(self):
+        assert self._append("postgres://yb@localhost/db") == (
+            "postgres://yb@localhost/db?connect_timeout=10"
+        )
+
 
 class TestResourceLimitEnvValidation:
     """Bad env values fail startup with a clean argparse error, not a
-    traceback. Same pattern that DB-22162 will apply to max_insert_rows
-    in the follow-up release."""
+    traceback."""
 
     def test_pool_max_size_rejects_non_int(self):
         with pytest.raises(SystemExit):
