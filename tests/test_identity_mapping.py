@@ -543,10 +543,37 @@ class TestGetDbRoleV2:
     @patch("yugabytedb_mcp_server.tools.get_access_token")
     def test_scalar_claim_without_map_still_allowed(self, mock_get_token):
         """Regression: a scalar claim without a map continues to work.
-        Only list claims trigger the new fail-closed check."""
+        Only composite claims trigger the new fail-closed check."""
         mock_get_token.return_value = _make_access_token({"sub": "alice"})
         ctx = _make_ctx(identity_claim="sub", identity_map=None)
         assert _get_db_role(ctx) == "alice"
+
+    # DB-22135 round-2 (post-review): Vishal's phrasing is "the claim is
+    # not a fixed enumerated value (regardless of claim name)". A dict
+    # and a tuple aren't fixed either. Guard widened to cover both.
+
+    @patch("yugabytedb_mcp_server.tools.get_access_token")
+    def test_dict_claim_without_map_rejected(self, mock_get_token):
+        """A dict-shaped claim (unusual but not impossible from a custom
+        IdP) without a map is also refused. Otherwise it'd be str()'d
+        into `SET ROLE "{'role': 'admin'}"` — meaningless at the DB but
+        the intent (no allowlist for composite claim) is violated."""
+        mock_get_token.return_value = _make_access_token(
+            {"sub": {"role": "admin"}}
+        )
+        ctx = _make_ctx(identity_claim="sub", identity_map=None)
+        with pytest.raises(IdentityError, match="dict"):
+            _get_db_role(ctx)
+
+    @patch("yugabytedb_mcp_server.tools.get_access_token")
+    def test_tuple_claim_without_map_rejected(self, mock_get_token):
+        """A tuple claim is the same composite class as list — refused."""
+        mock_get_token.return_value = _make_access_token(
+            {"sub": ("a", "b")}
+        )
+        ctx = _make_ctx(identity_claim="sub", identity_map=None)
+        with pytest.raises(IdentityError, match="tuple"):
+            _get_db_role(ctx)
 
     @patch("yugabytedb_mcp_server.tools.get_access_token")
     def test_keycloak_realm_roles_flow(self, mock_get_token):

@@ -378,27 +378,49 @@ def _get_db_role(ctx: Context, requested_role: Optional[str] = None) -> Optional
 
     # 2. Normalize the claim to a list of non-empty string values. This is
     #    where scalar and list-valued claims converge into one code path.
-    if isinstance(claim_value, list):
+    #
+    # DB-22135 fail-closed at request time: any *composite* claim value
+    # (list, tuple, dict) without a map means the caller could hand us
+    # arbitrary group names / structures which we'd feed verbatim to
+    # `SET ROLE` — no allowlist. Vishal's re-open comment: "fail closed
+    # whenever there is no allowlist/map and the claim is not a fixed
+    # enumerated value (regardless of claim name)". Dicts and tuples are
+    # rare but not fixed either. The startup guard can only see the claim
+    # NAME, so it misses composite claims served under unrecognized names
+    # (`roles`, `entitlements`, custom scopes) — catch them here where
+    # the actual value type is known.
+    if isinstance(claim_value, (list, tuple)):
         raw_values = [str(v) for v in claim_value if v]
         if not raw_values:
             raise IdentityError(_missing_msg)
-        # DB-22135 fail-closed at request time: a list claim without a
-        # map file means every group name the IdP hands out would be a
-        # candidate SET ROLE target — no allowlist. The startup guard
-        # can only see the claim NAME, so it misses list claims served
-        # under unrecognized names (`roles`, `entitlements`, custom
-        # scopes). Catch them here where the actual value type is known.
         if identity_map is None:
             raise IdentityError(
-                f"Claim {claim_name!r} resolved to a list of "
-                f"{len(raw_values)} value(s), but YB_MCP_IDENTITY_MAP is "
-                f"unset. A list claim without a map has no allowlist — "
-                f"every group name would be a candidate SET ROLE target. "
-                f"Configure YB_MCP_IDENTITY_MAP to translate IdP group "
-                f"names to a fixed PG role set, or switch "
-                f"YB_MCP_IDENTITY_CLAIM to a scalar claim like `sub` or "
-                f"`email`."
+                f"Claim {claim_name!r} resolved to a "
+                f"{type(claim_value).__name__} of {len(raw_values)} "
+                f"value(s), but YB_MCP_IDENTITY_MAP is unset. A composite "
+                f"claim without a map has no allowlist — every value "
+                f"would be a candidate SET ROLE target. Configure "
+                f"YB_MCP_IDENTITY_MAP to translate IdP values to a fixed "
+                f"PG role set, or switch YB_MCP_IDENTITY_CLAIM to a "
+                f"scalar claim like `sub` or `email`."
             )
+    elif isinstance(claim_value, dict):
+        if identity_map is None:
+            raise IdentityError(
+                f"Claim {claim_name!r} resolved to a dict, but "
+                f"YB_MCP_IDENTITY_MAP is unset. A composite claim "
+                f"without a map has no allowlist and no defined mapping "
+                f"to a scalar role name. Configure YB_MCP_IDENTITY_MAP, "
+                f"or switch YB_MCP_IDENTITY_CLAIM to a scalar claim like "
+                f"`sub` or `email`."
+            )
+        # With a map: fall through with a synthesized "raw value" that
+        # the map lookup can key off. Since the map is admin-controlled,
+        # a stringified dict is fine as a lookup key — the operator
+        # decides whether to accept it.
+        if not claim_value:
+            raise IdentityError(_missing_msg)
+        raw_values = [str(claim_value)]
     else:
         if not claim_value:
             raise IdentityError(_missing_msg)
