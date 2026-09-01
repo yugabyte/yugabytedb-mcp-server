@@ -37,12 +37,18 @@ def superuser_roles():
     url = os.environ["YUGABYTEDB_URL"]
     with psycopg.connect(url, autocommit=True) as conn:
         with conn.cursor() as cur:
+            # SET ROLE needs the pool user to be a member of the target role
+            # (unless it's a superuser, in which case anything works). Grant
+            # membership to whichever user the conninfo actually connected as
+            # — CI runs Postgres as ``test``, dev runs YB as ``yugabyte``.
+            cur.execute("SELECT current_user")
+            pool_user = cur.fetchone()[0]
             cur.execute(f'DROP ROLE IF EXISTS "{_SU_ROLE}"')
             cur.execute(f'DROP ROLE IF EXISTS "{_NORMAL_ROLE}"')
             cur.execute(f'CREATE ROLE "{_SU_ROLE}" WITH SUPERUSER')
             cur.execute(f'CREATE ROLE "{_NORMAL_ROLE}"')
-            cur.execute(f'GRANT "{_SU_ROLE}" TO yugabyte')
-            cur.execute(f'GRANT "{_NORMAL_ROLE}" TO yugabyte')
+            cur.execute(f'GRANT "{_SU_ROLE}" TO "{pool_user}"')
+            cur.execute(f'GRANT "{_NORMAL_ROLE}" TO "{pool_user}"')
     yield
     with psycopg.connect(url, autocommit=True) as conn:
         with conn.cursor() as cur:
