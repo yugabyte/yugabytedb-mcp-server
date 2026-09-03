@@ -1,9 +1,12 @@
 # server.py
+import binascii
 import json
 import logging
 import os
+import re
 import sys
 import argparse
+import tempfile
 from typing import AsyncIterator
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
@@ -26,6 +29,21 @@ from .tools import (
 )
 
 logger = logging.getLogger("yugabytedb-mcp.server")
+
+
+_SSLROOTCERT_KW_RE = re.compile(r"(?i)(?:^|[?&\s])sslrootcert\s*=")
+
+
+def _has_sslrootcert(conninfo: str) -> bool:
+    """True when the libpq conninfo already carries a ``sslrootcert``
+    parameter (keyword form ``… sslrootcert=…`` or URI form
+    ``?sslrootcert=…`` / ``&sslrootcert=…``).
+
+    Boundary anchor rules out substring matches inside a field value —
+    e.g. ``password=sslrootcertPW123`` no longer looks like a configured
+    cert, so the fetched Secrets Manager cert is actually appended.
+    """
+    return _SSLROOTCERT_KW_RE.search(conninfo) is not None
 
 
 def _pool_reset(conn) -> None:
@@ -111,7 +129,11 @@ class ServerConfig:
     stateless_http: bool
     ssl_root_cert_secret_arn: str | None
     ssl_root_cert_key: str | None
-    ssl_root_cert_path: str
+    # None when the operator hasn't configured YB_SSL_ROOT_CERT_PATH — we
+    # materialize a private (mode-0700) tempdir at fetch time in that case.
+    # The old default (`/tmp/yb-root.crt`) was a predictable, shared path
+    # that a local attacker could pre-symlink to redirect the write.
+    ssl_root_cert_path: str | None
     ssl_root_cert_secret_region: str
     require_where_on_update: bool
     require_where_on_delete: bool
@@ -134,19 +156,75 @@ class ServerConfig:
     max_query_len: int
 
 
+_BEGIN_ARMOR = re.compile(r"(-----BEGIN CERTIFICATE-----)\s+")
+_END_ARMOR = re.compile(r"\s+(-----END CERTIFICATE-----)")
+_END_TO_BEGIN = re.compile(
+    r"(-----END CERTIFICATE-----)\s+(-----BEGIN CERTIFICATE-----)"
+)
+
+
 def normalize_pem(pem: str) -> str:
-    # Remove surrounding spaces
+    """Coerce a PEM cert into canonical form regardless of how whitespace
+    was mangled in transit (JSON round-trip, single-line copy/paste,
+    tabs, multiple spaces). The previous implementation only recognized
+    exact 1-space and 2-space separators between armor lines, so a cert
+    stored with any other whitespace shape parsed as a single malformed
+    line and libpq rejected it.
+    """
     pem = pem.strip()
-
-    # Fix cases where newlines were replaced by spaces
-    pem = pem.replace("-----BEGIN CERTIFICATE----- ", "-----BEGIN CERTIFICATE-----\n")
-    pem = pem.replace(" -----END CERTIFICATE-----", "\n-----END CERTIFICATE-----")
-
-    # Also fix intermediate blocks
-    pem = pem.replace("-----END CERTIFICATE-----  -----BEGIN CERTIFICATE-----",
-                      "-----END CERTIFICATE-----\n\n-----BEGIN CERTIFICATE-----")
-
+    pem = _BEGIN_ARMOR.sub(r"\1\n", pem)
+    pem = _END_ARMOR.sub(r"\n\1", pem)
+    pem = _END_TO_BEGIN.sub(r"\1\n\n\2", pem)
     return pem + "\n"
+
+
+def _cert_destination(configured: str | None) -> str:
+    """Return the filesystem path where the root cert will be written.
+
+    When the operator has set ``YB_SSL_ROOT_CERT_PATH`` we honor it (they
+    own the safety of their chosen directory). Otherwise we materialize
+    a fresh per-process private directory via ``mkdtemp`` so the write
+    doesn't land in a predictable, shared-directory location.
+    """
+    if configured:
+        return configured
+    cert_dir = tempfile.mkdtemp(prefix="yb-mcp-cert-")
+    os.chmod(cert_dir, 0o700)
+    logger.debug("Materialized private TLS-cert dir at %s (mode 0700)", cert_dir)
+    return os.path.join(cert_dir, "yb-root.crt")
+
+
+def _write_cert_atomic(dest: str, pem: str) -> None:
+    """Write ``pem`` to ``dest`` in a symlink- and TOCTOU-safe way.
+
+    - Temp file in the destination's directory, opened with
+      ``O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW`` and mode 0600 from creation
+      (no umask race, no symlink traversal).
+    - ``os.replace`` swaps the temp file into place atomically. If a
+      symlink already exists at ``dest``, ``rename(2)`` replaces the
+      symlink itself, not the file it points to — so a pre-existing
+      symlink at the destination can't redirect the write to an
+      attacker-chosen target.
+    """
+    dest_abs = os.path.abspath(dest)
+    dest_dir = os.path.dirname(dest_abs) or "."
+    suffix = binascii.hexlify(os.urandom(8)).decode()
+    tmp = os.path.join(dest_dir, f".yb-root-cert.{suffix}.tmp")
+    fd = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(pem)
+        os.replace(tmp, dest_abs)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def write_root_cert():
@@ -176,11 +254,10 @@ def write_root_cert():
                     )
                 pem = next(iter(data.values()))
 
-        pem = normalize_pem(pem)
-        with open(CONFIG.ssl_root_cert_path, "w") as f:
-            f.write(pem.strip() + "\n")
-
-        return CONFIG.ssl_root_cert_path
+        pem = normalize_pem(pem).strip() + "\n"
+        dest = _cert_destination(CONFIG.ssl_root_cert_path)
+        _write_cert_atomic(dest, pem)
+        return dest
 
     except Exception as e:
         logger.error("Failed to load root cert from Secrets Manager: %s", e)
@@ -189,9 +266,8 @@ def write_root_cert():
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
-    if not CONFIG.yugabytedb_url:
-        logger.critical("YUGABYTEDB_URL is not set")
-        sys.exit(1)
+    # YUGABYTEDB_URL presence is enforced in parse_config() before we get
+    # here — no need to re-check inside the async lifespan.
 
     # validate pool sizing at startup so a misconfig
     # (min > max) fails with a clean error instead of a raw psycopg
@@ -208,7 +284,13 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
     cert_path = write_root_cert()
     if cert_path:
         logger.debug("Wrote TLS root cert to %s", cert_path)
-        if "sslrootcert" not in database_url:
+        # A plain substring check like `"sslrootcert" in database_url`
+        # false-positives on any conninfo whose password / hostname / other
+        # field VALUE contains the literal "sslrootcert" (e.g.
+        # `password=sslrootcertPW123`), silently dropping the fetched cert.
+        # Match the actual libpq keyword form (` sslrootcert=`) or URI
+        # query param (`?sslrootcert=`, `&sslrootcert=`) instead.
+        if not _has_sslrootcert(database_url):
             database_url += f" sslrootcert={cert_path}"
             logger.debug("Appended sslrootcert to connection string")
 
@@ -378,7 +460,7 @@ def parse_config() -> ServerConfig:
     parser.add_argument(
         "--stateless-http",
         action="store_true",
-        default=os.environ.get("YB_MCP_STATELESS_HTTP", "").lower() == "true",
+        default=_env_bool("YB_MCP_STATELESS_HTTP"),
         help="Enable stateless HTTP mode (env: YB_MCP_STATELESS_HTTP=true)",
     )
     parser.add_argument(
@@ -398,8 +480,13 @@ def parse_config() -> ServerConfig:
     )
     parser.add_argument(
         "--yb-ssl-root-cert-path",
-        default=os.getenv("YB_SSL_ROOT_CERT_PATH", "/tmp/yb-root.crt"),
-        help="Filesystem path where the root certificate will be written (default: `/tmp/yb-root.crt`)",
+        default=os.getenv("YB_SSL_ROOT_CERT_PATH"),
+        help="Filesystem path where the root certificate will be written. "
+             "When unset, a per-process private directory (mode 0700) is "
+             "created via `mkdtemp`; set this explicitly only when you have "
+             "a specific reason to pin the location (e.g. a sidecar "
+             "reading from a known path). "
+             "(env: YB_SSL_ROOT_CERT_PATH)",
     )
     parser.add_argument(
         "--yb-aws-ssl-root-cert-secret-region",
@@ -421,19 +508,19 @@ def parse_config() -> ServerConfig:
     parser.add_argument(
         "--require-where-on-update",
         action="store_true",
-        default=os.environ.get("YB_MCP_REQUIRE_WHERE_ON_UPDATE", "").lower() == "true",
+        default=_env_bool("YB_MCP_REQUIRE_WHERE_ON_UPDATE"),
         help="Reject UPDATE without WHERE clause (env: YB_MCP_REQUIRE_WHERE_ON_UPDATE=true)",
     )
     parser.add_argument(
         "--require-where-on-delete",
         action="store_true",
-        default=os.environ.get("YB_MCP_REQUIRE_WHERE_ON_DELETE", "").lower() == "true",
+        default=_env_bool("YB_MCP_REQUIRE_WHERE_ON_DELETE"),
         help="Reject DELETE without WHERE clause (env: YB_MCP_REQUIRE_WHERE_ON_DELETE=true)",
     )
     parser.add_argument(
         "--enable-write-query",
         action="store_true",
-        default=os.environ.get("YB_MCP_ENABLE_WRITE_QUERY", "").lower() == "true",
+        default=_env_bool("YB_MCP_ENABLE_WRITE_QUERY"),
         help="Enable the run_write_query tool (disabled by default) (env: YB_MCP_ENABLE_WRITE_QUERY=true)",
     )
     parser.add_argument(
@@ -447,9 +534,7 @@ def parse_config() -> ServerConfig:
     # who still expect ``email`` (and therefore an id token) opt in via
     # ``YB_MCP_LEGACY_ACCEPT_ID_TOKENS=true``, which also flips the
     # ``require_access_token`` default back to False.
-    _legacy_auth = os.environ.get(
-        "YB_MCP_LEGACY_ACCEPT_ID_TOKENS", ""
-    ).lower() == "true"
+    _legacy_auth = _env_bool("YB_MCP_LEGACY_ACCEPT_ID_TOKENS")
     _default_identity_claim = "email" if _legacy_auth else "sub"
     parser.add_argument(
         "--identity-claim",
@@ -476,9 +561,7 @@ def parse_config() -> ServerConfig:
     parser.add_argument(
         "--allow-superuser-role",
         action="store_true",
-        default=os.environ.get(
-            "YB_MCP_ALLOW_SUPERUSER_ROLE", ""
-        ).lower() == "true",
+        default=_env_bool("YB_MCP_ALLOW_SUPERUSER_ROLE"),
         help="Defense-in-depth guard: by default we refuse to SET ROLE "
              "to a superuser role, even if the identity map explicitly "
              "resolves there. Setting this flag disables the guard "
@@ -547,6 +630,17 @@ def parse_config() -> ServerConfig:
     )
 
     args = parser.parse_args()
+    # Required-config preflight. Previously handled inside the async
+    # `app_lifespan` via `sys.exit(1)`, which surfaced as a SystemExit
+    # traceback + uvicorn "Application startup failed" (exit code 3). Doing
+    # it here means the caller gets a clean argparse error + exit code 2
+    # before the ASGI app is even constructed.
+    if not args.yugabytedb_url:
+        parser.error(
+            "YUGABYTEDB_URL is required (set the env var or pass "
+            "--yugabytedb-url). Example: "
+            "'host=localhost port=5433 dbname=yugabyte user=yugabyte'."
+        )
     return ServerConfig(
         yugabytedb_url=args.yugabytedb_url,
         transport=args.transport,
@@ -777,10 +871,34 @@ def _is_loopback(host: str) -> bool:
         return False
 
 
-def _env_bool(name: str) -> bool:
-    """Read an env var as a boolean. Accepts case-insensitive `true`;
-    anything else is False. Matches the parse_config idiom."""
-    return os.environ.get(name, "").lower() == "true"
+_TRUE_VALUES = frozenset({"true", "1", "yes", "on", "y"})
+_FALSE_VALUES = frozenset({"false", "0", "no", "off", "n", ""})
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var. Common truthy values are all accepted so
+    an operator who writes ``YB_MCP_REQUIRE_WHERE_ON_DELETE=1`` (or
+    ``yes`` / ``on``) doesn't silently get the flag off.
+
+    - Unset → ``default``.
+    - Case-insensitive ``true`` / ``1`` / ``yes`` / ``on`` / ``y`` → ``True``.
+    - Case-insensitive ``false`` / ``0`` / ``no`` / ``off`` / ``n`` / ``""`` → ``False``.
+    - Anything else → ``default`` with a WARNING so an operator-visible
+      typo doesn't silently flip a security flag.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in _TRUE_VALUES:
+        return True
+    if v in _FALSE_VALUES:
+        return False
+    logger.warning(
+        "%s=%r is not a recognized boolean; falling back to default=%s",
+        name, raw, default,
+    )
+    return default
 
 
 def _check_http_startup(host: str) -> None:
