@@ -1124,7 +1124,17 @@ def main() -> None:
     logger.info("yugabytedb-mcp-server starting (pid=%d)", os.getpid())
     global CONFIG
     CONFIG = parse_config()
-    server = YugabyteDBMCPServer()
+    # Auth-provider construction (Cognito / OIDC) reads required env vars
+    # and raises ValueError on any missing key — surface those as a clean
+    # pre-flight error with exit code 2, matching parse_config's
+    # parser.error() path. Structurally the check has always been pre-ASGI
+    # (server.run() hasn't been called yet), but a raw ValueError
+    # traceback reads worse than the argparse-style presentation.
+    try:
+        server = YugabyteDBMCPServer()
+    except ValueError as e:
+        print(f"yugabytedb-mcp: error: {e}", file=sys.stderr)
+        sys.exit(2)
     server.run()
 
 

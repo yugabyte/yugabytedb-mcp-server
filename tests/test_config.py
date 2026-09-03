@@ -249,6 +249,58 @@ class TestResourceLimitEnvParsing:
         assert cfg.max_result_bytes == 1_048_576
 
 
+class TestAuthProviderPreflight:
+    """DB-22184 follow-up: `_create_cognito` / `_create_oidc` raise
+    `ValueError` on missing env; `main()` catches those in the same
+    pre-flight window as `parser.error()` so an auth-config mistake
+    surfaces as a clean stderr line + exit code 2, not a raw
+    ValueError traceback.
+
+    Structurally the check was already pre-ASGI (raised inside
+    `YugabyteDBMCPServer.__init__`, which runs before `server.run()`);
+    this test pins the presentation as well as the ordering."""
+
+    def test_main_exits_cleanly_on_missing_auth_env(self, capsys):
+        from unittest.mock import MagicMock
+        from yugabytedb_mcp_server import server as server_module
+
+        with patch.object(server_module, "parse_config") as mock_parse, \
+             patch.object(
+                 server_module, "YugabyteDBMCPServer",
+                 side_effect=ValueError(
+                     "Cognito auth is missing required env vars: X, Y"
+                 ),
+             ):
+            mock_parse.return_value = MagicMock()
+            with pytest.raises(SystemExit) as excinfo:
+                server_module.main()
+
+        assert excinfo.value.code == 2
+        stderr = capsys.readouterr().err
+        assert "yugabytedb-mcp: error:" in stderr
+        assert "Cognito auth is missing required env vars: X, Y" in stderr
+        # A regression that lets the ValueError propagate would leave a
+        # traceback in stderr — assert we don't see one.
+        assert "Traceback" not in stderr
+
+    def test_main_does_not_swallow_non_valueerror(self):
+        """Guard against the catch getting overly broad. Only ValueError
+        (which is what `_require_env` raises) should be redirected to
+        the clean pre-flight exit; anything else must propagate so real
+        bugs aren't hidden."""
+        from unittest.mock import MagicMock
+        from yugabytedb_mcp_server import server as server_module
+
+        with patch.object(server_module, "parse_config") as mock_parse, \
+             patch.object(
+                 server_module, "YugabyteDBMCPServer",
+                 side_effect=RuntimeError("unrelated bug"),
+             ):
+            mock_parse.return_value = MagicMock()
+            with pytest.raises(RuntimeError, match="unrelated bug"):
+                server_module.main()
+
+
 class TestRequiredConfigPreflight:
     """DB-22182: previously the ``YUGABYTEDB_URL`` presence check ran
     inside the async ``app_lifespan`` via ``sys.exit(1)``, which
