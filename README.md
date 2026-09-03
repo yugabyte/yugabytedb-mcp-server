@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/yugabyte-yugabytedb-mcp-server-badge.png)](https://mseep.ai/app/yugabyte-yugabytedb-mcp-server)
+
 # YugabyteDB MCP Server
 
 An [MCP](https://modelcontextprotocol.io/) server for YugabyteDB and PostgreSQL — lets LLMs (Claude Desktop, Cursor, Windsurf, etc.) summarize schemas, run read-only queries, and execute write statements behind a configurable guardrail layer.
