@@ -51,6 +51,32 @@ def create_auth_provider(name: str | None):
         )
 
 
+def _require_env(provider: str, names: tuple[str, ...]) -> dict[str, str]:
+    """Read a group of required env vars for an auth provider. Collects
+    every missing name and raises a single ValueError (matching the
+    "unknown provider" error style at ``create_auth_provider``) instead
+    of a bare ``KeyError`` on whichever env var the interpreter happened
+    to hit first.
+
+    Empty-string values count as unset — an operator who leaves the var
+    exported but blank gets the same clear error as an unset var.
+    """
+    values: dict[str, str] = {}
+    missing: list[str] = []
+    for name in names:
+        v = os.environ.get(name)
+        if not v:
+            missing.append(name)
+        else:
+            values[name] = v
+    if missing:
+        raise ValueError(
+            f"{provider} auth is missing required env vars: "
+            f"{', '.join(missing)}. Set all of them and retry."
+        )
+    return values
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     """Parse a boolean env var.
 
@@ -201,9 +227,19 @@ def _create_cognito():
                 )
             return result
 
-    pool_id = os.environ["COGNITO_USER_POOL_ID"]
-    region = os.environ["COGNITO_AWS_REGION"]
-    client_id = os.environ["COGNITO_CLIENT_ID"]
+    required = _require_env(
+        "Cognito",
+        (
+            "COGNITO_USER_POOL_ID",
+            "COGNITO_AWS_REGION",
+            "COGNITO_CLIENT_ID",
+            "COGNITO_CLIENT_SECRET",
+        ),
+    )
+    pool_id = required["COGNITO_USER_POOL_ID"]
+    region = required["COGNITO_AWS_REGION"]
+    client_id = required["COGNITO_CLIENT_ID"]
+    client_secret = required["COGNITO_CLIENT_SECRET"]
     logger.debug("Configuring Cognito provider (pool=%s, region=%s)", pool_id, region)
     config_url = (
         f"https://cognito-idp.{region}.amazonaws.com/{pool_id}/"
@@ -217,7 +253,7 @@ def _create_cognito():
     proxy = _CognitoProxy(
         config_url=config_url,
         client_id=client_id,
-        client_secret=os.environ["COGNITO_CLIENT_SECRET"],
+        client_secret=client_secret,
         base_url=base_url,
         token_endpoint_auth_method="client_secret_basic",
         extra_authorize_params={"scope": scopes},
@@ -277,9 +313,13 @@ def _create_oidc():
     from fastmcp.server.auth.auth import MultiAuth
     from fastmcp.server.auth.providers.jwt import JWTVerifier
 
-    config_url = os.environ["OIDC_CONFIG_URL"]
-    client_id = os.environ["OIDC_CLIENT_ID"]
-    client_secret = os.environ["OIDC_CLIENT_SECRET"]
+    required = _require_env(
+        "OIDC",
+        ("OIDC_CONFIG_URL", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET"),
+    )
+    config_url = required["OIDC_CONFIG_URL"]
+    client_id = required["OIDC_CLIENT_ID"]
+    client_secret = required["OIDC_CLIENT_SECRET"]
     audience = os.environ.get("OIDC_AUDIENCE")
 
     proxy = OIDCProxy(
