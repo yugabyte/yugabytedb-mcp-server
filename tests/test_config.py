@@ -180,13 +180,15 @@ class TestConnectTimeoutAppend:
     rejects with "extra key/value separator")."""
 
     def _append(self, url: str) -> str:
-        """Mirror the logic in ``app_lifespan``."""
+        """Delegate to the production helper so the test actually
+        exercises the code path in ``app_lifespan`` (which now calls the
+        shared ``_append_conninfo_param``). The prior in-test copy of
+        the URI/keyword branch logic would silently pass after a
+        production-side regression."""
+        from yugabytedb_mcp_server.server import _append_conninfo_param
         if "connect_timeout" in url.lower():
             return url
-        if url.startswith(("postgres://", "postgresql://")):
-            sep = "&" if "?" in url else "?"
-            return f"{url}{sep}connect_timeout=10"
-        return f"{url} connect_timeout=10"
+        return _append_conninfo_param(url, "connect_timeout", "10")
 
     def test_keyword_form_bare(self):
         assert self._append("host=localhost port=5433 dbname=yb user=yb") == (
@@ -257,8 +259,16 @@ class TestAuthProviderPreflight:
     ValueError traceback.
 
     Structurally the check was already pre-ASGI (raised inside
-    `YugabyteDBMCPServer.__init__`, which runs before `server.run()`);
-    this test pins the presentation as well as the ordering."""
+    `create_auth_provider`, which runs before `server.run()`); this test
+    pins the presentation as well as the ordering.
+
+    The try wraps ONLY the `create_auth_provider` call — not the
+    `YugabyteDBMCPServer(...)` constructor as a whole — so that
+    `ValueError` subclasses raised by other constructor work (pydantic's
+    `ValidationError` from `FastMCP(...)`, for example) propagate
+    normally and don't get collapsed into an argparse-style pre-flight
+    exit with the traceback discarded.
+    """
 
     def test_main_exits_cleanly_on_missing_auth_env(self, capsys):
         from unittest.mock import MagicMock
@@ -266,7 +276,7 @@ class TestAuthProviderPreflight:
 
         with patch.object(server_module, "parse_config") as mock_parse, \
              patch.object(
-                 server_module, "YugabyteDBMCPServer",
+                 server_module, "create_auth_provider",
                  side_effect=ValueError(
                      "Cognito auth is missing required env vars: X, Y"
                  ),
@@ -279,25 +289,45 @@ class TestAuthProviderPreflight:
         stderr = capsys.readouterr().err
         assert "yugabytedb-mcp: error:" in stderr
         assert "Cognito auth is missing required env vars: X, Y" in stderr
-        # A regression that lets the ValueError propagate would leave a
-        # traceback in stderr — assert we don't see one.
-        assert "Traceback" not in stderr
 
     def test_main_does_not_swallow_non_valueerror(self):
-        """Guard against the catch getting overly broad. Only ValueError
-        (which is what `_require_env` raises) should be redirected to
-        the clean pre-flight exit; anything else must propagate so real
-        bugs aren't hidden."""
+        """Guard against the try widening. Only ValueError raised by
+        `create_auth_provider` (which is what `_require_env` raises)
+        goes through the clean pre-flight exit; anything else must
+        propagate so real bugs aren't hidden."""
         from unittest.mock import MagicMock
         from yugabytedb_mcp_server import server as server_module
 
         with patch.object(server_module, "parse_config") as mock_parse, \
              patch.object(
-                 server_module, "YugabyteDBMCPServer",
+                 server_module, "create_auth_provider",
                  side_effect=RuntimeError("unrelated bug"),
              ):
             mock_parse.return_value = MagicMock()
             with pytest.raises(RuntimeError, match="unrelated bug"):
+                server_module.main()
+
+    def test_main_propagates_valueerror_from_constructor(self):
+        """The try must NOT wrap ``YugabyteDBMCPServer(...)`` — a
+        ``ValueError`` (or subclass like pydantic ``ValidationError``)
+        from ``FastMCP(...)`` or ``_register_tools()`` should crash with
+        a traceback, not silently exit(2) with the traceback discarded.
+        Otherwise real regressions in tool wiring get hidden behind a
+        one-line error message that looks like a config problem."""
+        from unittest.mock import MagicMock
+        from yugabytedb_mcp_server import server as server_module
+
+        with patch.object(server_module, "parse_config") as mock_parse, \
+             patch.object(
+                 server_module, "create_auth_provider",
+                 return_value=None,
+             ), \
+             patch.object(
+                 server_module, "YugabyteDBMCPServer",
+                 side_effect=ValueError("pydantic validation failed"),
+             ):
+            mock_parse.return_value = MagicMock()
+            with pytest.raises(ValueError, match="pydantic validation failed"):
                 server_module.main()
 
 
@@ -333,8 +363,11 @@ class TestSslRootCertGuard:
     match (``"sslrootcert" in conninfo``). Any field value containing
     that literal — e.g. ``password=sslrootcertPW123`` — false-positived,
     silently DROPPING the fetched cert. Fix: match the actual libpq
-    keyword form (``\\bsslrootcert=``) or URI query param
-    (``?sslrootcert=`` / ``&sslrootcert=``)."""
+    keyword form (``sslrootcert=`` preceded by a whitespace or line
+    start) or URI query param (``?sslrootcert=`` / ``&sslrootcert=``).
+    Implemented via the anchored regex ``(?i)(?:^|[?&\\s])sslrootcert\\s*=``
+    in ``server.py`` (not ``\\bsslrootcert=`` — ``\\b`` matches right
+    after ``=`` too, so it would let ``password=sslrootcert`` through)."""
 
     def _has(self, conninfo: str) -> bool:
         from yugabytedb_mcp_server.server import _has_sslrootcert
@@ -407,3 +440,52 @@ class TestResourceLimitEnvValidation:
     def test_max_query_len_rejects_negative(self):
         with pytest.raises(SystemExit):
             _parse_with_env({"YB_MCP_MAX_QUERY_LEN": "-100"})
+
+
+class TestEnvBoolSharedHelper:
+    """Post-review guard: ``_env_bool`` used to be defined twice (once
+    in ``server.py``, once in ``auth.py``) with different value sets.
+    ``YB_MCP_LEGACY_ACCEPT_ID_TOKENS=y`` was accepted as True by
+    ``parse_config`` (server side, knew ``y``) but rejected as
+    unrecognized by ``_create_cognito`` (auth side, didn't know ``y``),
+    which decoupled the two halves of the flag and broke the escape
+    hatch DB-22136 exists to serve. Fix: single canonical helper in
+    ``auth.py``, imported by ``server.py``. These tests pin the
+    invariant so the helpers can't drift again."""
+
+    def test_server_and_auth_import_same_function_object(self):
+        """The exact same function object must be reachable from both
+        module namespaces. A rebind that produced two lookalikes with
+        different value sets is what caused the original divergence."""
+        from yugabytedb_mcp_server import server as server_module
+        from yugabytedb_mcp_server import auth as auth_module
+        assert server_module._env_bool is auth_module._env_bool
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            # Full truthy set — including 'y' which was previously
+            # missing from auth.py.
+            ("true", True), ("True", True), ("TRUE", True),
+            ("1", True), ("yes", True), ("YES", True),
+            ("on", True), ("y", True), ("Y", True),
+            # Full falsy set — including 'n' which was previously
+            # missing from auth.py.
+            ("false", False), ("0", False), ("no", False),
+            ("off", False), ("n", False), ("N", False),
+            ("", False),
+        ],
+    )
+    def test_shared_helper_recognizes_full_value_set(self, raw, expected):
+        from yugabytedb_mcp_server.auth import _env_bool
+        with patch.dict(os.environ, {"YB_MCP_TEST_BOOL": raw}, clear=False):
+            assert _env_bool("YB_MCP_TEST_BOOL", default=not expected) is expected
+
+    def test_unrecognized_value_falls_through_to_default(self):
+        """Typo protection: an unrecognized value logs a warning and
+        returns the default, so a security-sensitive flag doesn't
+        silently flip because someone wrote ``YB_MCP_...=maybe``."""
+        from yugabytedb_mcp_server.auth import _env_bool
+        with patch.dict(os.environ, {"YB_MCP_TEST_BOOL": "maybe"}, clear=False):
+            assert _env_bool("YB_MCP_TEST_BOOL", default=False) is False
+            assert _env_bool("YB_MCP_TEST_BOOL", default=True) is True

@@ -77,12 +77,23 @@ def _require_env(provider: str, names: tuple[str, ...]) -> dict[str, str]:
     return values
 
 
+# Truthy / falsy sets used by ``_env_bool``. Kept as module constants (not
+# closed over inside the function) so a single edit here changes the value
+# vocabulary everywhere the helper is used — server.py imports both
+# ``_env_bool`` and the value sets from this module, so the two call sites
+# can't drift apart the way they did before this consolidation.
+_TRUE_VALUES = frozenset({"true", "1", "yes", "on", "y"})
+_FALSE_VALUES = frozenset({"false", "0", "no", "off", "n", ""})
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
-    """Parse a boolean env var.
+    """Parse a boolean env var. Common truthy values are all accepted so
+    an operator who writes ``YB_MCP_REQUIRE_ACCESS_TOKEN=y`` (or ``1`` /
+    ``yes`` / ``on``) doesn't silently get the flag off.
 
     - Unset → ``default``.
-    - Case-insensitive ``true`` / ``1`` / ``yes`` / ``on`` → ``True``.
-    - Case-insensitive ``false`` / ``0`` / ``no`` / ``off`` / ``""`` → ``False``.
+    - Case-insensitive ``true`` / ``1`` / ``yes`` / ``on`` / ``y`` → ``True``.
+    - Case-insensitive ``false`` / ``0`` / ``no`` / ``off`` / ``n`` / ``""`` → ``False``.
     - Anything else → ``default`` (with a WARNING so an operator-visible
       typo doesn't silently flip a security flag).
     """
@@ -90,9 +101,9 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     v = raw.strip().lower()
-    if v in ("true", "1", "yes", "on"):
+    if v in _TRUE_VALUES:
         return True
-    if v in ("false", "0", "no", "off", ""):
+    if v in _FALSE_VALUES:
         return False
     logger.warning(
         "%s=%r is not a recognized boolean; falling back to default=%s",

@@ -16,6 +16,7 @@ import tempfile
 import pytest
 
 from yugabytedb_mcp_server.server import (
+    _append_conninfo_param,
     _write_cert_atomic,
     normalize_pem,
 )
@@ -56,9 +57,13 @@ class TestNormalizePemVariableWhitespace:
 class TestNormalizePemChains:
     """Multi-cert bundles from Secrets Manager arrive with anywhere
     from zero to several whitespace chars between one block's END and
-    the next block's BEGIN."""
+    the next block's BEGIN. The zero-separator case is real: a JSON
+    round-trip that stripped every internal newline yields a glued
+    ``-----END CERTIFICATE----------BEGIN CERTIFICATE-----`` sequence
+    that libpq refuses. ``_END_TO_BEGIN`` in ``server.py`` uses ``\\s*``
+    (not ``\\s+``) so the empty-separator input still splits cleanly."""
 
-    @pytest.mark.parametrize("sep", ["  ", "   ", "\n\n", "\t", " \n \t "])
+    @pytest.mark.parametrize("sep", ["", "  ", "   ", "\n\n", "\t", " \n \t "])
     def test_end_to_begin_variable_whitespace(self, sep):
         body_a = _BODY
         body_b = _BODY[::-1]  # different content
@@ -135,3 +140,136 @@ class TestWriteCertAtomic:
         assert dest.read_text() == _CANONICAL_ONE
         # Mode is preserved on re-write.
         assert stat.S_IMODE(os.stat(dest).st_mode) == 0o600
+
+
+# ---------------------------------------------------------------------------
+# _cert_destination + atexit cleanup — no tmpdir leaks per process start
+# ---------------------------------------------------------------------------
+
+class TestCertDirCleanup:
+    """Every process start under stdio transport spawns a fresh MCP
+    server; without cleanup, each start left an owner-only
+    ``yb-mcp-cert-*/`` dir in the operator's tmpdir with nothing ever
+    reaping it. ``_cert_destination`` now records the dirs it creates
+    into a module-level list, and an ``atexit`` hook removes them at
+    interpreter shutdown."""
+
+    def test_configured_path_does_not_track_for_cleanup(self, tmp_path):
+        """When the operator supplies ``YB_SSL_ROOT_CERT_PATH``, the dir
+        belongs to them — we must not add it to the cleanup list."""
+        from yugabytedb_mcp_server.server import _cert_destination, _owned_cert_dirs
+
+        # Snapshot the list length; call must not append.
+        before = list(_owned_cert_dirs)
+        configured = str(tmp_path / "operator-owned-dir" / "yb-root.crt")
+        result = _cert_destination(configured)
+        assert result == configured
+        assert list(_owned_cert_dirs) == before
+
+    def test_default_path_is_tracked_and_cleanup_removes_it(self):
+        """A default (no ``YB_SSL_ROOT_CERT_PATH``) invocation makes a
+        private ``mkdtemp`` dir, appends it to the tracking list, and
+        ``_cleanup_owned_cert_dirs`` wipes it."""
+        from yugabytedb_mcp_server.server import (
+            _cert_destination,
+            _owned_cert_dirs,
+            _cleanup_owned_cert_dirs,
+        )
+
+        before = len(_owned_cert_dirs)
+        path = _cert_destination(None)
+        assert len(_owned_cert_dirs) == before + 1
+        cert_dir = os.path.dirname(path)
+        assert os.path.isdir(cert_dir)
+        assert cert_dir.rsplit("/", 1)[-1].startswith("yb-mcp-cert-")
+
+        _cleanup_owned_cert_dirs()
+        assert not os.path.exists(cert_dir), (
+            f"atexit cleanup should have removed {cert_dir}"
+        )
+
+    def test_cleanup_is_best_effort_on_missing_dir(self):
+        """Cleanup swallows errors — a dir that already vanished (or
+        was never created) must not raise on shutdown."""
+        from yugabytedb_mcp_server.server import (
+            _owned_cert_dirs,
+            _cleanup_owned_cert_dirs,
+        )
+
+        _owned_cert_dirs.append("/nonexistent/path/that/never/existed")
+        try:
+            _cleanup_owned_cert_dirs()  # must not raise
+        finally:
+            try:
+                _owned_cert_dirs.remove(
+                    "/nonexistent/path/that/never/existed"
+                )
+            except ValueError:
+                pass
+
+
+class TestAppendConninfoParam:
+    """DB-22185 follow-up: appending ``sslrootcert=<path>`` (and, from
+    DB-22159, ``connect_timeout=10``) must use the right separator for
+    the conninfo's form. libpq keyword form is space-separated; URI form
+    is query-string style. Space-appending to a URI (
+    ``postgresql://…?sslmode=verify-full sslrootcert=/tmp/x``) is
+    rejected by psycopg. This shared helper backs both append sites, so
+    the two paths can't drift out of sync again."""
+
+    def test_keyword_form_uses_space_separator(self):
+        url = "host=x port=5433 user=y password=z"
+        result = _append_conninfo_param(url, "sslrootcert", "/etc/x.crt")
+        assert result == "host=x port=5433 user=y password=z sslrootcert=/etc/x.crt"
+
+    def test_uri_form_without_existing_query_uses_question_mark(self):
+        url = "postgresql://u@h:5433/db"
+        result = _append_conninfo_param(url, "sslrootcert", "/etc/x.crt")
+        assert result == "postgresql://u@h:5433/db?sslrootcert=/etc/x.crt"
+
+    def test_uri_form_with_existing_query_uses_ampersand(self):
+        url = "postgresql://u@h:5433/db?sslmode=verify-full"
+        result = _append_conninfo_param(url, "sslrootcert", "/etc/x.crt")
+        # Space-appending to this input was the specific bug: it would
+        # produce "?sslmode=verify-full sslrootcert=/etc/x.crt", which
+        # psycopg refuses because the space becomes part of the last
+        # query-param VALUE.
+        assert result == (
+            "postgresql://u@h:5433/db?sslmode=verify-full&sslrootcert=/etc/x.crt"
+        )
+
+    def test_postgres_scheme_variant_also_uri_form(self):
+        # libpq accepts both ``postgres://`` and ``postgresql://`` — the
+        # helper must detect both.
+        url = "postgres://u@h:5433/db?sslmode=require"
+        result = _append_conninfo_param(url, "connect_timeout", "10")
+        assert result == (
+            "postgres://u@h:5433/db?sslmode=require&connect_timeout=10"
+        )
+
+    def test_connect_timeout_keyword_form_reuses_helper(self):
+        # Regression pin for the DB-22159 keyword-form path — the helper
+        # replaced an inline ``f"{url} connect_timeout=10"`` so keyword
+        # form must still produce the same string.
+        url = "host=x port=5433 user=y"
+        result = _append_conninfo_param(url, "connect_timeout", "10")
+        assert result == "host=x port=5433 user=y connect_timeout=10"
+        """Cleanup swallows errors — a dir that already vanished (or
+        was never created) must not raise on shutdown."""
+        from yugabytedb_mcp_server.server import (
+            _owned_cert_dirs,
+            _cleanup_owned_cert_dirs,
+        )
+
+        # Push a bogus path and confirm cleanup doesn't raise.
+        _owned_cert_dirs.append("/nonexistent/path/that/never/existed")
+        try:
+            _cleanup_owned_cert_dirs()  # must not raise
+        finally:
+            # Best-effort pop — leave the list clean for other tests.
+            try:
+                _owned_cert_dirs.remove(
+                    "/nonexistent/path/that/never/existed"
+                )
+            except ValueError:
+                pass

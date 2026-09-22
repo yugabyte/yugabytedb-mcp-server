@@ -1,9 +1,11 @@
 # server.py
+import atexit
 import binascii
 import json
 import logging
 import os
 import re
+import shutil
 import sys
 import argparse
 import tempfile
@@ -20,7 +22,12 @@ from starlette.responses import JSONResponse
 import boto3
 
 from .guardrails import GuardrailConfig
-from .auth import create_auth_provider, cognito_password_login, CognitoLoginError
+from .auth import (
+    create_auth_provider,
+    cognito_password_login,
+    CognitoLoginError,
+    _env_bool,
+)
 from .tools import (
     summarize_database,
     run_read_only_query,
@@ -44,6 +51,27 @@ def _has_sslrootcert(conninfo: str) -> bool:
     cert, so the fetched Secrets Manager cert is actually appended.
     """
     return _SSLROOTCERT_KW_RE.search(conninfo) is not None
+
+
+def _append_conninfo_param(url: str, key: str, value: str) -> str:
+    """Append ``key=value`` to a libpq conninfo string, using the right
+    separator for the URL's form. libpq accepts two forms:
+
+    - Keyword form: ``host=… port=… user=…`` — parameters are
+      space-separated. ``" key=value"`` is the correct append.
+    - URI form: ``postgresql://…?param=value&param=value`` — parameters
+      are query-string style. Space-appending mangles it into
+      ``…?sslmode=verify-full sslrootcert=/tmp/x``, which psycopg
+      rejects. Use ``?`` if there are no existing query params, ``&``
+      otherwise.
+
+    Shared by the sslrootcert append (DB-22185) and the connect_timeout
+    append (DB-22159) so the two paths can't drift out of sync.
+    """
+    if url.startswith(("postgres://", "postgresql://")):
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}{key}={value}"
+    return f"{url} {key}={value}"
 
 
 def _pool_reset(conn) -> None:
@@ -158,8 +186,13 @@ class ServerConfig:
 
 _BEGIN_ARMOR = re.compile(r"(-----BEGIN CERTIFICATE-----)\s+")
 _END_ARMOR = re.compile(r"\s+(-----END CERTIFICATE-----)")
+# ``\s*`` (not ``\s+``) so a bundle whose blocks were glued together with
+# no separator at all — e.g. ``…-----END CERTIFICATE----------BEGIN
+# CERTIFICATE-----…`` after a JSON round-trip that stripped every newline —
+# normalizes to a valid multi-cert bundle. The keep-alive test suite
+# covers the zero, one, and many-whitespace cases.
 _END_TO_BEGIN = re.compile(
-    r"(-----END CERTIFICATE-----)\s+(-----BEGIN CERTIFICATE-----)"
+    r"(-----END CERTIFICATE-----)\s*(-----BEGIN CERTIFICATE-----)"
 )
 
 
@@ -178,18 +211,48 @@ def normalize_pem(pem: str) -> str:
     return pem + "\n"
 
 
+# Track private cert directories we materialize via ``mkdtemp`` so an
+# atexit hook can remove them on process shutdown. Without this, every
+# server start (per-client under stdio transport) piles up a fresh
+# ``yb-mcp-cert-*/`` dir in the operator's tmpdir with no cleanup path.
+# Operator-supplied paths (via ``YB_SSL_ROOT_CERT_PATH``) are NOT tracked
+# — those directories belong to the operator, not us.
+_owned_cert_dirs: list[str] = []
+
+
+def _cleanup_owned_cert_dirs() -> None:
+    """Best-effort removal of the private cert dirs this process created.
+
+    Runs at interpreter shutdown via ``atexit``. Errors are swallowed:
+    the goal is opportunistic cleanup, not a hard guarantee. A dir that
+    can't be removed (e.g. because the process was killed and the parent
+    dir was made read-only) will fall through to the operator's normal
+    tmpdir cleanup.
+    """
+    for path in _owned_cert_dirs:
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_owned_cert_dirs)
+
+
 def _cert_destination(configured: str | None) -> str:
     """Return the filesystem path where the root cert will be written.
 
     When the operator has set ``YB_SSL_ROOT_CERT_PATH`` we honor it (they
     own the safety of their chosen directory). Otherwise we materialize
     a fresh per-process private directory via ``mkdtemp`` so the write
-    doesn't land in a predictable, shared-directory location.
+    doesn't land in a predictable, shared-directory location. The private
+    dir is tracked for atexit cleanup — see ``_cleanup_owned_cert_dirs``.
     """
     if configured:
         return configured
     cert_dir = tempfile.mkdtemp(prefix="yb-mcp-cert-")
     os.chmod(cert_dir, 0o700)
+    _owned_cert_dirs.append(cert_dir)
     logger.debug("Materialized private TLS-cert dir at %s (mode 0700)", cert_dir)
     return os.path.join(cert_dir, "yb-root.crt")
 
@@ -290,25 +353,24 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
         # `password=sslrootcertPW123`), silently dropping the fetched cert.
         # Match the actual libpq keyword form (` sslrootcert=`) or URI
         # query param (`?sslrootcert=`, `&sslrootcert=`) instead.
+        #
+        # The append must also respect the conninfo form: space-appending to
+        # a URI (`postgresql://…?sslmode=verify-full sslrootcert=/tmp/x`)
+        # produces a string psycopg rejects. `_append_conninfo_param` picks
+        # `?`/`&` for URIs and space for keyword form.
         if not _has_sslrootcert(database_url):
-            database_url += f" sslrootcert={cert_path}"
+            database_url = _append_conninfo_param(database_url, "sslrootcert", cert_path)
             logger.debug("Appended sslrootcert to connection string")
 
     # bound the TCP connect attempt too. libpq's default
     # is unlimited; without a cap, a network partition to the DB during
     # pool warm-up hangs startup indefinitely (or the pool acquire path
     # blocks the tool call for hundreds of seconds). Only add when the
-    # operator hasn't set one explicitly. libpq accepts both keyword form
-    # (`host=… connect_timeout=10`) and URI form
-    # (`postgresql://…?connect_timeout=10`) — space-appending to a URI
-    # mangles it into `?sslmode=… connect_timeout=10` which psycopg
-    # rejects. Detect the form and use the right separator.
+    # operator hasn't set one explicitly. `_append_conninfo_param` handles
+    # the URI-vs-keyword-form detection (see its docstring); DB-22159 added
+    # the URI branch to fix this same class of mangling.
     if "connect_timeout" not in database_url.lower():
-        if database_url.startswith(("postgres://", "postgresql://")):
-            sep = "&" if "?" in database_url else "?"
-            database_url = f"{database_url}{sep}connect_timeout=10"
-        else:
-            database_url = f"{database_url} connect_timeout=10"
+        database_url = _append_conninfo_param(database_url, "connect_timeout", "10")
 
     # Connection string can contain a password — log only structural info.
     logger.debug(
@@ -669,8 +731,18 @@ def parse_config() -> ServerConfig:
 
 
 class YugabyteDBMCPServer:
-    def __init__(self):
-        auth = create_auth_provider(CONFIG.auth_provider)
+    def __init__(self, auth=None):
+        # ``auth`` is optional so tests and other in-process callers can
+        # keep instantiating with no args (the constructor self-builds
+        # from ``CONFIG.auth_provider``). ``main()`` builds the provider
+        # explicitly outside this call so a ``ValueError`` from
+        # ``create_auth_provider`` (missing env var for the chosen
+        # provider — DB-22184's ``_require_env``) can be trapped and
+        # rendered as a clean pre-flight error without also swallowing
+        # unrelated ``ValueError`` subclasses raised by ``FastMCP(...)``
+        # or ``_register_tools()`` (e.g. pydantic's ``ValidationError``).
+        if auth is None:
+            auth = create_auth_provider(CONFIG.auth_provider)
         self.mcp = FastMCP(
             "yugabytedb-mcp",
             lifespan=app_lifespan,
@@ -869,36 +941,6 @@ def _is_loopback(host: str) -> bool:
         return ipaddress.ip_address(h).is_loopback
     except ValueError:
         return False
-
-
-_TRUE_VALUES = frozenset({"true", "1", "yes", "on", "y"})
-_FALSE_VALUES = frozenset({"false", "0", "no", "off", "n", ""})
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    """Parse a boolean env var. Common truthy values are all accepted so
-    an operator who writes ``YB_MCP_REQUIRE_WHERE_ON_DELETE=1`` (or
-    ``yes`` / ``on``) doesn't silently get the flag off.
-
-    - Unset → ``default``.
-    - Case-insensitive ``true`` / ``1`` / ``yes`` / ``on`` / ``y`` → ``True``.
-    - Case-insensitive ``false`` / ``0`` / ``no`` / ``off`` / ``n`` / ``""`` → ``False``.
-    - Anything else → ``default`` with a WARNING so an operator-visible
-      typo doesn't silently flip a security flag.
-    """
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    v = raw.strip().lower()
-    if v in _TRUE_VALUES:
-        return True
-    if v in _FALSE_VALUES:
-        return False
-    logger.warning(
-        "%s=%r is not a recognized boolean; falling back to default=%s",
-        name, raw, default,
-    )
-    return default
 
 
 def _check_http_startup(host: str) -> None:
@@ -1130,11 +1172,19 @@ def main() -> None:
     # parser.error() path. Structurally the check has always been pre-ASGI
     # (server.run() hasn't been called yet), but a raw ValueError
     # traceback reads worse than the argparse-style presentation.
+    #
+    # NOTE: this try MUST wrap only the ``create_auth_provider`` call.
+    # ``YugabyteDBMCPServer(...)`` includes ``FastMCP(...)`` construction
+    # and ``_register_tools()``, both of which can raise ``ValueError``
+    # subclasses (pydantic's ``ValidationError`` in particular) that we do
+    # NOT want to collapse into an argparse-style "error: ..." with the
+    # traceback discarded.
     try:
-        server = YugabyteDBMCPServer()
+        auth = create_auth_provider(CONFIG.auth_provider)
     except ValueError as e:
         print(f"yugabytedb-mcp: error: {e}", file=sys.stderr)
         sys.exit(2)
+    server = YugabyteDBMCPServer(auth=auth)
     server.run()
 
 
