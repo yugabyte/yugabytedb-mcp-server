@@ -136,13 +136,31 @@ class TestEnvBool:
         os.environ.pop("X", None)
         assert _env_bool("X") is False
 
-    @pytest.mark.parametrize("val", ["1", "yes", "on", "y", "false", "0", ""])
-    def test_only_true_is_true(self, val):
-        """Matches the parse_config idiom — only the literal `true` (case-
-        insensitive) is True. `1`, `yes`, etc. are False. Documents current
-        behavior; tracks broadening this in the follow-up release."""
+    @pytest.mark.parametrize("val", ["1", "yes", "on", "y", "Y", "YES", "ON"])
+    def test_common_truthy_values_accepted(self, val):
+        """DB-22186: the previous helper only accepted the literal `true`
+        (case-insensitive). Common shell truthy values were silently False,
+        so an operator who wrote `YB_MCP_REQUIRE_WHERE_ON_DELETE=1` got the
+        flag off with no warning."""
+        with patch.dict(os.environ, {"X": val}):
+            assert _env_bool("X") is True
+
+    @pytest.mark.parametrize("val", ["false", "0", "no", "off", "n", ""])
+    def test_common_falsy_values_stay_false(self, val):
         with patch.dict(os.environ, {"X": val}):
             assert _env_bool("X") is False
+
+    def test_unknown_value_falls_back_to_default_and_warns(self, caplog):
+        """A typo like `YB_MCP_ALLOW_SUPERUSER_ROLE=truue` used to silently
+        evaluate to False (secure) but with no operator-visible signal that
+        the config was ignored. The helper now warns."""
+        with patch.dict(os.environ, {"X": "truue"}), caplog.at_level("WARNING"):
+            assert _env_bool("X", default=False) is False
+        assert any("not a recognized boolean" in r.message for r in caplog.records)
+
+    def test_unknown_value_respects_explicit_default(self, caplog):
+        with patch.dict(os.environ, {"X": "garbage"}), caplog.at_level("WARNING"):
+            assert _env_bool("X", default=True) is True
 
 
 # ---------------------------------------------------------------------------

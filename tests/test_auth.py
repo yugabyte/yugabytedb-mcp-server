@@ -14,7 +14,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from yugabytedb_mcp_server.auth import create_auth_provider, _create_cognito
+from yugabytedb_mcp_server.auth import create_auth_provider, _create_cognito, _create_oidc
 
 
 # ---------------------------------------------------------------------------
@@ -64,10 +64,49 @@ class TestAuthFactory:
         with pytest.raises(ValueError, match="Unknown auth provider"):
             create_auth_provider("not-a-real-provider")
 
-    def test_cognito_missing_env_raises(self):
+    def test_cognito_missing_env_raises_clean_valueerror(self):
+        """DB-22184: previously a bare KeyError on whichever env var
+        happened to be checked first — no guidance on the others. Now a
+        single ValueError lists every missing var so an operator can fix
+        the config in one pass."""
         with patch.dict("os.environ", {}, clear=True):
-            with pytest.raises(KeyError):
+            with pytest.raises(ValueError) as excinfo:
                 _create_cognito()
+        msg = str(excinfo.value)
+        assert "Cognito" in msg
+        for var in (
+            "COGNITO_USER_POOL_ID",
+            "COGNITO_AWS_REGION",
+            "COGNITO_CLIENT_ID",
+            "COGNITO_CLIENT_SECRET",
+        ):
+            assert var in msg, f"expected {var} in error, got: {msg!r}"
+
+    def test_cognito_partial_env_reports_only_missing(self):
+        partial = {
+            "COGNITO_USER_POOL_ID": "us-east-1_xyz",
+            "COGNITO_AWS_REGION": "us-east-1",
+            # Missing: COGNITO_CLIENT_ID, COGNITO_CLIENT_SECRET
+        }
+        with patch.dict("os.environ", partial, clear=True):
+            with pytest.raises(ValueError) as excinfo:
+                _create_cognito()
+        msg = str(excinfo.value)
+        assert "COGNITO_CLIENT_ID" in msg
+        assert "COGNITO_CLIENT_SECRET" in msg
+        # Vars that were set must NOT appear in the missing list.
+        assert "COGNITO_USER_POOL_ID" not in msg
+        assert "COGNITO_AWS_REGION" not in msg
+
+    def test_oidc_missing_env_raises_clean_valueerror(self):
+        """DB-22184 parallel: same helper covers the OIDC provider."""
+        with patch.dict("os.environ", {}, clear=True):
+            with pytest.raises(ValueError) as excinfo:
+                _create_oidc()
+        msg = str(excinfo.value)
+        assert "OIDC" in msg
+        for var in ("OIDC_CONFIG_URL", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET"):
+            assert var in msg, f"expected {var} in error, got: {msg!r}"
 
 
 class TestCognitoConstruction:

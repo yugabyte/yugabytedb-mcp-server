@@ -76,7 +76,7 @@ For development from source, see [Development](#development) below.
 | `YB_AWS_SSL_ROOT_CERT_SECRET_ARN` | `--yb-aws-ssl-root-cert-secret-arn` | No | ARN of an AWS Secrets Manager secret holding the YugabyteDB TLS root certificate. |
 | `YB_AWS_SSL_ROOT_CERT_KEY` | `--yb-aws-ssl-root-cert-key` | No | JSON key inside the secret when it stores multiple certs. |
 | `YB_AWS_SSL_ROOT_CERT_SECRET_REGION` | `--yb-aws-ssl-root-cert-secret-region` | No | AWS region of the secret. |
-| `YB_SSL_ROOT_CERT_PATH` | `--yb-ssl-root-cert-path` | No | Where to write the fetched cert. Default `/tmp/yb-root.crt`. |
+| `YB_SSL_ROOT_CERT_PATH` | `--yb-ssl-root-cert-path` | No | Where to write the fetched cert. Default: a fresh per-process private directory (`yb-mcp-cert-*/yb-root.crt` under the system temp dir, mode `0700`, cleaned up at process exit). Set an explicit path to place the cert somewhere the operator manages directly. |
 
 For OIDC/Cognito authentication, per-user `SET ROLE` mapping, the identity map
 file format, and the `/auth/login` shortcut — see [`OIDC.md`](OIDC.md).
